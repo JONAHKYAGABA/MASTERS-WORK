@@ -33,6 +33,7 @@ import pickle
 import hashlib
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
+import multiprocessing as mp
 from functools import partial
 import time
 import random
@@ -554,10 +555,16 @@ def _select_best_image(jpg_files: list, metadata_cache: dict) -> tuple:
 # Global metadata cache for worker processes (set via Pool initializer)
 METADATA_CACHE = None
 
-def _init_worker(metadata_cache):
-    """Initializer for Pool workers: set global metadata cache."""
+def _init_worker(metadata_cache_path):
+    """Initializer for Pool workers: load metadata cache from a file path."""
     global METADATA_CACHE
-    METADATA_CACHE = metadata_cache
+    METADATA_CACHE = {}
+    try:
+        if metadata_cache_path:
+            with open(metadata_cache_path, 'rb') as f:
+                METADATA_CACHE = pickle.load(f)
+    except Exception:
+        METADATA_CACHE = {}
 
 
 def _map_qa_file(args_tuple):
@@ -752,6 +759,8 @@ def main():
                         help='Maximum number of samples to cache. Overrides --sample_percent if set.')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for subset sampling (default: 42)')
+    parser.add_argument('--maxtasksperchild', type=int, default=100,
+                        help='Recycle worker after this many tasks (default: 100)')
     args = parser.parse_args()
     
     # Validate sample_percent
@@ -841,6 +850,13 @@ def main():
     num_workers = args.num_workers or max(1, cpu_count() - 2)
     print(f"  Workers: {num_workers}")
     print(f"  Chunk size: {args.chunk_size}")
+
+    # Use 'spawn' start method to avoid large forked memory copies
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # start method already set; ignore
+        pass
     
     # =========================================================================
     # STEP 1: Load split info
@@ -936,8 +952,19 @@ def main():
     mimic_cxr_str = str(mimic_cxr_path)
     sg_dir_str = str(sg_dir) if sg_dir.exists() else None
     
-    # Pass None for metadata_cache in chunk args to avoid pickling the full
-    # metadata dict with every task. Workers receive the cache via initializer.
+    # Persist metadata_cache to a temp file so workers can load it from disk
+    # (avoids pickling the large dict into IPC for each worker).
+    metadata_tmp_path = None
+    if metadata_cache:
+        try:
+            md_fd, md_tmp = tempfile.mkstemp(suffix='.pkl', prefix='prebuild_metadata_')
+            with os.fdopen(md_fd, 'wb') as mf:
+                pickle.dump(metadata_cache, mf, protocol=pickle.HIGHEST_PROTOCOL)
+            metadata_tmp_path = md_tmp
+        except Exception:
+            metadata_tmp_path = None
+
+    # Pass None for metadata_cache in chunk args; workers will load via initializer
     chunk_args_list = [
         (chunk, valid_studies, mimic_cxr_str, sg_dir_str, None)
         for chunk in chunks
@@ -954,8 +981,13 @@ def main():
     start_time = time.time()
     
     try:
-        # Use initializer to populate METADATA_CACHE in each worker process
-        with Pool(processes=num_workers, initializer=_init_worker, initargs=(metadata_cache,)) as pool:
+        # Use initializer to populate METADATA_CACHE in each worker process.
+        with Pool(processes=num_workers, initializer=_init_worker, initargs=(init_arg,),
+                  maxtasksperchild=args.maxtasksperchild) as pool:
+        # full dict to avoid large IPC serialization.
+        init_arg = metadata_tmp_path if metadata_tmp_path else None
+        with Pool(processes=num_workers, initializer=_init_worker, initargs=(init_arg,),
+              maxtasksperchild=args.maxtasksperchild) as pool:
             # Use imap_unordered for better performance and progress tracking
             for i, result in enumerate(pool.imap_unordered(_map_qa_chunk, chunk_args_list)):
                 # Result may contain a temp_file where the worker wrote the
@@ -1031,6 +1063,13 @@ def main():
             total_skipped_img += result.get('files_skipped_img', 0)
     
     elapsed = time.time() - start_time
+
+    # Cleanup metadata temp file (workers have already loaded it)
+    if metadata_tmp_path:
+        try:
+            os.remove(metadata_tmp_path)
+        except Exception:
+            pass
     
     # ============ REDUCE PHASE (already done - just concatenation) ============
     print(f"\n  REDUCE phase: Combined {len(all_samples):,} samples")
