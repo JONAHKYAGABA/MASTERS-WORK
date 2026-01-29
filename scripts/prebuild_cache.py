@@ -979,15 +979,14 @@ def main():
     total_skipped_img = 0
     
     start_time = time.time()
-    
+
     try:
-        # Use initializer to populate METADATA_CACHE in each worker process.
-        with Pool(processes=num_workers, initializer=_init_worker, initargs=(init_arg,),
-                  maxtasksperchild=args.maxtasksperchild) as pool:
-        # full dict to avoid large IPC serialization.
+        # Prepare initializer argument (path to metadata temp file or None)
         init_arg = metadata_tmp_path if metadata_tmp_path else None
-        with Pool(processes=num_workers, initializer=_init_worker, initargs=(init_arg,),
-              maxtasksperchild=args.maxtasksperchild) as pool:
+
+        # Use initializer to populate METADATA_CACHE in each worker process.
+        with Pool(processes=num_workers, initializer=_init_worker,
+                  initargs=(init_arg,), maxtasksperchild=args.maxtasksperchild) as pool:
             # Use imap_unordered for better performance and progress tracking
             for i, result in enumerate(pool.imap_unordered(_map_qa_chunk, chunk_args_list)):
                 # Result may contain a temp_file where the worker wrote the
