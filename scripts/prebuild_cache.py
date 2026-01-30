@@ -749,24 +749,56 @@ def main():
     print("STEP 1: Loading split info...")
     print("-" * 70)
     
+    # Preferred: per-QA split file (one line per study like 'p10000032_s50414267')
     split_file = mimic_qa_path / f"splits/{args.split}_studies.txt"
-    if not split_file.exists():
-        print(f"ERROR: Split file not found: {split_file}")
-        sys.exit(1)
-    
-    with open(split_file, 'r') as f:
-        lines = [l.strip() for l in f if l.strip()]
-    
     valid_studies = set()
-    for line in lines:
-        if line.startswith('s'):
+
+    if split_file.exists():
+        with open(split_file, 'r') as f:
+            lines = [l.strip() for l in f if l.strip()]
+
+        for line in lines:
+            # Accept multiple formats: 'p10000032_s50414267' or 's50414267_p10000032'
+            parts = line.split('_')
             try:
-                parts = line.split('_')
-                subject_id = int(parts[0][2:])
-                study_id = int(parts[1][1:])
-                valid_studies.add((subject_id, study_id))
-            except:
+                if len(parts) >= 2:
+                    # Identify which part is subject vs study by prefix
+                    a, b = parts[0], parts[1]
+                    if a.lower().startswith('p') and b.lower().startswith('s'):
+                        subject_id = int(a.lstrip('pP'))
+                        study_id = int(b.lstrip('sS'))
+                    elif a.lower().startswith('s') and b.lower().startswith('p'):
+                        subject_id = int(b.lstrip('pP'))
+                        study_id = int(a.lstrip('sS'))
+                    else:
+                        # Fallback: try to parse digits
+                        subject_id = int(''.join(filter(str.isdigit, a)))
+                        study_id = int(''.join(filter(str.isdigit, b)))
+                    valid_studies.add((subject_id, study_id))
+            except Exception:
                 continue
+        print(f"  {len(valid_studies):,} studies loaded from split file {split_file}")
+    else:
+        # Fallback: try to load split info from MIMIC-CXR split CSV (common install layout)
+        mimic_split_csv = mimic_cxr_path / 'mimic-cxr-2.0.0-split.csv.gz'
+        if not mimic_split_csv.exists():
+            mimic_split_csv = mimic_cxr_path / 'mimic-cxr-2.0.0-split.csv'
+
+        if mimic_split_csv.exists():
+            try:
+                import pandas as pd
+                df_split = pd.read_csv(mimic_split_csv, compression='gzip' if str(mimic_split_csv).endswith('.gz') else None)
+                split_name = 'validate' if args.split == 'val' else args.split
+                df_split = df_split[df_split['split'] == split_name]
+                valid_studies = set(zip(df_split['subject_id'].astype(int), df_split['study_id'].astype(int)))
+                print(f"  {len(valid_studies):,} studies loaded from {mimic_split_csv.name}")
+            except Exception as e:
+                print(f"ERROR: Failed to read MIMIC split CSV fallback: {e}")
+                sys.exit(1)
+        else:
+            print(f"ERROR: Split file not found: {split_file}")
+            print(f" and fallback split CSV not found at: {mimic_cxr_path}")
+            sys.exit(1)
     
     print(f"  {len(valid_studies):,} studies in '{args.split}' split")
     
@@ -797,9 +829,16 @@ def main():
     
     metadata_cache = _load_metadata_cache(str(mimic_cxr_path))
     
-    # Scene graph directory
-    sg_dir = mimic_qa_path.parent / 'scene_graphs'
-    if not sg_dir.exists():
+    # Scene graph directory - accept either 'scene_graphs' or 'scene_data'
+    preferred_sg = mimic_qa_path.parent / 'scene_graphs'
+    alt_sg = mimic_qa_path.parent / 'scene_data'
+    if preferred_sg.exists():
+        sg_dir = preferred_sg
+        print("  Using scene graph directory: scene_graphs")
+    elif alt_sg.exists():
+        sg_dir = alt_sg
+        print("  Using scene graph directory: scene_data")
+    else:
         sg_dir = None
         print("  Scene graph directory not found")
     
