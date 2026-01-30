@@ -851,9 +851,14 @@ def main():
     print(f"  Workers: {num_workers}")
     print(f"  Chunk size: {args.chunk_size}")
 
-    # Use 'spawn' start method to avoid large forked memory copies
+    # Prefer 'forkserver' start method (safer for large multiprocessing jobs on Unix)
+    # Fall back to 'spawn' if 'forkserver' isn't available.
     try:
-        mp.set_start_method('spawn', force=True)
+        available = mp.get_all_start_methods()
+        if 'forkserver' in available:
+            mp.set_start_method('forkserver', force=True)
+        else:
+            mp.set_start_method('spawn', force=True)
     except RuntimeError:
         # start method already set; ignore
         pass
@@ -1096,9 +1101,33 @@ def main():
     print(f"  Time elapsed: {elapsed:.1f}s")
     
     if all_samples:
-        with open(cache_path, 'wb') as f:
-            pickle.dump(all_samples, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
+        # Atomically write cache to avoid leaving a partially-written file
+        # if the process is interrupted. Write to a temp file in the same
+        # directory and then replace the final path.
+        tmp_fd = None
+        tmp_path = None
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.pkl', prefix=cache_path.name + '.tmp.', dir=str(cache_path.parent))
+            with os.fdopen(tmp_fd, 'wb') as f:
+                pickle.dump(all_samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    # On some platforms fsync may fail for special filesystems; ignore
+                    pass
+            # Atomic replace
+            os.replace(tmp_path, str(cache_path))
+        except Exception as e:
+            # Cleanup temp file if present
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            print(f"  ✗ Failed to save cache atomically: {e}")
+            raise
+
         mb = cache_path.stat().st_size / (1024 * 1024)
         print(f"\n  ✓ Saved: {cache_path}")
         print(f"    Size: {mb:.1f} MB")
