@@ -756,25 +756,20 @@ def main():
     print("STEP 1: Loading split info...")
     print("-" * 70)
     
-    split_file = mimic_qa_path / f"splits/{args.split}_studies.txt"
+    import pandas as pd
+    split_file = mimic_cxr_path / 'mimic-cxr-2.0.0-split.csv.gz'
+    if not split_file.exists():
+        split_file = mimic_cxr_path / 'mimic-cxr-2.0.0-split.csv'
+    
     if not split_file.exists():
         print(f"ERROR: Split file not found: {split_file}")
         sys.exit(1)
     
-    with open(split_file, 'r') as f:
-        lines = [l.strip() for l in f if l.strip()]
+    compression = 'gzip' if str(split_file).endswith('.gz') else None
+    df = pd.read_csv(split_file, compression=compression)
+    df = df[df['split'] == args.split]
     
-    valid_studies = set()
-    for line in lines:
-        if line.startswith('s'):
-            try:
-                parts = line.split('_')
-                subject_id = int(parts[0][2:])
-                study_id = int(parts[1][1:])
-                valid_studies.add((subject_id, study_id))
-            except:
-                continue
-    
+    valid_studies = set(zip(df['subject_id'], df['study_id']))
     print(f"  {len(valid_studies):,} studies in '{args.split}' split")
     
     # =========================================================================
@@ -784,7 +779,7 @@ def main():
     print("STEP 2: Collecting QA file paths...")
     print("-" * 70)
     
-    qa_files = list(mimic_qa_path.glob('p**/s*.qa.json'))
+    qa_files = list(mimic_qa_path.glob('qa/p**/s*.qa.json'))
     print(f"  {len(qa_files):,} QA files found")
     
     # Sample if needed
@@ -805,7 +800,7 @@ def main():
     metadata_cache = _load_metadata_cache(str(mimic_cxr_path))
     
     # Scene graph directory
-    sg_dir = mimic_qa_path.parent / 'scene_graphs'
+    sg_dir = mimic_qa_path / 'scene_data'
     if not sg_dir.exists():
         sg_dir = None
         print("  Scene graph directory not found")
