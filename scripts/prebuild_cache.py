@@ -23,6 +23,12 @@ Run (SUBSET for pipeline testing - recommended for initial development):
     # Very small subset for debugging (1%)
     python scripts/prebuild_cache.py --config configs/pretrain_config.yaml --sample_percent 1 --split train
     python scripts/prebuild_cache.py --config configs/pretrain_config.yaml --sample_percent 1 --split val
+
+Resume or checkpoint long runs:
+    # Save partial cache every 50 chunks
+    python scripts/prebuild_cache.py --config configs/pretrain_config.yaml --checkpoint_every 50
+    # Resume from the last checkpoint if it exists
+    python scripts/prebuild_cache.py --config configs/pretrain_config.yaml --resume
 """
 
 import os
@@ -38,6 +44,42 @@ from functools import partial
 import time
 import random
 import tempfile
+
+
+# =============================================================================
+# CHECKPOINTING (optional)
+# =============================================================================
+
+def _load_checkpoint(checkpoint_path: Path) -> dict:
+    """Load checkpoint state from disk."""
+    if not checkpoint_path.exists():
+        return {}
+    try:
+        with open(checkpoint_path, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return {}
+
+
+def _save_checkpoint(checkpoint_path: Path, state: dict) -> None:
+    """Persist checkpoint state to disk."""
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.pkl', prefix=checkpoint_path.name + '.tmp.', dir=str(checkpoint_path.parent))
+    try:
+        with os.fdopen(tmp_fd, 'wb') as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, str(checkpoint_path))
+    except Exception:
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
 
 # Add project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -662,12 +704,12 @@ def _map_qa_chunk(chunk_args):
     This reduces IPC overhead significantly.
     
     Args:
-        chunk_args: (list_of_qa_file_paths, valid_studies_frozen, mimic_cxr_path, sg_dir_path, metadata_cache)
+        chunk_args: (chunk_idx, list_of_qa_file_paths, valid_studies_frozen, mimic_cxr_path, sg_dir_path, metadata_cache)
     
     Returns:
         dict with 'samples' list and stats
     """
-    file_paths, valid_studies_frozen, mimic_cxr_str, sg_dir_str, metadata_cache = chunk_args
+    chunk_idx, file_paths, valid_studies_frozen, mimic_cxr_str, sg_dir_str, metadata_cache = chunk_args
     
     all_samples = []
     files_processed = 0
@@ -710,6 +752,7 @@ def _map_qa_chunk(chunk_args):
         all_samples = None
 
         return {
+            'chunk_idx': chunk_idx,
             'temp_file': tmp_path,
             'files_processed': files_processed,
             'files_skipped_split': files_skipped_split,
@@ -718,6 +761,7 @@ def _map_qa_chunk(chunk_args):
     except Exception:
         # Fallback to in-memory return (rare)
         return {
+            'chunk_idx': chunk_idx,
             'samples': all_samples,
             'files_processed': files_processed,
             'files_skipped_split': files_skipped_split,
@@ -761,6 +805,10 @@ def main():
                         help='Random seed for subset sampling (default: 42)')
     parser.add_argument('--maxtasksperchild', type=int, default=100,
                         help='Recycle worker after this many tasks (default: 100)')
+    parser.add_argument('--checkpoint_every', type=int, default=0,
+                        help='Save partial cache every N chunks (0 disables).')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume from checkpoint/partial cache if available.')
     args = parser.parse_args()
     
     # Validate sample_percent
@@ -817,6 +865,9 @@ def main():
         cache_path = cache_dir / f"samples_{args.split}_{cache_key}.pkl"
     
     print(f"  Cache: {cache_path}")
+
+    checkpoint_path = cache_path.with_suffix('.checkpoint.pkl')
+    partial_cache_path = cache_path.with_suffix('.partial.pkl')
     
     # Handle --validate_only
     if args.validate_only:
@@ -933,6 +984,22 @@ def main():
             sample_count = max(1, int(len(qa_files) * (args.sample_percent / 100.0)))
             qa_files = random.sample(qa_files, sample_count)
             print(f"  Sampled {len(qa_files):,} files ({args.sample_percent}% of {total_qa_files:,})")
+
+    # ===== RESUME FROM CHECKPOINT (optional) =====
+    resume_state = {}
+    if args.resume and checkpoint_path.exists():
+        print("\n  ♻ Resuming from checkpoint...")
+        resume_state = _load_checkpoint(checkpoint_path)
+        if resume_state:
+            # Trust saved QA list to keep sampling consistent
+            saved_qa_files = resume_state.get('qa_files')
+            if saved_qa_files:
+                qa_files = saved_qa_files
+                print(f"  Loaded saved QA file list: {len(qa_files):,} files")
+            else:
+                print("  ⚠ Checkpoint missing QA file list; resume may be inconsistent")
+        else:
+            print("  ⚠ Failed to load checkpoint; starting fresh")
     
     # =========================================================================
     # STEP 3: MapReduce processing
@@ -971,8 +1038,8 @@ def main():
 
     # Pass None for metadata_cache in chunk args; workers will load via initializer
     chunk_args_list = [
-        (chunk, valid_studies, mimic_cxr_str, sg_dir_str, None)
-        for chunk in chunks
+        (idx, chunk, valid_studies, mimic_cxr_str, sg_dir_str, None)
+        for idx, chunk in enumerate(chunks)
     ]
     
     # ============ MAP PHASE ============
@@ -982,8 +1049,68 @@ def main():
     total_processed = 0
     total_skipped_split = 0
     total_skipped_img = 0
+    processed_chunks = set()
+
+    # Resume partial cache (if requested)
+    if args.resume and resume_state:
+        processed_chunks = set(resume_state.get('processed_chunks', []))
+        total_processed = resume_state.get('files_processed', 0)
+        total_skipped_split = resume_state.get('files_skipped_split', 0)
+        total_skipped_img = resume_state.get('files_skipped_img', 0)
+        if partial_cache_path.exists():
+            try:
+                with open(partial_cache_path, 'rb') as f:
+                    all_samples = pickle.load(f)
+                print(f"  Loaded partial cache: {len(all_samples):,} samples")
+            except Exception:
+                print("  ⚠ Failed to load partial cache; continuing without it")
+                all_samples = []
+
+        if processed_chunks:
+            print(f"  Resuming from {len(processed_chunks):,} completed chunks")
+
+    # Filter chunks to resume only remaining work
+    if processed_chunks:
+        chunk_args_list = [c for c in chunk_args_list if c[0] not in processed_chunks]
+        print(f"  Remaining chunks to process: {len(chunk_args_list)}")
     
     start_time = time.time()
+
+    def _save_partial_cache(path: Path, samples: list) -> None:
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.pkl', prefix=path.name + '.tmp.', dir=str(path.parent))
+        try:
+            with os.fdopen(tmp_fd, 'wb') as f:
+                pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp_path, str(path))
+        except Exception:
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+
+    def _checkpoint_state(processed_idx_set: set) -> dict:
+        return {
+            'version': 1,
+            'cache_path': str(cache_path),
+            'cache_key': cache_key,
+            'split': args.split,
+            'sample_percent': args.sample_percent,
+            'max_samples': args.max_samples,
+            'seed': args.seed,
+            'chunk_size': args.chunk_size,
+            'qa_files': qa_files,
+            'processed_chunks': sorted(list(processed_idx_set)),
+            'files_processed': total_processed,
+            'files_skipped_split': total_skipped_split,
+            'files_skipped_img': total_skipped_img,
+        }
 
     try:
         # Prepare initializer argument (path to metadata temp file or None)
@@ -1018,17 +1145,30 @@ def main():
                 total_processed += result.get('files_processed', 0)
                 total_skipped_split += result.get('files_skipped_split', 0)
                 total_skipped_img += result.get('files_skipped_img', 0)
+                if result.get('chunk_idx') is not None:
+                    processed_chunks.add(result.get('chunk_idx'))
                 
                 # Progress update every 10 chunks or at end
-                if (i + 1) % 10 == 0 or (i + 1) == len(chunks):
+                if (i + 1) % 10 == 0 or (i + 1) == len(chunk_args_list):
                     elapsed = time.time() - start_time
                     rate = (i + 1) / elapsed if elapsed > 0 else 0
-                    eta = (len(chunks) - i - 1) / rate if rate > 0 else 0
+                    eta = (len(chunk_args_list) - i - 1) / rate if rate > 0 else 0
                     
-                    print(f"    [{i+1}/{len(chunks)}] "
+                    print(f"    [{i+1}/{len(chunk_args_list)}] "
                           f"Samples: {len(all_samples):,} | "
                           f"Rate: {rate:.1f} chunks/s | "
                           f"ETA: {eta:.0f}s")
+
+                # Checkpointing (optional)
+                if args.checkpoint_every and args.checkpoint_every > 0:
+                    if (i + 1) % args.checkpoint_every == 0 or (i + 1) == len(chunk_args_list):
+                        print(f"    ⏳ Saving checkpoint at chunk {i+1}...")
+                        try:
+                            _save_partial_cache(partial_cache_path, all_samples)
+                            _save_checkpoint(checkpoint_path, _checkpoint_state(processed_chunks))
+                            print(f"    ✓ Checkpoint saved: {partial_cache_path.name}")
+                        except Exception as e:
+                            print(f"    ⚠ Checkpoint save failed: {e}")
     
     except Exception as e:
         print(f"\n  ⚠ Multiprocessing failed: {e}")
@@ -1042,7 +1182,7 @@ def main():
         total_skipped_split = 0
         total_skipped_img = 0
         
-        for chunk_args in tqdm(chunk_args_list, desc="Processing", unit="chunk"):
+        for i, chunk_args in enumerate(tqdm(chunk_args_list, desc="Processing", unit="chunk")):
             result = _map_qa_chunk(chunk_args)
             if result is None:
                 continue
@@ -1065,6 +1205,18 @@ def main():
             total_processed += result.get('files_processed', 0)
             total_skipped_split += result.get('files_skipped_split', 0)
             total_skipped_img += result.get('files_skipped_img', 0)
+            if result.get('chunk_idx') is not None:
+                processed_chunks.add(result.get('chunk_idx'))
+
+            if args.checkpoint_every and args.checkpoint_every > 0:
+                if (i + 1) % args.checkpoint_every == 0 or (i + 1) == len(chunk_args_list):
+                    print(f"    ⏳ Saving checkpoint at chunk {i+1}...")
+                    try:
+                        _save_partial_cache(partial_cache_path, all_samples)
+                        _save_checkpoint(checkpoint_path, _checkpoint_state(processed_chunks))
+                        print(f"    ✓ Checkpoint saved: {partial_cache_path.name}")
+                    except Exception as e:
+                        print(f"    ⚠ Checkpoint save failed: {e}")
     
     elapsed = time.time() - start_time
 
@@ -1131,6 +1283,15 @@ def main():
         mb = cache_path.stat().st_size / (1024 * 1024)
         print(f"\n  ✓ Saved: {cache_path}")
         print(f"    Size: {mb:.1f} MB")
+
+        # Cleanup partial cache/checkpoint if present
+        try:
+            if partial_cache_path.exists():
+                partial_cache_path.unlink()
+            if checkpoint_path.exists():
+                checkpoint_path.unlink()
+        except Exception:
+            pass
     else:
         print("\n  ⚠ No samples to save!")
         sys.exit(1)
