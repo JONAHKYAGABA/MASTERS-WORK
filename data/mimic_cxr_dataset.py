@@ -372,7 +372,8 @@ class MIMICCXRVQADataset(Dataset):
         use_exports: bool = False,  # Use pre-filtered exports folder
         cache_dir: Optional[str] = None,  # Cache directory for samples
         use_cache: bool = True,  # Whether to use caching
-        force_rebuild_cache: bool = False  # Force rebuild even if cache exists
+        force_rebuild_cache: bool = False,  # Force rebuild even if cache exists
+        prebuilt_cache_path: Optional[str] = None  # Optional: load samples from external prebuilt cache (.pkl)
     ):
         self.mimic_cxr_path = Path(mimic_cxr_path)
         self.mimic_qa_path = Path(mimic_qa_path)
@@ -385,6 +386,7 @@ class MIMICCXRVQADataset(Dataset):
         self.use_exports = use_exports
         self.use_cache = use_cache
         self.force_rebuild_cache = force_rebuild_cache
+        self.prebuilt_cache_path = prebuilt_cache_path
         
         # Setup cache directory
         self.cache_dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
@@ -489,6 +491,48 @@ class MIMICCXRVQADataset(Dataset):
     
     def _load_samples_with_cache(self) -> List[Dict[str, Any]]:
         """Load samples with caching support for faster distributed training."""
+        # If an explicit external cache is provided (e.g., produced by scripts/prebuild_cache.py),
+        # load it directly. This is especially useful for subset caches for pretraining.
+        if self.prebuilt_cache_path:
+            p = Path(self.prebuilt_cache_path)
+            if p.exists():
+                try:
+                    logger.info(f"Loading samples from PREBUILT cache: {p}")
+                    with open(p, 'rb') as f:
+                        samples = pickle.load(f)
+
+                    # Best-effort filtering to align with dataset config
+                    if self.view_filter and self.view_filter != 'all':
+                        filtered = []
+                        for s in samples:
+                            view_pos = s.get('view_position')
+                            if view_pos is None and s.get('dicom_id'):
+                                view_pos = self._get_view_position(s.get('dicom_id'))
+                            if self._is_valid_view(view_pos):
+                                filtered.append(s)
+                        samples = filtered
+
+                    if self.question_types:
+                        samples = [s for s in samples if s.get('question_type') in set(self.question_types)]
+
+                    # Quality filtering is not possible if the prebuilt cache doesn't carry quality metadata
+                    if self.quality_grade and self.quality_grade.lower() not in ('', 'all', 'none'):
+                        logger.warning(
+                            "prebuilt_cache_path is set but quality_grade filtering requires per-question quality metadata "
+                            "(not present in prebuilt cache). Proceeding without quality filtering."
+                        )
+
+                    # Apply max_samples limit if needed
+                    if self.max_samples and len(samples) > self.max_samples:
+                        samples = samples[:self.max_samples]
+
+                    logger.info(f"Loaded {len(samples)} samples from PREBUILT cache")
+                    return samples
+                except Exception as e:
+                    logger.warning(f"Failed to load prebuilt cache '{p}', falling back to normal loading: {e}")
+            else:
+                logger.warning(f"prebuilt_cache_path does not exist: {p} (falling back to normal loading)")
+
         cache_path = self._get_cache_path()
         
         # Try to load from cache

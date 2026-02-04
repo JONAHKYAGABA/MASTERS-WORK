@@ -1018,6 +1018,7 @@ def main(args):
         max_samples=args.max_samples,
         cache_dir=cache_dir,
         use_cache=True,
+        prebuilt_cache_path=args.prebuilt_cache_train,
     )
     
     # Barrier to ensure all processes have loaded/cached train data
@@ -1037,6 +1038,7 @@ def main(args):
         max_samples=args.max_samples // 10 if args.max_samples else None,
         cache_dir=cache_dir,
         use_cache=True,
+        prebuilt_cache_path=args.prebuilt_cache_val,
     )
     
     # Barrier to ensure all processes have loaded/cached val data
@@ -1463,6 +1465,10 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, help='Learning rate')
     parser.add_argument('--max_samples', type=int, default=None, help='Max samples (for debugging)')
+    parser.add_argument('--prebuilt_cache_train', type=str, default=None,
+                       help='Path to prebuilt TRAIN samples .pkl (e.g., from scripts/prebuild_cache.py)')
+    parser.add_argument('--prebuilt_cache_val', type=str, default=None,
+                       help='Path to prebuilt VAL/VALIDATE samples .pkl (e.g., from scripts/prebuild_cache.py)')
     
     # Distributed training (per methodology Section 11)
     parser.add_argument('--use_deepspeed', action='store_true',

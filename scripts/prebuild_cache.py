@@ -1217,7 +1217,18 @@ def main():
                   initargs=(init_arg,), maxtasksperchild=args.maxtasksperchild) as pool:
             # Use imap_unordered for better performance; show tqdm progress.
             from tqdm import tqdm
-            with tqdm(total=len(chunk_args_list), desc="Caching (MAP)", unit="chunk") as pbar:
+            # When stdout/stderr is redirected (e.g., nohup -> file), tqdm's frequent
+            # carriage-return updates can make logs hard to read. Slow it down.
+            is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)() or getattr(sys.stderr, "isatty", lambda: False)())
+            mininterval = 1.0 if is_tty else 30.0
+            with tqdm(
+                total=len(chunk_args_list),
+                desc="Caching (MAP)",
+                unit="chunk",
+                mininterval=mininterval,
+                dynamic_ncols=is_tty,
+                leave=is_tty,
+            ) as pbar:
                 for i, result in enumerate(pool.imap_unordered(_map_qa_chunk, chunk_args_list)):
                     # Result may contain a temp_file where the worker wrote the
                     # full samples to avoid large IPC payloads. Load and cleanup.
@@ -1261,13 +1272,13 @@ def main():
                     # Checkpointing (optional)
                     if args.checkpoint_every and args.checkpoint_every > 0:
                         if (i + 1) % args.checkpoint_every == 0 or (i + 1) == len(chunk_args_list):
-                            print(f"    ⏳ Saving checkpoint at chunk {i+1}...")
+                            pbar.write(f"    ⏳ Saving checkpoint at chunk {i+1}...")
                             try:
                                 _save_partial_cache(partial_cache_path, all_samples)
                                 _save_checkpoint(checkpoint_path, _checkpoint_state(processed_chunks))
-                                print(f"    ✓ Checkpoint saved: {partial_cache_path.name}")
+                                pbar.write(f"    ✓ Checkpoint saved: {partial_cache_path.name}")
                             except Exception as e:
-                                print(f"    ⚠ Checkpoint save failed: {e}")
+                                pbar.write(f"    ⚠ Checkpoint save failed: {e}")
     
     except Exception as e:
         print(f"\n  ⚠ Multiprocessing failed: {e}")
@@ -1275,13 +1286,24 @@ def main():
         
         # Sequential fallback with progress
         from tqdm import tqdm
+        is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)() or getattr(sys.stderr, "isatty", lambda: False)())
+        mininterval = 1.0 if is_tty else 30.0
         
         all_samples = []
         total_processed = 0
         total_skipped_split = 0
         total_skipped_img = 0
         
-        for i, chunk_args in enumerate(tqdm(chunk_args_list, desc="Caching (sequential)", unit="chunk")):
+        for i, chunk_args in enumerate(
+            tqdm(
+                chunk_args_list,
+                desc="Caching (sequential)",
+                unit="chunk",
+                mininterval=mininterval,
+                dynamic_ncols=is_tty,
+                leave=is_tty,
+            )
+        ):
             result = _map_qa_chunk(chunk_args)
             if result is None:
                 continue
@@ -1309,13 +1331,13 @@ def main():
 
             if args.checkpoint_every and args.checkpoint_every > 0:
                 if (i + 1) % args.checkpoint_every == 0 or (i + 1) == len(chunk_args_list):
-                    print(f"    ⏳ Saving checkpoint at chunk {i+1}...")
+                    tqdm.write(f"    ⏳ Saving checkpoint at chunk {i+1}...")
                     try:
                         _save_partial_cache(partial_cache_path, all_samples)
                         _save_checkpoint(checkpoint_path, _checkpoint_state(processed_chunks))
-                        print(f"    ✓ Checkpoint saved: {partial_cache_path.name}")
+                        tqdm.write(f"    ✓ Checkpoint saved: {partial_cache_path.name}")
                     except Exception as e:
-                        print(f"    ⚠ Checkpoint save failed: {e}")
+                        tqdm.write(f"    ⚠ Checkpoint save failed: {e}")
     
     elapsed = time.time() - start_time
 
