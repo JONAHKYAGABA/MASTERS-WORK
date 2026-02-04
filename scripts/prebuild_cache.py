@@ -741,12 +741,16 @@ def _map_qa_chunk(chunk_args):
     try:
         fd, tmp_path = tempfile.mkstemp(suffix='.pkl', prefix='prebuild_chunk_')
         with os.fdopen(fd, 'wb') as tf:
-            pickle.dump({
-                'samples': all_samples,
-                'files_processed': files_processed,
-                'files_skipped_split': files_skipped_split,
-                'files_skipped_img': files_skipped_img,
-            }, tf, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(
+                {
+                    'samples': all_samples,
+                    'files_processed': files_processed,
+                    'files_skipped_split': files_skipped_split,
+                    'files_skipped_img': files_skipped_img,
+                },
+                tf,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
 
         # Clear large list to free memory in worker (best-effort)
         all_samples = None
@@ -1075,9 +1079,11 @@ def main():
         print(f"  Remaining chunks to process: {len(chunk_args_list)}")
     
     start_time = time.time()
-
+    
     def _save_partial_cache(path: Path, samples: list) -> None:
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.pkl', prefix=path.name + '.tmp.', dir=str(path.parent))
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            suffix='.pkl', prefix=path.name + '.tmp.', dir=str(path.parent)
+        )
         try:
             with os.fdopen(tmp_fd, 'wb') as f:
                 pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1279,7 +1285,7 @@ def main():
                 pass
             print(f"  ✗ Failed to save cache atomically: {e}")
             raise
-
+        
         mb = cache_path.stat().st_size / (1024 * 1024)
         print(f"\n  ✓ Saved: {cache_path}")
         print(f"    Size: {mb:.1f} MB")
