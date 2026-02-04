@@ -898,8 +898,15 @@ def main(args):
                 args.use_deepspeed = True
                 logger.info(f"Auto-enabled DeepSpeed ZeRO-{hardware_info.deepspeed_stage} for {hardware_info.num_gpus} GPUs")
             elif hardware_info.num_gpus > 1:
-                args.use_ddp = True
-                logger.info(f"Auto-enabled DDP for {hardware_info.num_gpus} GPUs")
+                # IMPORTANT:
+                # DDP requires launching with torchrun (WORLD_SIZE>1) to initialize
+                # the default process group. If we are running via plain `python`,
+                # auto-enabling DDP will crash. Prefer DataParallel in that case.
+                logger.info(
+                    f"Multiple GPUs detected ({hardware_info.num_gpus}) but DeepSpeed is unavailable. "
+                    "Using DataParallel fallback (no distributed init). "
+                    "For true DDP, launch with: torchrun --nproc_per_node=<num_gpus> train_mimic_cxr.py --use_ddp ..."
+                )
     else:
         hardware_info = None
     
@@ -1174,37 +1181,48 @@ def main(args):
         
     # DDP or DataParallel setup
     elif use_ddp:
-        if is_main_process(local_rank):
-            logger.info("Initializing DistributedDataParallel...")
-        
-        model = model.to(device)
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=True
-        )
-        
-        # Standard optimizer and scheduler
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay
-        )
-        
-        from torch.optim.lr_scheduler import OneCycleLR
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=config.training.learning_rate,
-            total_steps=total_steps,
-            pct_start=config.training.warmup_ratio,
-            anneal_strategy='cos'
-        )
-        
-        scaler = GradScaler('cuda') if config.training.fp16 else None
+        # Guardrail: DDP requires an initialized process group (usually via torchrun).
+        # If we're not actually in a distributed run, fall back safely.
+        if not dist.is_available() or not dist.is_initialized():
+            if is_main_process(local_rank):
+                logger.warning(
+                    "DDP was enabled but no default process group is initialized. "
+                    "Falling back to DataParallel/single-process mode. "
+                    "If you intended to use DDP, launch with torchrun --nproc_per_node=<n> and pass --use_ddp."
+                )
+            use_ddp = False
+        if use_ddp:
+            if is_main_process(local_rank):
+                logger.info("Initializing DistributedDataParallel...")
+            
+            model = model.to(device)
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True
+            )
+            
+            # Standard optimizer and scheduler
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=config.training.learning_rate,
+                weight_decay=config.training.weight_decay
+            )
+            
+            from torch.optim.lr_scheduler import OneCycleLR
+            scheduler = OneCycleLR(
+                optimizer,
+                max_lr=config.training.learning_rate,
+                total_steps=total_steps,
+                pct_start=config.training.warmup_ratio,
+                anneal_strategy='cos'
+            )
+            
+            scaler = GradScaler('cuda') if config.training.fp16 else None
         
     # Single GPU / DataParallel fallback
-    else:
+    if not use_deepspeed and not use_ddp:
         model = model.to(device)
         
         # Multi-GPU with DataParallel (less efficient than DDP)
