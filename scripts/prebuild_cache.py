@@ -81,6 +81,53 @@ def _save_checkpoint(checkpoint_path: Path, state: dict) -> None:
             pass
         raise
 
+# =============================================================================
+# CACHE CLEANUP HELPERS
+# =============================================================================
+
+def _safe_unlink(path: Path) -> bool:
+    """Best-effort file delete. Returns True if deleted, False otherwise."""
+    try:
+        if path.exists():
+            path.unlink()
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _cleanup_failed_cache_artifacts(
+    cache_path: Path,
+    checkpoint_path: Path,
+    partial_cache_path: Path,
+    cache_dir: Path,
+    *,
+    remove_final_cache: bool,
+) -> None:
+    """
+    Remove artifacts left by failed/interrupted runs.
+
+    Deletes:
+    - checkpoint + partial cache
+    - temp files created during atomic writes (samples_*.pkl.tmp.*)
+    - optionally the final cache_path (if invalid/corrupt)
+    """
+    _safe_unlink(checkpoint_path)
+    _safe_unlink(partial_cache_path)
+
+    if remove_final_cache:
+        _safe_unlink(cache_path)
+
+    # Clean up any stale temp files next to the cache (from interrupted atomic writes)
+    try:
+        prefix = cache_path.name + '.tmp.'
+        for p in cache_dir.iterdir():
+            if p.is_file() and p.name.startswith(prefix):
+                _safe_unlink(p)
+    except Exception:
+        # Best-effort cleanup only
+        pass
+
 # Add project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -813,6 +860,8 @@ def main():
                         help='Save partial cache every N chunks (0 disables).')
     parser.add_argument('--resume', action='store_true',
                         help='Resume from checkpoint/partial cache if available.')
+    parser.add_argument('--keep_failed_cache', action='store_true',
+                        help='Do NOT auto-delete invalid/failed cache files before rebuilding.')
     args = parser.parse_args()
     
     # Validate sample_percent
@@ -872,6 +921,17 @@ def main():
 
     checkpoint_path = cache_path.with_suffix('.checkpoint.pkl')
     partial_cache_path = cache_path.with_suffix('.partial.pkl')
+
+    # If we are NOT resuming, proactively remove stale checkpoint/partial/tmp files
+    # from previous failed/interrupted runs.
+    if not args.keep_failed_cache and not args.resume:
+        _cleanup_failed_cache_artifacts(
+            cache_path=cache_path,
+            checkpoint_path=checkpoint_path,
+            partial_cache_path=partial_cache_path,
+            cache_dir=cache_dir,
+            remove_final_cache=False,
+        )
     
     # Handle --validate_only
     if args.validate_only:
@@ -894,12 +954,42 @@ def main():
         sys.exit(0 if report['overall_valid'] else 1)
     
     if cache_path.exists() and not args.force:
-        with open(cache_path, 'rb') as f:
-            samples = pickle.load(f)
-        print(f"\n✓ Cache exists: {len(samples):,} samples")
-        print(f"  Use --force to rebuild")
-        print(f"  Use --validate_only to check cache validity")
-        return
+        # If a previous run produced a bad/corrupt cache, don't get stuck reusing it.
+        # Validate quickly; if invalid, auto-delete and rebuild.
+        existing_ok = False
+        existing_count = None
+        try:
+            with open(cache_path, 'rb') as f:
+                samples = pickle.load(f)
+            existing_count = len(samples)
+            report = validate_cache(
+                str(cache_path),
+                num_samples=min(args.validate_samples, max(1, existing_count)),
+                check_files=not args.skip_file_checks,
+            )
+            existing_ok = bool(report.get('overall_valid', False))
+        except Exception:
+            existing_ok = False
+
+        if existing_ok:
+            print(f"\n✓ Cache exists and looks valid: {existing_count:,} samples")
+            print(f"  Use --force to rebuild")
+            print(f"  Use --validate_only to check cache validity")
+            return
+
+        if args.keep_failed_cache:
+            print(f"\n⚠ Cache exists but appears INVALID/corrupt: {cache_path}")
+            print("  Re-run with --force to rebuild, or omit --keep_failed_cache to auto-clear it.")
+            return
+
+        print(f"\n♻ Found INVALID/corrupt cache. Clearing and rebuilding: {cache_path}")
+        _cleanup_failed_cache_artifacts(
+            cache_path=cache_path,
+            checkpoint_path=checkpoint_path,
+            partial_cache_path=partial_cache_path,
+            cache_dir=cache_dir,
+            remove_final_cache=True,
+        )
     
     # Determine workers
     num_workers = args.num_workers or max(1, cpu_count() - 2)
@@ -1125,56 +1215,59 @@ def main():
         # Use initializer to populate METADATA_CACHE in each worker process.
         with Pool(processes=num_workers, initializer=_init_worker,
                   initargs=(init_arg,), maxtasksperchild=args.maxtasksperchild) as pool:
-            # Use imap_unordered for better performance and progress tracking
-            for i, result in enumerate(pool.imap_unordered(_map_qa_chunk, chunk_args_list)):
-                # Result may contain a temp_file where the worker wrote the
-                # full samples to avoid large IPC payloads. Load and cleanup.
-                samples = []
-                if result is None:
-                    continue
-                if 'temp_file' in result:
-                    tmp = result.get('temp_file')
-                    try:
-                        with open(tmp, 'rb') as tf:
-                            chunk_data = pickle.load(tf)
-                        samples = chunk_data.get('samples', [])
-                    except Exception:
-                        samples = []
-                    try:
-                        os.remove(tmp)
-                    except Exception:
-                        pass
-                else:
-                    samples = result.get('samples', [])
-
-                all_samples.extend(samples)
-                total_processed += result.get('files_processed', 0)
-                total_skipped_split += result.get('files_skipped_split', 0)
-                total_skipped_img += result.get('files_skipped_img', 0)
-                if result.get('chunk_idx') is not None:
-                    processed_chunks.add(result.get('chunk_idx'))
-                
-                # Progress update every 10 chunks or at end
-                if (i + 1) % 10 == 0 or (i + 1) == len(chunk_args_list):
-                    elapsed = time.time() - start_time
-                    rate = (i + 1) / elapsed if elapsed > 0 else 0
-                    eta = (len(chunk_args_list) - i - 1) / rate if rate > 0 else 0
-                    
-                    print(f"    [{i+1}/{len(chunk_args_list)}] "
-                          f"Samples: {len(all_samples):,} | "
-                          f"Rate: {rate:.1f} chunks/s | "
-                          f"ETA: {eta:.0f}s")
-
-                # Checkpointing (optional)
-                if args.checkpoint_every and args.checkpoint_every > 0:
-                    if (i + 1) % args.checkpoint_every == 0 or (i + 1) == len(chunk_args_list):
-                        print(f"    ⏳ Saving checkpoint at chunk {i+1}...")
+            # Use imap_unordered for better performance; show tqdm progress.
+            from tqdm import tqdm
+            with tqdm(total=len(chunk_args_list), desc="Caching (MAP)", unit="chunk") as pbar:
+                for i, result in enumerate(pool.imap_unordered(_map_qa_chunk, chunk_args_list)):
+                    # Result may contain a temp_file where the worker wrote the
+                    # full samples to avoid large IPC payloads. Load and cleanup.
+                    samples = []
+                    if result is None:
+                        pbar.update(1)
+                        continue
+                    if 'temp_file' in result:
+                        tmp = result.get('temp_file')
                         try:
-                            _save_partial_cache(partial_cache_path, all_samples)
-                            _save_checkpoint(checkpoint_path, _checkpoint_state(processed_chunks))
-                            print(f"    ✓ Checkpoint saved: {partial_cache_path.name}")
-                        except Exception as e:
-                            print(f"    ⚠ Checkpoint save failed: {e}")
+                            with open(tmp, 'rb') as tf:
+                                chunk_data = pickle.load(tf)
+                            samples = chunk_data.get('samples', [])
+                        except Exception:
+                            samples = []
+                        try:
+                            os.remove(tmp)
+                        except Exception:
+                            pass
+                    else:
+                        samples = result.get('samples', [])
+
+                    all_samples.extend(samples)
+                    total_processed += result.get('files_processed', 0)
+                    total_skipped_split += result.get('files_skipped_split', 0)
+                    total_skipped_img += result.get('files_skipped_img', 0)
+                    if result.get('chunk_idx') is not None:
+                        processed_chunks.add(result.get('chunk_idx'))
+
+                    # Update progress bar (keep output clean vs print spam)
+                    pbar.update(1)
+                    if (i + 1) % 5 == 0 or (i + 1) == len(chunk_args_list):
+                        pbar.set_postfix(
+                            samples=f"{len(all_samples):,}",
+                            processed=f"{total_processed:,}",
+                            skip_split=f"{total_skipped_split:,}",
+                            skip_img=f"{total_skipped_img:,}",
+                            refresh=False,
+                        )
+
+                    # Checkpointing (optional)
+                    if args.checkpoint_every and args.checkpoint_every > 0:
+                        if (i + 1) % args.checkpoint_every == 0 or (i + 1) == len(chunk_args_list):
+                            print(f"    ⏳ Saving checkpoint at chunk {i+1}...")
+                            try:
+                                _save_partial_cache(partial_cache_path, all_samples)
+                                _save_checkpoint(checkpoint_path, _checkpoint_state(processed_chunks))
+                                print(f"    ✓ Checkpoint saved: {partial_cache_path.name}")
+                            except Exception as e:
+                                print(f"    ⚠ Checkpoint save failed: {e}")
     
     except Exception as e:
         print(f"\n  ⚠ Multiprocessing failed: {e}")
@@ -1188,7 +1281,7 @@ def main():
         total_skipped_split = 0
         total_skipped_img = 0
         
-        for i, chunk_args in enumerate(tqdm(chunk_args_list, desc="Processing", unit="chunk")):
+        for i, chunk_args in enumerate(tqdm(chunk_args_list, desc="Caching (sequential)", unit="chunk")):
             result = _map_qa_chunk(chunk_args)
             if result is None:
                 continue
