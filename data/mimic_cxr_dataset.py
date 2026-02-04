@@ -392,8 +392,13 @@ class MIMICCXRVQADataset(Dataset):
         self.cache_dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        # Tokenizer (IMPORTANT):
+        # HuggingFace fast tokenizers can deadlock when a Dataset is constructed
+        # in the main process and then DataLoader forks worker processes.
+        # To avoid fork-safety issues, initialize lazily inside the worker the
+        # first time __getitem__ is called.
+        self.tokenizer_name = tokenizer_name
+        self.tokenizer = None
         
         # Initialize transforms
         if transform is not None:
@@ -434,6 +439,12 @@ class MIMICCXRVQADataset(Dataset):
         
         # Load samples (with caching support)
         self.samples = self._load_samples_with_cache()
+    def _get_tokenizer(self):
+        """Lazily initialize tokenizer (fork-safe for DataLoader workers)."""
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+        return self.tokenizer
+
         
         logger.info(f"Loaded {len(self.samples)} samples for {split}")
     
@@ -1057,7 +1068,8 @@ class MIMICCXRVQADataset(Dataset):
         )
         
         # Tokenize question
-        question_inputs = self.tokenizer(
+        tokenizer = self._get_tokenizer()
+        question_inputs = tokenizer(
             sample['question'],
             padding='max_length',
             truncation=True,
