@@ -935,6 +935,11 @@ def main(args):
         config.training.gradient_checkpointing = False
         logger.info("Gradient checkpointing FORCE DISABLED via --no_gradient_checkpointing")
 
+    # Force disable FP16 if flag is set (required when CUDA toolkit can't compile DeepSpeed FP16 ops)
+    if args.no_fp16:
+        config.training.fp16 = False
+        logger.info("FP16 FORCE DISABLED via --no_fp16")
+
     # ----- Phase detection and dataset quality alignment -----
     phase = getattr(config.training, 'phase', 'finetune')
     phase = phase.lower() if isinstance(phase, str) else 'finetune'
@@ -1540,6 +1545,10 @@ if __name__ == "__main__":
     # Gradient checkpointing override
     parser.add_argument('--no_gradient_checkpointing', action='store_true',
                        help='Force disable gradient checkpointing (fixes DataParallel deadlock)')
+    
+    # FP16 override (required when CUDA toolkit is too old to compile DeepSpeed FP16 ops)
+    parser.add_argument('--no_fp16', action='store_true',
+                       help='Force disable FP16 mixed precision (use when CUDA toolkit cannot compile DeepSpeed ops)')
     
     args = parser.parse_args()
     
