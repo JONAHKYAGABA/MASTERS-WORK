@@ -85,8 +85,8 @@ training:
   warmup_ratio: 0.05  # 5% warmup for pretraining
   max_grad_norm: 1.0
   
-  # Mixed precision
-  fp16: true
+  # Mixed precision (disabled - CUDA toolkit too old to compile DeepSpeed FP16 ops)
+  fp16: false
   gradient_checkpointing: false  # Disabled - causes deadlock with DataParallel
   
   # Loss weights
