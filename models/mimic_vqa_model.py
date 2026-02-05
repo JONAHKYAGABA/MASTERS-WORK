@@ -384,12 +384,30 @@ class MultiHeadAnswerModule(nn.Module):
 
 
 # =============================================================================
-# FREE-FORM ANSWER DECODER (Transformer Decoder)
+# FREE-FORM ANSWER DECODER (Transformer Decoder) - PRIMARY ANSWER GENERATOR
 # =============================================================================
 
 class AnswerDecoder(nn.Module):
     """
-    Transformer decoder for generating free-form text answers.
+    PRIMARY ANSWER GENERATOR: Transformer decoder for generating report-quality answers.
+    
+    This decoder is trained on the rich, hierarchical answers from MIMIC-Ext-CXR-QBA:
+    
+    MIMIC-Ext-CXR-QBA Answer Features:
+    - Full sentences derived from actual radiology report sentences
+    - Hierarchical structure: main_answer + details + related_information
+    - Generated via 4 strategies: Indication, Abnormal, Region, Finding
+    - Rich tags: findings, regions, severity, certainty, modifiers, changes
+    - Bounding boxes for answer localization
+    
+    Training:
+    - Input: answer_ids from dataset (tokenized hierarchical answer text)
+    - Target: Full answer text like "There is no focal consolidation. The lungs appear clear..."
+    - Loss: Cross-entropy with teacher forcing
+    
+    Inference:
+    - Generates report-style answers autoregressively
+    - Output: generated_answer_text (decoded tokens)
     
     Takes the fused multimodal representation and generates natural language answers
     token by token using autoregressive decoding.
@@ -534,14 +552,31 @@ class AnswerDecoder(nn.Module):
 
 
 # =============================================================================
-# TEMPLATE-BASED ANSWER GENERATOR
+# CLASSIFICATION-BASED ANSWER GENERATOR (Fallback/Legacy)
 # =============================================================================
 
 class TemplateAnswerGenerator(nn.Module):
     """
-    Generates natural language answers from classification outputs using templates.
+    FALLBACK/LEGACY: Simple template-based answer generator from classification outputs.
     
-    Combines the classification predictions into grammatically correct sentences.
+    NOTE: This is NOT the primary answer generator! The model's transformer decoder
+    (AnswerDecoder) is trained on the rich, hierarchical, report-derived answers from
+    MIMIC-Ext-CXR-QBA dataset and should be used for production inference.
+    
+    This template generator is provided only as:
+    - A fallback when decoder is not yet trained
+    - A simple deterministic baseline for comparison
+    - Quick interpretable outputs based on classification heads
+    
+    For high-quality answers, use the decoder's generated_answer_text output instead.
+    
+    The MIMIC-Ext-CXR-QBA dataset provides:
+    - Hierarchical, multi-granular answers (main + details + related_info)
+    - Full sentences derived from actual radiology reports
+    - Rich tags (findings, regions, severity, certainty, modifiers)
+    - Bounding boxes for answer localization
+    
+    The decoder is trained on these actual answers, not simple templates.
     """
     
     def __init__(self):
@@ -557,27 +592,26 @@ class TemplateAnswerGenerator(nn.Module):
         question_types: Optional[List[str]] = None
     ) -> List[str]:
         """
-        Generate template-based answers from classification logits.
+        Generate simple template-based answers from classification logits.
+        
+        WARNING: These are basic templates, NOT report-quality answers.
+        Use the decoder output (generated_answer_text) for production.
         
         Args:
             vqa_logits: Dict with 'binary', 'category', 'region', 'severity' logits
-            question_types: Optional list of question types for better template selection
+            question_types: Optional list of question types for template selection
             
         Returns:
-            List of generated answer strings
+            List of simple answer strings (for fallback/baseline only)
         """
         batch_size = vqa_logits['binary'].shape[0]
         answers = []
         
         # Get predictions
-        binary_preds = vqa_logits['binary'].argmax(dim=-1)  # 0=No, 1=Yes
+        binary_preds = vqa_logits['binary'].argmax(dim=-1)
         category_preds = vqa_logits['category'].argmax(dim=-1)
         region_preds = vqa_logits['region'].argmax(dim=-1)
         severity_preds = vqa_logits['severity'].argmax(dim=-1)
-        
-        # Get confidence scores
-        binary_conf = F.softmax(vqa_logits['binary'], dim=-1).max(dim=-1)[0]
-        category_conf = F.softmax(vqa_logits['category'], dim=-1).max(dim=-1)[0]
         
         for b in range(batch_size):
             binary = binary_preds[b].item()
@@ -593,7 +627,7 @@ class TemplateAnswerGenerator(nn.Module):
             # Determine question type if provided
             q_type = question_types[b].lower() if question_types and b < len(question_types) else ""
             
-            # Generate appropriate answer
+            # Generate appropriate answer (simple templates)
             if category == 0:  # No Finding
                 answer = self.templates['normal']
             elif 'where' in q_type or 'location' in q_type:
@@ -607,7 +641,7 @@ class TemplateAnswerGenerator(nn.Module):
             else:
                 answer = self.templates['finding'].format(finding=finding, region=location)
             
-            # Add severity if relevant and not "No Finding"
+            # Add severity if relevant
             if category != 0 and severity > 0 and 'severe' not in q_type:
                 answer = answer.rstrip('.') + f", appearing {sev_level} in severity."
             
@@ -663,6 +697,7 @@ class SceneGraphGenerator(nn.Module):
     def forward(self, visual_features: torch.Tensor, gt_bboxes=None, gt_entities=None, gt_regions=None) -> Dict[str, Any]:
         B, C, H, W = visual_features.shape
         device = visual_features.device
+        dtype = visual_features.dtype  # Match dtype for FP16 compatibility
         
         rpn_feat = self.rpn_conv(visual_features)
         rpn_cls = self.rpn_cls(rpn_feat)
@@ -675,13 +710,13 @@ class SceneGraphGenerator(nn.Module):
         scores = torch.sigmoid(scores)
         
         bbox_flat = rpn_reg.view(B, 4, -1).permute(0, 2, 1)
-        boxes = torch.zeros(B, self.max_objects, 4, device=device)
+        boxes = torch.zeros(B, self.max_objects, 4, dtype=dtype, device=device)
         for b in range(B):
             selected = bbox_flat[b, indices[b] % bbox_flat.shape[1]]
             boxes[b, :selected.shape[0]] = torch.sigmoid(selected)
         
-        # ROI features
-        roi_features = torch.zeros(B, self.max_objects, C * self.roi_pool_size * self.roi_pool_size, device=device)
+        # ROI features (use same dtype as visual_features for FP16 compatibility)
+        roi_features = torch.zeros(B, self.max_objects, C * self.roi_pool_size * self.roi_pool_size, dtype=dtype, device=device)
         for b in range(B):
             for n in range(self.max_objects):
                 box = boxes[b, n]
@@ -1309,14 +1344,31 @@ class MIMICCXRVQAModel(nn.Module):
     Complete SSG-VQA-Net for MIMIC-CXR VQA with ALL features.
     
     ALL capabilities built-in:
-    - Classification-based VQA (multi-head)
-    - Free-form answer generation (transformer decoder)
-    - Template-based answer generation
+    - Classification-based VQA (multi-head for binary/category/region/severity)
+    - FREE-FORM ANSWER GENERATION (PRIMARY): Transformer decoder trained on
+      MIMIC-Ext-CXR-QBA's rich, hierarchical, report-derived answers
+    - Template-based answers (FALLBACK): Simple deterministic outputs from classification
     - Attention visualization for explainability
     - Scene graph generation from images
     - Visual grounding for answer localization (scene graph-guided)
     - CheXpert auxiliary classification
     - Manifold-Constrained Hyper-Connections (mHC) for enhanced feature fusion
+    
+    Answer Generation Strategy:
+    ==========================
+    The MIMIC-Ext-CXR-QBA dataset provides 42M+ QA pairs with:
+    - Full sentence answers derived from actual radiology reports
+    - Hierarchical structure: main_answer + details + related_information
+    - 4 generation strategies: Indication, Abnormal, Region, Finding
+    - Rich metadata: findings, regions, severity, certainty, bounding boxes
+    
+    The decoder (AnswerDecoder) is trained on these actual answers via:
+    - Input: 'answer_ids' (tokenized full_answer_text from dataset)
+    - Output: 'generated_answer_text' (model-generated report-style answer)
+    
+    The template generator (TemplateAnswerGenerator) is ONLY a fallback for:
+    - Testing before decoder is trained
+    - Quick deterministic outputs from classification heads
     
     Training Modes:
     - 'standard': Focus on VQA (SG generator frozen)
@@ -1635,28 +1687,33 @@ class MIMICCXRVQAModel(nn.Module):
         mhc_metrics = self.get_mhc_metrics() if self.use_mhc else {}
         
         return {
-            # Classification outputs
-            'vqa_logits': vqa_logits,
-            'chexpert_logits': chexpert_logits,
-            'pooled_output': fused,
+            # === CLASSIFICATION OUTPUTS ===
+            'vqa_logits': vqa_logits,           # Dict: binary/category/region/severity logits
+            'chexpert_logits': chexpert_logits, # (B, 14) CheXpert auxiliary predictions
+            'pooled_output': fused,             # (B, D) fused multimodal representation
             
-            # Generated answers
-            'generated_answer_ids': generated_ids,
-            'generated_answer_logits': generation_logits,
-            'generated_answer_text': generated_text,
-            'template_answer': template_answers,
+            # === ANSWER GENERATION (PRIMARY - from decoder trained on MIMIC-Ext-CXR-QBA) ===
+            'generated_answer_ids': generated_ids,     # (B, T) generated token IDs
+            'generated_answer_logits': generation_logits,  # (B, T, V) vocab logits for loss
+            'generated_answer_text': generated_text,   # List[str] - REPORT-QUALITY ANSWERS
+            # ^ This is the PRIMARY answer output - trained on actual hierarchical 
+            # answers from MIMIC-Ext-CXR-QBA dataset (42M+ report-derived QA pairs)
             
-            # Explainability
-            'attention_weights': attention_weights,
+            # === TEMPLATE ANSWERS (FALLBACK - from classification heads) ===
+            'template_answer': template_answers,  # List[str] - simple deterministic fallback
+            # ^ Only use as baseline/fallback - NOT report quality
             
-            # Scene graph generation
-            'scene_graph_outputs': scene_graph_outputs,
+            # === EXPLAINABILITY ===
+            'attention_weights': attention_weights,  # Dict: text_to_visual, visual_to_text, etc.
             
-            # Visual grounding
-            'grounding_outputs': grounding_outputs,
+            # === SCENE GRAPH GENERATION ===
+            'scene_graph_outputs': scene_graph_outputs,  # Dict: bbox_preds, entity_logits, etc.
             
-            # mHC metrics (for analysis/logging)
-            'mhc_metrics': mhc_metrics,
+            # === VISUAL GROUNDING ===
+            'grounding_outputs': grounding_outputs,  # Dict: bbox_pred, pointing_score, etc.
+            
+            # === mHC METRICS (for stability analysis) ===
+            'mhc_metrics': mhc_metrics,  # Dict: path weights, gate values, amax_gain
         }
     
     def generate_answer(
@@ -1667,13 +1724,27 @@ class MIMICCXRVQAModel(nn.Module):
         scene_graphs: List[Dict[str, Any]],
         question_types: Optional[List[str]] = None,
         use_decoder: bool = True,
-        use_template: bool = True,
+        use_template: bool = False,  # Default to False - decoder is primary
     ) -> Dict[str, List[str]]:
         """
-        Convenience method for answer generation only.
+        Convenience method for answer generation at inference time.
         
+        The decoder generates report-quality answers (trained on MIMIC-Ext-CXR-QBA).
+        Template answers are a simple fallback from classification outputs.
+        
+        Args:
+            images: (B, 3, H, W) input images
+            input_ids: (B, L) tokenized question
+            attention_mask: (B, L) question attention mask
+            scene_graphs: List of scene graph dicts
+            question_types: Optional question type strings for template selection
+            use_decoder: Include decoder output (PRIMARY - report-quality answers)
+            use_template: Include template output (FALLBACK - simple answers)
+            
         Returns:
-            Dict with 'decoder_answer' and/or 'template_answer' lists
+            Dict with:
+            - 'decoder_answer': List[str] - REPORT-QUALITY answers from decoder
+            - 'template_answer': List[str] - Simple fallback from classification
         """
         self.eval()
         with torch.no_grad():
