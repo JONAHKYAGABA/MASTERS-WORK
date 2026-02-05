@@ -1558,11 +1558,16 @@ class MIMICCXRVQAModel(nn.Module):
         # Get bboxes from scene graphs (use model dtype for consistency)
         bboxes = [torch.tensor(sg['bboxes'], dtype=model_dtype, device=device) for sg in local_scene_graphs]
         
-        # Get feature maps for scene graph generation
+        # Get feature maps for scene graph generation (cast to model dtype)
         feature_maps = self.visual_encoder.get_feature_maps(images)
+        if feature_maps.dtype != model_dtype:
+            feature_maps = feature_maps.to(dtype=model_dtype)
         
-        # Visual features
-        visual_features = self.visual_proj(self.visual_encoder(images, bboxes))
+        # Visual features (cast encoder output to model dtype for FP16 compatibility)
+        encoder_output = self.visual_encoder(images, bboxes)
+        if encoder_output.dtype != model_dtype:
+            encoder_output = encoder_output.to(dtype=model_dtype)
+        visual_features = self.visual_proj(encoder_output)
         
         # Visual mask (use model dtype for consistency)
         visual_mask = torch.zeros(batch_size, visual_features.shape[1], dtype=model_dtype, device=device)
@@ -1573,15 +1578,21 @@ class MIMICCXRVQAModel(nn.Module):
         # Scene Graph Generation
         scene_graph_outputs = self.scene_graph_generator(feature_maps, gt_bboxes, gt_entities, gt_regions)
         
-        # Text encoding
+        # Text encoding (cast to model dtype for FP16 compatibility)
         text_features, text_pooled = self.text_encoder(input_ids, attention_mask, token_type_ids)
+        if text_features.dtype != model_dtype:
+            text_features = text_features.to(dtype=model_dtype)
+            text_pooled = text_pooled.to(dtype=model_dtype)
         
-        # Scene graph encoding
+        # Scene graph encoding (cast to model dtype for FP16 compatibility)
         scene_features, scene_mask = self.scene_encoder(local_scene_graphs, device)
+        if scene_features.dtype != model_dtype:
+            scene_features = scene_features.to(dtype=model_dtype)
         scene_features = self.scene_proj(scene_features)
         
         # Multimodal fusion with attention extraction
-        fused, attention_weights, text_hidden = self.sim(visual_features, text_features, scene_features, visual_mask=visual_mask, text_mask=attention_mask.float(), scene_mask=scene_mask)
+        text_mask = attention_mask.to(dtype=model_dtype)
+        fused, attention_weights, text_hidden = self.sim(visual_features, text_features, scene_features, visual_mask=visual_mask, text_mask=text_mask, scene_mask=scene_mask.to(dtype=model_dtype))
         
         # Apply Manifold-Constrained Hyper-Connection for enhanced fusion (if enabled)
         if self.mhc_fusion is not None:
