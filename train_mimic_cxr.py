@@ -1184,6 +1184,12 @@ def main(args):
         ds_config['scheduler']['params']['warmup_max_lr'] = config.training.learning_rate
         ds_config['fp16']['enabled'] = config.training.fp16
         
+        # PyTorch 2.6+ requires contiguous tensors for distributed broadcast
+        # Make all parameters contiguous before DeepSpeed initialization
+        for param in model.parameters():
+            if not param.data.is_contiguous():
+                param.data = param.data.contiguous()
+        
         # Initialize DeepSpeed
         model, optimizer, _, scheduler = deepspeed.initialize(
             model=model,
