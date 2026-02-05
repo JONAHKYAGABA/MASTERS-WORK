@@ -77,7 +77,7 @@ training:
   max_grad_norm: 1.0
   
   fp16: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false  # Disabled - causes deadlock with DataParallel
   
   # Loss weights - balanced for fine-tuning
   vqa_loss_weight: 1.0

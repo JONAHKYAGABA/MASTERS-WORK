@@ -715,6 +715,20 @@ class MIMICCXRVQAModel(nn.Module):
         self.gradient_checkpointing = True
         if hasattr(self.text_encoder.encoder, 'gradient_checkpointing_enable'):
             self.text_encoder.encoder.gradient_checkpointing_enable()
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing (fixes DataParallel deadlock)."""
+        self.gradient_checkpointing = False
+        # Disable in text encoder (BERT)
+        if hasattr(self.text_encoder, 'encoder'):
+            if hasattr(self.text_encoder.encoder, 'gradient_checkpointing_disable'):
+                self.text_encoder.encoder.gradient_checkpointing_disable()
+            # Also set the flag directly if it exists
+            if hasattr(self.text_encoder.encoder, 'gradient_checkpointing'):
+                self.text_encoder.encoder.gradient_checkpointing = False
+        # Disable in text encoder config
+        if hasattr(self.text_encoder, 'config'):
+            self.text_encoder.config.gradient_checkpointing = False
     def forward(
         self,
         images: torch.Tensor,

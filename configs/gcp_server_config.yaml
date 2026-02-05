@@ -104,7 +104,7 @@ training:
   # - Gradient Checkpointing: enables 2x batch
   # ========================================
   fp16: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false  # Disabled - causes deadlock with DataParallel
   
   # Loss weights
   vqa_loss_weight: 1.0

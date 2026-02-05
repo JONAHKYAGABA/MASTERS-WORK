@@ -105,8 +105,8 @@ class TrainingConfig:
     # Mixed precision
     fp16: bool = True
     
-    # Gradient checkpointing
-    gradient_checkpointing: bool = True
+    # Gradient checkpointing (disabled by default - causes deadlock with DataParallel)
+    gradient_checkpointing: bool = False
     
     # Loss weights
     vqa_loss_weight: float = 1.0

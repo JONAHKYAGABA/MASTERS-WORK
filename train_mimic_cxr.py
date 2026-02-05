@@ -929,6 +929,11 @@ def main(args):
         config.wandb.project = args.wandb_project
     if args.disable_wandb:
         config.wandb.enabled = False
+    
+    # Force disable gradient checkpointing if flag is set
+    if args.no_gradient_checkpointing:
+        config.training.gradient_checkpointing = False
+        logger.info("Gradient checkpointing FORCE DISABLED via --no_gradient_checkpointing")
 
     # ----- Phase detection and dataset quality alignment -----
     phase = getattr(config.training, 'phase', 'finetune')
@@ -1124,9 +1129,18 @@ def main(args):
         gradient_checkpointing=config.training.gradient_checkpointing
     )
     
-    # Enable gradient checkpointing if configured
-    if config.training.gradient_checkpointing and hasattr(model, 'gradient_checkpointing_enable'):
-        model.gradient_checkpointing_enable()
+    # Enable/disable gradient checkpointing based on config
+    if config.training.gradient_checkpointing:
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+            if is_main_process(local_rank):
+                logger.info("Gradient checkpointing ENABLED")
+    else:
+        # Explicitly disable to ensure BERT encoder doesn't use it
+        if hasattr(model, 'gradient_checkpointing_disable'):
+            model.gradient_checkpointing_disable()
+        if is_main_process(local_rank):
+            logger.info("Gradient checkpointing DISABLED")
     
     # Loss function
     criterion = MultiTaskLoss(
@@ -1516,6 +1530,10 @@ if __name__ == "__main__":
     # Data check
     parser.add_argument('--skip_data_check', action='store_true', 
                        help='Skip data readiness check (not recommended)')
+    
+    # Gradient checkpointing override
+    parser.add_argument('--no_gradient_checkpointing', action='store_true',
+                       help='Force disable gradient checkpointing (fixes DataParallel deadlock)')
     
     args = parser.parse_args()
     
