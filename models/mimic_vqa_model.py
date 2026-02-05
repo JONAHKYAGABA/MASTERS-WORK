@@ -1045,14 +1045,10 @@ class HyperConnection(nn.Module):
         # Paper-faithful path transformations: RMSNorm + Linear + tanh (Eq. 5, 7)
         # Dynamic mapping: tanh(RMSNorm(x) @ W_dynamic)
         # Static mapping: bias term
-        self.path_transforms = nn.ModuleList([
-            nn.ModuleDict({
-                'rms_norm': RMSNorm(dim),
-                'dynamic_proj': nn.Linear(dim, dim, bias=False),
-                'static_bias': nn.Parameter(torch.zeros(dim)),
-                'dropout': nn.Dropout(dropout),
-            }) for _ in range(num_paths)
-        ])
+        self.path_rms_norms = nn.ModuleList([RMSNorm(dim) for _ in range(num_paths)])
+        self.path_dynamic_projs = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(num_paths)])
+        self.path_static_biases = nn.ParameterList([nn.Parameter(torch.zeros(dim)) for _ in range(num_paths)])
+        self.path_dropouts = nn.ModuleList([nn.Dropout(dropout) for _ in range(num_paths)])
         
         # Final gating: sigmoid with learnable scale (Paper Eq. 5: α)
         # Initialized small for stability
@@ -1088,15 +1084,15 @@ class HyperConnection(nn.Module):
         
         # Apply each hyper-connection path with paper-faithful transforms
         path_outputs = []
-        for i, (transform_dict, manifold_proj) in enumerate(zip(self.path_transforms, self.manifold_projs)):
+        for i, manifold_proj in enumerate(self.manifold_projs):
             # Paper Eq. 5, 7: Dynamic mapping with RMSNorm + tanh
             # h_dynamic = tanh(RMSNorm(residual) @ W)
-            normed = transform_dict['rms_norm'](residual)
-            dynamic = torch.tanh(transform_dict['dynamic_proj'](normed))
+            normed = self.path_rms_norms[i](residual)
+            dynamic = torch.tanh(self.path_dynamic_projs[i](normed))
             
             # Add static bias
-            path_residual = dynamic + transform_dict['static_bias']
-            path_residual = transform_dict['dropout'](path_residual)
+            path_residual = dynamic + self.path_static_biases[i]
+            path_residual = self.path_dropouts[i](path_residual)
             
             # Project onto manifold (Paper Eq. 6-9)
             projected = manifold_proj(path_residual)
