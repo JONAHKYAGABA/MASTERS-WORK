@@ -444,9 +444,6 @@ class MIMICCXRVQADataset(Dataset):
         if self.tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
         return self.tokenizer
-
-        
-        logger.info(f"Loaded {len(self.samples)} samples for {split}")
     
     def _load_metadata(self) -> Optional[pd.DataFrame]:
         """Load MIMIC-CXR metadata for view filtering."""

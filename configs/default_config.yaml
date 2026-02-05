@@ -83,10 +83,10 @@ training:
   # ========================================
   # OPTIMIZATION FLAGS (methodology Section 11.1)
   # - Mixed Precision: 1.5-2x speedup
-  # - Gradient Checkpointing: enables 2x batch
+  # - Gradient Checkpointing: DISABLED (causes deadlock with DataParallel)
   # ========================================
   fp16: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   
   # Loss weights
   vqa_loss_weight: 1.0
@@ -110,14 +110,13 @@ training:
   early_stopping_patience: 5
   
   # ========================================
-  # DATA LOADING (methodology Section 11.2)
-  # - num_workers: 12 (3 per GPU for 4 GPUs)
+  # DATA LOADING
+  # - num_workers: 0 (avoids tokenizer fork deadlock)
   # - pin_memory: true (faster GPU transfer)
-  # - prefetch_factor: 4 (preload batches)
   # ========================================
-  dataloader_num_workers: 12
+  dataloader_num_workers: 0
   dataloader_pin_memory: true
-  dataloader_prefetch_factor: 4
+  dataloader_prefetch_factor: 2
   
   # Hugging Face Hub (optional)
   hub_model_id: ""  # e.g., "your-username/mimic-cxr-vqa-ssg"
