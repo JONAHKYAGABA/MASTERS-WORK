@@ -446,7 +446,21 @@ class MIMICCXRVQADataset(Dataset):
         return self.tokenizer
     
     def _load_metadata(self) -> Optional[pd.DataFrame]:
-        """Load MIMIC-CXR metadata for view filtering."""
+        """
+        Load MIMIC-CXR-JPG metadata for comprehensive image information.
+        
+        MIMIC-CXR-JPG metadata columns (from mimic-cxr-2.0.0-metadata.csv.gz):
+        - dicom_id: Image identifier (JPG filename stem)
+        - PerformedProcedureStepDescription: Type of study ("CHEST (PA AND LAT)", etc.)
+        - ViewPosition: Orientation ("AP", "PA", "LATERAL", etc.)
+        - Rows: Image height in pixels
+        - Columns: Image width in pixels
+        - StudyDate: Anonymized but chronologically consistent date
+        - StudyTime: Time of study (hours:minutes:seconds.fraction)
+        - ProcedureCodeSequence_CodeMeaning: Human-readable procedure description
+        - ViewCodeSequence_CodeMeaning: Human-readable view orientation
+        - PatientOrientationCodeSequence_CodeMeaning: "Erect", "Recumbent", or null
+        """
         metadata_file = self.mimic_cxr_path / 'mimic-cxr-2.0.0-metadata.csv.gz'
         
         if not metadata_file.exists():
@@ -459,12 +473,28 @@ class MIMICCXRVQADataset(Dataset):
                 else:
                     df = pd.read_csv(metadata_file)
                 
-                # Create indexed lookup dict for O(1) access (MUCH faster than DataFrame scans)
+                # Create indexed lookup dicts for O(1) access
                 self._dicom_to_view = {}
+                self._dicom_to_metadata = {}  # Full metadata for each image
+                
                 for _, row in df.iterrows():
                     dicom_id = row.get('dicom_id')
                     if dicom_id:
-                        self._dicom_to_view[str(dicom_id)] = row.get('ViewPosition')
+                        dicom_str = str(dicom_id)
+                        self._dicom_to_view[dicom_str] = row.get('ViewPosition')
+                        
+                        # Store full metadata for enhanced features
+                        self._dicom_to_metadata[dicom_str] = {
+                            'view_position': row.get('ViewPosition'),
+                            'view_code': row.get('ViewCodeSequence_CodeMeaning'),
+                            'procedure': row.get('PerformedProcedureStepDescription'),
+                            'procedure_code': row.get('ProcedureCodeSequence_CodeMeaning'),
+                            'patient_orientation': row.get('PatientOrientationCodeSequence_CodeMeaning'),
+                            'original_rows': int(row.get('Rows', 0)) if pd.notna(row.get('Rows')) else None,
+                            'original_cols': int(row.get('Columns', 0)) if pd.notna(row.get('Columns')) else None,
+                            'study_date': row.get('StudyDate'),
+                            'study_time': row.get('StudyTime'),
+                        }
                 
                 logger.info(f"Loaded metadata: {len(df)} images (indexed for fast lookup)")
                 return df
@@ -472,11 +502,39 @@ class MIMICCXRVQADataset(Dataset):
                 logger.warning(f"Could not load metadata: {e}")
         
         self._dicom_to_view = {}
+        self._dicom_to_metadata = {}
         return None
     
     def _get_view_position(self, dicom_id: str) -> Optional[str]:
         """Get ViewPosition for a DICOM ID from metadata (O(1) lookup)."""
         return self._dicom_to_view.get(str(dicom_id))
+    
+    def _get_image_metadata(self, dicom_id: str) -> Dict[str, Any]:
+        """
+        Get full MIMIC-CXR-JPG metadata for an image.
+        
+        Returns dict with:
+        - view_position: "AP", "PA", "LATERAL", etc.
+        - view_code: Human-readable view ("postero-anterior", "antero-posterior", etc.)
+        - procedure: Type of study ("CHEST (PA AND LAT)", "CHEST (PORTABLE AP)", etc.)
+        - patient_orientation: "Erect", "Recumbent", or None
+        - original_rows: Original image height before resize
+        - original_cols: Original image width before resize
+        - study_date: Anonymized date (chronologically consistent)
+        - study_time: Time of study
+        """
+        default = {
+            'view_position': None,
+            'view_code': None,
+            'procedure': None,
+            'procedure_code': None,
+            'patient_orientation': None,
+            'original_rows': None,
+            'original_cols': None,
+            'study_date': None,
+            'study_time': None,
+        }
+        return self._dicom_to_metadata.get(str(dicom_id), default)
     
     def _get_cache_key(self) -> str:
         """Generate a unique cache key based on dataset configuration."""
@@ -1096,6 +1154,223 @@ class MIMICCXRVQADataset(Dataset):
         
         return answers[0].get('text', '')
     
+    def _get_full_answer_text(self, answers: List[Dict]) -> str:
+        """
+        Get the complete hierarchical answer text for decoder training.
+        
+        Concatenates main_answer + details in natural sentence form,
+        matching the rich MIMIC-Ext-CXR-QBA answer structure.
+        """
+        if not answers:
+            return "No findings to report."
+        
+        parts = []
+        
+        for ans in answers:
+            answer_type = ans.get('answer_type', 'main_answer')
+            text = ans.get('text', '')
+            
+            if not text:
+                continue
+            
+            # Main answers come first
+            if answer_type == 'main_answer':
+                parts.insert(0, text)
+            # Details are appended
+            elif answer_type == 'details':
+                parts.append(text)
+            # Related info goes at the end
+            elif answer_type == 'related_information':
+                parts.append(f"Additionally, {text.lower()}" if text[0].isupper() else text)
+            
+            # Process sub-answers recursively
+            sub_answers = ans.get('sub_answers', [])
+            for sub in sub_answers:
+                sub_text = sub.get('text', '')
+                if sub_text:
+                    parts.append(sub_text)
+        
+        # Join into coherent answer
+        if not parts:
+            return "No significant findings."
+        
+        # Clean up the combined text
+        full_text = ' '.join(parts)
+        # Remove duplicate periods
+        full_text = full_text.replace('..', '.').replace('. .', '.')
+        
+        return full_text
+    
+    def _get_grounding_data(
+        self, 
+        answers: List[Dict], 
+        image_width: int, 
+        image_height: int,
+        image_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Extract visual grounding data from answers.
+        
+        MIMIC-Ext-CXR-QBA provides bounding boxes per answer via the localization field:
+        {
+            "localization": {
+                "[image_id]": {
+                    "bboxes": [[x1, y1, x2, y2], ...],
+                    ...
+                }
+            }
+        }
+        
+        Returns:
+            Dict with normalized bbox, validity flag, and regions
+        """
+        # Default: full image, not a valid grounding target
+        default_bbox = np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+        
+        if not answers:
+            return {
+                'bbox': default_bbox,
+                'valid': False,
+                'regions': []
+            }
+        
+        # Find main answer with localization
+        for ans in answers:
+            if ans.get('answer_type') != 'main_answer':
+                continue
+            
+            localization = ans.get('localization', {})
+            if not localization:
+                continue
+            
+            # Get localization for specific image or first available
+            if image_id and image_id in localization:
+                img_loc = localization[image_id]
+            elif localization:
+                img_loc = next(iter(localization.values()), {})
+            else:
+                continue
+            
+            bboxes = img_loc.get('bboxes', [])
+            if not bboxes or len(bboxes) == 0:
+                continue
+            
+            # Get first bbox and normalize
+            bbox = bboxes[0]
+            x1 = max(0, min(bbox[0] / image_width, 1.0))
+            y1 = max(0, min(bbox[1] / image_height, 1.0))
+            x2 = max(0, min(bbox[2] / image_width, 1.0))
+            y2 = max(0, min(bbox[3] / image_height, 1.0))
+            
+            # Ensure valid bbox
+            if x2 <= x1 or y2 <= y1:
+                continue
+            
+            return {
+                'bbox': np.array([x1, y1, x2, y2], dtype=np.float32),
+                'valid': True,
+                'regions': ans.get('regions', [])
+            }
+        
+        return {
+            'bbox': default_bbox,
+            'valid': False,
+            'regions': []
+        }
+    
+    def _get_scene_graph_targets(
+        self, 
+        scene_graph: Dict[str, Any],
+        image_width: int,
+        image_height: int,
+        image_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Extract ground truth targets for scene graph generation training.
+        
+        From MIMIC-Ext-CXR-QBA scene_graph.json:
+        - observations: contains entities, regions, bboxes
+        - regions: anatomical region nodes with bboxes
+        - located_at_relations: observation-region edges
+        
+        Returns:
+            Dict with gt_bboxes, gt_entities, gt_regions, gt_positiveness
+        """
+        observations = scene_graph.get('observations', {})
+        
+        if not observations:
+            return {
+                'gt_bboxes': None,
+                'gt_entities': None,
+                'gt_regions': None,
+                'gt_positiveness': None,
+                'gt_relationships': None,
+            }
+        
+        bboxes = []
+        entities = []
+        regions = []
+        positiveness_list = []
+        
+        for obs_id, obs in observations.items():
+            # Extract bbox
+            bbox = None
+            if 'localization' in obs and obs['localization']:
+                loc = obs['localization']
+                if isinstance(loc, dict):
+                    if image_id and image_id in loc:
+                        img_loc = loc[image_id]
+                    else:
+                        img_loc = next(iter(loc.values()), {})
+                    
+                    if isinstance(img_loc, dict) and 'bboxes' in img_loc:
+                        if img_loc['bboxes'] and len(img_loc['bboxes']) > 0:
+                            raw_bbox = img_loc['bboxes'][0]
+                            # Normalize
+                            x1 = max(0, min(raw_bbox[0] / image_width, 1.0))
+                            y1 = max(0, min(raw_bbox[1] / image_height, 1.0))
+                            x2 = max(0, min(raw_bbox[2] / image_width, 1.0))
+                            y2 = max(0, min(raw_bbox[3] / image_height, 1.0))
+                            if x2 > x1 and y2 > y1:
+                                bbox = [x1, y1, x2, y2]
+            
+            if bbox is None:
+                bbox = [0.0, 0.0, 1.0, 1.0]  # Default to full image
+            bboxes.append(bbox)
+            
+            # Entity (finding)
+            obs_entities = obs.get('obs_entities', [])
+            if obs_entities:
+                entity_name = obs_entities[0].lower() if isinstance(obs_entities[0], str) else 'unknown'
+                entity_id = self.sg_processor.entity_to_idx.get(entity_name, 0)
+            else:
+                entity_id = 0
+            entities.append(entity_id)
+            
+            # Region
+            obs_regions = obs.get('regions', [])
+            if obs_regions:
+                if isinstance(obs_regions[0], dict):
+                    region_name = obs_regions[0].get('region', 'unknown').lower()
+                else:
+                    region_name = str(obs_regions[0]).lower()
+                region_id = self.sg_processor.region_to_idx.get(region_name, 0)
+            else:
+                region_id = 0
+            regions.append(region_id)
+            
+            # Positiveness
+            pos = obs.get('positiveness', 'neg')
+            positiveness_list.append(1 if pos == 'pos' else 0)
+        
+        return {
+            'gt_bboxes': np.array(bboxes, dtype=np.float32) if bboxes else None,
+            'gt_entities': np.array(entities, dtype=np.int64) if entities else None,
+            'gt_regions': np.array(regions, dtype=np.int64) if regions else None,
+            'gt_positiveness': np.array(positiveness_list, dtype=np.int64) if positiveness_list else None,
+            'gt_relationships': None,  # TODO: Extract from located_at_relations
+        }
+    
     def __len__(self) -> int:
         return len(self.samples)
     
@@ -1112,6 +1387,10 @@ class MIMICCXRVQADataset(Dataset):
             original_size = (224, 224)
         
         image_tensor = self.transform(image)
+        image_width, image_height = original_size
+        
+        # Get dicom_id for image-specific localization
+        dicom_id = sample.get('dicom_id', None)
         
         # Load scene graph
         scene_graph = {}
@@ -1122,15 +1401,18 @@ class MIMICCXRVQADataset(Dataset):
             except Exception as e:
                 logger.debug(f"Error loading scene graph: {e}")
         
-        # Process scene graph
+        # Process scene graph for model input
         sg_features = self.sg_processor.process(
             scene_graph, 
-            original_size[0], 
-            original_size[1]
+            image_width, 
+            image_height,
+            image_id=dicom_id
         )
         
-        # Tokenize question
+        # Get tokenizer
         tokenizer = self._get_tokenizer()
+        
+        # Tokenize question
         question_inputs = tokenizer(
             sample['question'],
             padding='max_length',
@@ -1139,24 +1421,92 @@ class MIMICCXRVQADataset(Dataset):
             return_tensors='pt'
         )
         
-        # Get answer index
+        # Get answer index (for classification heads)
         answer_idx = self._get_answer_idx(
             sample['question_type'],
             sample['answers']
         )
         
-        # Get CheXpert labels
+        # =====================================================
+        # ANSWER GENERATION DATA (for decoder training)
+        # =====================================================
+        # Get full hierarchical answer text from MIMIC-Ext-CXR-QBA
+        full_answer_text = self._get_full_answer_text(sample['answers'])
+        
+        # Tokenize answer for decoder training
+        # Format: [CLS] answer text [SEP]
+        answer_inputs = tokenizer(
+            full_answer_text,
+            padding='max_length',
+            truncation=True,
+            max_length=64,  # Max answer length
+            return_tensors='pt'
+        )
+        answer_ids = answer_inputs['input_ids'].squeeze(0)
+        
+        # =====================================================
+        # VISUAL GROUNDING DATA (for grounding head training)
+        # =====================================================
+        grounding_data = self._get_grounding_data(
+            sample['answers'],
+            image_width,
+            image_height,
+            image_id=dicom_id
+        )
+        grounding_bbox = torch.tensor(grounding_data['bbox'], dtype=torch.float)
+        grounding_valid = torch.tensor(1.0 if grounding_data['valid'] else 0.0, dtype=torch.float)
+        
+        # =====================================================
+        # SCENE GRAPH GENERATION DATA (for SG generator training)
+        # =====================================================
+        sg_targets = self._get_scene_graph_targets(
+            scene_graph,
+            image_width,
+            image_height,
+            image_id=dicom_id
+        )
+        
+        # =====================================================
+        # CHEXPERT LABELS (for auxiliary supervision)
+        # =====================================================
         chexpert_labels, chexpert_mask = self.chexpert_loader.get_labels(
             sample['subject_id'],
             sample['study_id']
         )
         
-        # Get additional answer metadata for evaluation
+        # Get main answer metadata for evaluation
         main_answer = sample['answers'][0] if sample['answers'] else {}
         answer_text = main_answer.get('text', '')
         answer_regions = main_answer.get('regions', [])
         answer_entities = main_answer.get('obs_entities', [])
         answer_positiveness = main_answer.get('positiveness', '')
+        
+        # =====================================================
+        # MIMIC-CXR-JPG IMAGE METADATA (from metadata CSV)
+        # =====================================================
+        # Get comprehensive image metadata for context-aware processing
+        img_metadata = self._get_image_metadata(dicom_id) if dicom_id else {}
+        
+        # View position info (AP, PA, LATERAL) - important for model understanding
+        view_position = img_metadata.get('view_position') or sample.get('view_position')
+        view_code = img_metadata.get('view_code', '')  # "postero-anterior", "antero-posterior", etc.
+        
+        # Patient orientation (Erect, Recumbent) - affects image interpretation
+        patient_orientation = img_metadata.get('patient_orientation', '')
+        
+        # Procedure info - "CHEST (PA AND LAT)", "CHEST (PORTABLE AP)", etc.
+        procedure = img_metadata.get('procedure', '')
+        
+        # Original image dimensions (before resize)
+        original_rows = img_metadata.get('original_rows') or image_height
+        original_cols = img_metadata.get('original_cols') or image_width
+        
+        # Study timing (for longitudinal analysis if needed)
+        study_date = img_metadata.get('study_date')
+        study_time = img_metadata.get('study_time')
+        
+        # Encode view position for model (useful for view-aware processing)
+        view_encoding = self._encode_view_position(view_position)
         
         return {
             # === MODEL INPUTS ===
@@ -1169,35 +1519,89 @@ class MIMICCXRVQADataset(Dataset):
             # === ROUTING ===
             'question_types': sample['question_type'],
             
-            # === TARGETS ===
+            # === CLASSIFICATION TARGETS ===
             'answer_idx': torch.tensor(answer_idx, dtype=torch.long),
             'chexpert_labels': torch.tensor(chexpert_labels, dtype=torch.float),
             'chexpert_mask': torch.tensor(chexpert_mask, dtype=torch.float),
             
-            # === METADATA (for evaluation/debugging) ===
+            # === ANSWER GENERATION TARGETS ===
+            'answer_ids': answer_ids,                # Tokenized answer for decoder
+            'reference_answer': full_answer_text,    # Full text for metrics
+            
+            # === VISUAL GROUNDING TARGETS ===
+            'grounding_bbox': grounding_bbox,        # (4,) normalized [x1, y1, x2, y2]
+            'grounding_valid': grounding_valid,      # 1.0 if valid target, 0.0 otherwise
+            
+            # === SCENE GRAPH GENERATION TARGETS ===
+            'gt_sg_bboxes': sg_targets['gt_bboxes'],        # (N, 4) or None
+            'gt_sg_entities': sg_targets['gt_entities'],    # (N,) entity indices or None
+            'gt_sg_regions': sg_targets['gt_regions'],      # (N,) region indices or None
+            'gt_sg_positiveness': sg_targets['gt_positiveness'],  # (N,) 0/1 or None
+            
+            # === PATIENT/STUDY METADATA ===
             'subject_id': sample['subject_id'],
             'study_id': sample['study_id'],
+            'dicom_id': dicom_id,
             'question_id': sample.get('question_id', ''),
             
-            # === ANSWER METADATA (for enhanced evaluation) ===
-            'answer_text': answer_text,              # Raw answer text
-            'answer_regions': answer_regions,        # Ground truth regions
-            'answer_entities': answer_entities,      # Ground truth entities
-            'answer_positiveness': answer_positiveness,  # pos/neg/neutral
+            # === ANSWER METADATA (for evaluation) ===
+            'answer_text': answer_text,
+            'answer_regions': answer_regions,
+            'answer_entities': answer_entities,
+            'answer_positiveness': answer_positiveness,
             
-            # === IMAGE METADATA ===
-            'image_width': original_size[0],
-            'image_height': original_size[1],
+            # === MIMIC-CXR-JPG IMAGE METADATA ===
+            'image_width': image_width,
+            'image_height': image_height,
+            'original_rows': original_rows,           # Original size before transform
+            'original_cols': original_cols,
+            'view_position': view_position,           # "AP", "PA", "LATERAL", etc.
+            'view_code': view_code,                   # "postero-anterior", "antero-posterior"
+            'view_encoding': torch.tensor(view_encoding, dtype=torch.float),  # One-hot [4]
+            'patient_orientation': patient_orientation,  # "Erect", "Recumbent"
+            'procedure': procedure,                   # "CHEST (PA AND LAT)", etc.
+            'study_date': study_date,                 # Anonymized but chronologically consistent
+            'study_time': study_time,
         }
+    
+    def _encode_view_position(self, view_position: Optional[str]) -> List[float]:
+        """
+        Encode view position as a one-hot vector for view-aware model processing.
+        
+        Categories from MIMIC-CXR-JPG:
+        - PA (Posterior-Anterior): Standard upright view
+        - AP (Anterior-Posterior): Portable/bedside view
+        - LATERAL: Side view
+        - Other/Unknown
+        
+        Returns:
+            [4] one-hot encoding: [PA, AP, LATERAL, OTHER]
+        """
+        encoding = [0.0, 0.0, 0.0, 0.0]
+        
+        if view_position is None:
+            encoding[3] = 1.0  # Unknown
+        elif view_position.upper() in ('PA', 'PA LLD'):
+            encoding[0] = 1.0  # PA
+        elif view_position.upper() in ('AP', 'AP AXIAL'):
+            encoding[1] = 1.0  # AP
+        elif view_position.upper() in ('LATERAL', 'LL', 'LAO', 'RAO'):
+            encoding[2] = 1.0  # LATERAL
+        else:
+            encoding[3] = 1.0  # Other
+        
+        return encoding
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Custom collate function for variable-length scene graphs.
+    Custom collate function for MIMIC-CXR VQA dataset.
     
     Handles:
     - Fixed-size tensors (images, tokens, labels) -> stacked
-    - Variable-length lists (scene_graphs, metadata) -> collected as lists
+    - Variable-length lists (scene_graphs, gt_sg_*, metadata) -> collected as lists
+    - Answer generation targets -> stacked
+    - Grounding targets -> stacked
     """
     
     # === Stack fixed-size tensors ===
@@ -1209,6 +1613,36 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     chexpert_labels = torch.stack([item['chexpert_labels'] for item in batch])
     chexpert_mask = torch.stack([item['chexpert_mask'] for item in batch])
     
+    # === Answer Generation Targets ===
+    answer_ids = torch.stack([item['answer_ids'] for item in batch])
+    reference_answers = [item.get('reference_answer', '') for item in batch]
+    
+    # === Visual Grounding Targets ===
+    grounding_bboxes = torch.stack([item['grounding_bbox'] for item in batch])
+    grounding_valid = torch.stack([item['grounding_valid'].unsqueeze(0) for item in batch])
+    
+    # === Scene Graph Generation Targets (variable length - keep as lists) ===
+    # Convert numpy arrays to torch tensors where not None
+    gt_sg_bboxes = []
+    gt_sg_entities = []
+    gt_sg_regions = []
+    
+    for item in batch:
+        if item['gt_sg_bboxes'] is not None:
+            gt_sg_bboxes.append(torch.from_numpy(item['gt_sg_bboxes']))
+        else:
+            gt_sg_bboxes.append(None)
+        
+        if item['gt_sg_entities'] is not None:
+            gt_sg_entities.append(torch.from_numpy(item['gt_sg_entities']))
+        else:
+            gt_sg_entities.append(None)
+        
+        if item['gt_sg_regions'] is not None:
+            gt_sg_regions.append(torch.from_numpy(item['gt_sg_regions']))
+        else:
+            gt_sg_regions.append(None)
+    
     # === Collect variable-length scene graphs ===
     scene_graphs = [item['scene_graphs'] for item in batch]
     
@@ -1219,28 +1653,52 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     image_widths = torch.tensor([item.get('image_width', 224) for item in batch], dtype=torch.long)
     image_heights = torch.tensor([item.get('image_height', 224) for item in batch], dtype=torch.long)
     
+    # === Stack MIMIC-CXR-JPG Image Metadata ===
+    view_encodings = torch.stack([item['view_encoding'] for item in batch])
+    original_rows = torch.tensor([item.get('original_rows', 224) for item in batch], dtype=torch.long)
+    original_cols = torch.tensor([item.get('original_cols', 224) for item in batch], dtype=torch.long)
+    
     result = {
-        # Model inputs
+        # === Model Inputs ===
         'images': images,
         'input_ids': input_ids,
         'attention_mask': attention_mask,
         'token_type_ids': token_type_ids,
         'scene_graphs': scene_graphs,
         
-        # Routing
+        # === Routing ===
         'question_types': question_types,
         
-        # Targets
+        # === Classification Targets ===
         'answer_idx': answer_idx,
         'chexpert_labels': chexpert_labels,
         'chexpert_mask': chexpert_mask,
         
-        # Image dimensions
-        'image_widths': image_widths,
-        'image_heights': image_heights,
+        # === Answer Generation Targets ===
+        'answer_ids': answer_ids,               # (B, T) tokenized answers for decoder
+        'reference_answers': reference_answers,  # List[str] for metrics
+        
+        # === Visual Grounding Targets ===
+        'gt_grounding_bboxes': grounding_bboxes,  # (B, 4) normalized bboxes
+        'gt_pointing_valid': grounding_valid,     # (B, 1) validity flags
+        
+        # === Scene Graph Generation Targets ===
+        'gt_sg_bboxes': gt_sg_bboxes,      # List[Tensor(N, 4) | None]
+        'gt_sg_entities': gt_sg_entities,  # List[Tensor(N,) | None]
+        'gt_sg_regions': gt_sg_regions,    # List[Tensor(N,) | None]
+        
+        # === MIMIC-CXR-JPG Image Metadata ===
+        'image_widths': image_widths,           # Current image width
+        'image_heights': image_heights,         # Current image height
+        'original_rows': original_rows,         # Original image rows (before resize)
+        'original_cols': original_cols,         # Original image cols (before resize)
+        'view_encodings': view_encodings,       # (B, 4) one-hot [PA, AP, LATERAL, OTHER]
+        'view_positions': [item.get('view_position', '') for item in batch],  # List[str]
+        'patient_orientations': [item.get('patient_orientation', '') for item in batch],  # List[str] "Erect"/"Recumbent"
+        'procedures': [item.get('procedure', '') for item in batch],  # List[str] "CHEST (PA AND LAT)", etc.
     }
     
-    # === Optionally collect evaluation metadata (if present) ===
+    # === Study/Patient Metadata (for evaluation & tracking) ===
     if 'answer_text' in batch[0]:
         result['answer_texts'] = [item.get('answer_text', '') for item in batch]
     if 'answer_regions' in batch[0]:
@@ -1255,6 +1713,12 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         result['subject_ids'] = [item.get('subject_id', 0) for item in batch]
     if 'study_id' in batch[0]:
         result['study_ids'] = [item.get('study_id', 0) for item in batch]
+    if 'dicom_id' in batch[0]:
+        result['dicom_ids'] = [item.get('dicom_id', '') for item in batch]
+    if 'study_date' in batch[0]:
+        result['study_dates'] = [item.get('study_date') for item in batch]
+    if 'study_time' in batch[0]:
+        result['study_times'] = [item.get('study_time') for item in batch]
     
     return result
 

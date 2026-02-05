@@ -553,9 +553,40 @@ def train_epoch(
         chexpert_labels = batch['chexpert_labels'].to(device)
         chexpert_mask = batch['chexpert_mask'].to(device)
         
-        # Image dimensions for bbox normalization (from collate_fn)
+        # === Image Metadata (from MIMIC-CXR-JPG) ===
         image_widths = batch.get('image_widths', torch.full((images.shape[0],), 224, dtype=torch.long)).to(device) if images is not None else None
         image_heights = batch.get('image_heights', torch.full((images.shape[0],), 224, dtype=torch.long)).to(device) if images is not None else None
+        view_encodings = batch.get('view_encodings', None)
+        if view_encodings is not None:
+            view_encodings = view_encodings.to(device)
+        
+        # === Answer Generation Targets (from MIMIC-Ext-CXR-QBA) ===
+        answer_ids = batch.get('answer_ids', None)
+        if answer_ids is not None:
+            answer_ids = answer_ids.to(device)
+        reference_answers = batch.get('reference_answers', None)
+        
+        # === Visual Grounding Targets (from answer localization) ===
+        gt_grounding_bboxes = batch.get('gt_grounding_bboxes', None)
+        if gt_grounding_bboxes is not None:
+            gt_grounding_bboxes = gt_grounding_bboxes.to(device)
+        gt_pointing_valid = batch.get('gt_pointing_valid', None)
+        if gt_pointing_valid is not None:
+            gt_pointing_valid = gt_pointing_valid.to(device)
+        
+        # === Scene Graph Generation Targets (from scene_graph.json) ===
+        # These are lists of tensors (variable length per sample)
+        gt_sg_bboxes = batch.get('gt_sg_bboxes', None)
+        gt_sg_entities = batch.get('gt_sg_entities', None)
+        gt_sg_regions = batch.get('gt_sg_regions', None)
+        
+        # Move scene graph targets to device (they're lists of tensors or None)
+        if gt_sg_bboxes is not None:
+            gt_sg_bboxes = [t.to(device) if t is not None else None for t in gt_sg_bboxes]
+        if gt_sg_entities is not None:
+            gt_sg_entities = [t.to(device) if t is not None else None for t in gt_sg_entities]
+        if gt_sg_regions is not None:
+            gt_sg_regions = [t.to(device) if t is not None else None for t in gt_sg_regions]
         
         if images is None:
             continue
@@ -579,7 +610,12 @@ def train_epoch(
                 token_type_ids=token_type_ids,
                 question_types=question_types,
                 image_widths=image_widths,
-                image_heights=image_heights
+                image_heights=image_heights,
+                view_encodings=view_encodings,
+                gt_bboxes=gt_sg_bboxes,
+                gt_entities=gt_sg_entities,
+                gt_regions=gt_sg_regions,
+                answer_ids=answer_ids,
             )
             
             loss, loss_dict = criterion(
@@ -587,7 +623,13 @@ def train_epoch(
                 vqa_targets,
                 chexpert_labels,
                 chexpert_mask,
-                question_types
+                question_types,
+                answer_ids=answer_ids,
+                gt_sg_bboxes=gt_sg_bboxes,
+                gt_sg_entities=gt_sg_entities,
+                gt_sg_regions=gt_sg_regions,
+                gt_grounding_bboxes=gt_grounding_bboxes,
+                gt_pointing_valid=gt_pointing_valid,
             )
             
             # DeepSpeed backward (handles gradient accumulation)
@@ -607,7 +649,12 @@ def train_epoch(
                         token_type_ids=token_type_ids,
                         question_types=question_types,
                         image_widths=image_widths,
-                        image_heights=image_heights
+                        image_heights=image_heights,
+                        view_encodings=view_encodings,
+                        gt_bboxes=gt_sg_bboxes,
+                        gt_entities=gt_sg_entities,
+                        gt_regions=gt_sg_regions,
+                        answer_ids=answer_ids,
                     )
                     
                     loss, loss_dict = criterion(
@@ -615,7 +662,13 @@ def train_epoch(
                         vqa_targets,
                         chexpert_labels,
                         chexpert_mask,
-                        question_types
+                        question_types,
+                        answer_ids=answer_ids,
+                        gt_sg_bboxes=gt_sg_bboxes,
+                        gt_sg_entities=gt_sg_entities,
+                        gt_sg_regions=gt_sg_regions,
+                        gt_grounding_bboxes=gt_grounding_bboxes,
+                        gt_pointing_valid=gt_pointing_valid,
                     )
                     
                     # Scale loss for gradient accumulation
@@ -633,7 +686,12 @@ def train_epoch(
                     token_type_ids=token_type_ids,
                     question_types=question_types,
                     image_widths=image_widths,
-                    image_heights=image_heights
+                    image_heights=image_heights,
+                    view_encodings=view_encodings,
+                    gt_bboxes=gt_sg_bboxes,
+                    gt_entities=gt_sg_entities,
+                    gt_regions=gt_sg_regions,
+                    answer_ids=answer_ids,
                 )
                 
                 loss, loss_dict = criterion(
@@ -641,7 +699,13 @@ def train_epoch(
                     vqa_targets,
                     chexpert_labels,
                     chexpert_mask,
-                    question_types
+                    question_types,
+                    answer_ids=answer_ids,
+                    gt_sg_bboxes=gt_sg_bboxes,
+                    gt_sg_entities=gt_sg_entities,
+                    gt_sg_regions=gt_sg_regions,
+                    gt_grounding_bboxes=gt_grounding_bboxes,
+                    gt_pointing_valid=gt_pointing_valid,
                 )
                 
                 # Scale loss for gradient accumulation
@@ -713,14 +777,29 @@ def train_epoch(
             else:
                 lr = optimizer.param_groups[0]['lr']
             
-            wandb.log({
+            # Extract all loss components
+            def get_loss_val(key):
+                val = loss_dict.get(key, 0)
+                return val.item() if torch.is_tensor(val) else val
+            
+            log_dict = {
                 'train/loss': loss.item() * (grad_accum_steps if not use_deepspeed else 1),
-                'train/vqa_loss': loss_dict.get('vqa_loss', 0).item() if torch.is_tensor(loss_dict.get('vqa_loss', 0)) else loss_dict.get('vqa_loss', 0),
-                'train/chexpert_loss': loss_dict.get('chexpert_loss', 0).item() if torch.is_tensor(loss_dict.get('chexpert_loss', 0)) else loss_dict.get('chexpert_loss', 0),
+                'train/vqa_loss': get_loss_val('vqa_loss'),
+                'train/chexpert_loss': get_loss_val('chexpert_loss'),
+                'train/generation_loss': get_loss_val('generation_loss'),
+                'train/scene_graph_loss': get_loss_val('scene_graph_loss'),
+                'train/grounding_loss': get_loss_val('grounding_loss'),
                 'train/learning_rate': lr,
                 'train/epoch': epoch,
                 'global_step': global_step,
-            })
+            }
+            
+            # Log mHC metrics if available
+            mhc_metrics = outputs.get('mhc_metrics', {})
+            for k, v in mhc_metrics.items():
+                log_dict[f'train/mhc_{k}'] = v
+            
+            wandb.log(log_dict)
     
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss, global_step
@@ -734,7 +813,7 @@ def validate(
     device: torch.device,
     config: MIMICCXRVQAConfig
 ) -> Dict[str, float]:
-    """Validate model."""
+    """Validate model with full feature evaluation."""
     model.eval()
     
     metrics_calculator = VQAMetrics()
@@ -755,6 +834,35 @@ def validate(
         chexpert_labels = batch['chexpert_labels'].to(device)
         chexpert_mask = batch['chexpert_mask'].to(device)
         
+        # === Image Metadata (from MIMIC-CXR-JPG) ===
+        view_encodings = batch.get('view_encodings', None)
+        if view_encodings is not None:
+            view_encodings = view_encodings.to(device)
+        
+        # === Reference answers for generation metrics ===
+        reference_answers = batch.get('reference_answers', None)
+        
+        # === Grounding targets for grounding metrics ===
+        gt_grounding_bboxes = batch.get('gt_grounding_bboxes', None)
+        if gt_grounding_bboxes is not None:
+            gt_grounding_bboxes = gt_grounding_bboxes.cpu().numpy()
+        gt_pointing_valid = batch.get('gt_pointing_valid', None)
+        if gt_pointing_valid is not None:
+            gt_pointing_valid = gt_pointing_valid.cpu().numpy()
+        
+        # === Scene graph targets for SG metrics ===
+        gt_sg_entities = batch.get('gt_sg_entities', None)
+        gt_sg_regions = batch.get('gt_sg_regions', None)
+        gt_sg_bboxes = batch.get('gt_sg_bboxes', None)
+        
+        # Convert to numpy for metrics
+        if gt_sg_entities is not None:
+            gt_sg_entities = [t.cpu().numpy() if t is not None else None for t in gt_sg_entities]
+        if gt_sg_regions is not None:
+            gt_sg_regions = [t.cpu().numpy() if t is not None else None for t in gt_sg_regions]
+        if gt_sg_bboxes is not None:
+            gt_sg_bboxes = [t.cpu().numpy() if t is not None else None for t in gt_sg_bboxes]
+        
         vqa_targets = {
             'binary': answer_idx,
             'category': answer_idx,
@@ -765,14 +873,15 @@ def validate(
         if images is None:
             continue
         
-        # Forward pass
+        # Forward pass (inference mode - no answer_ids for free generation)
         outputs = model(
             images=images,
             input_ids=input_ids,
             attention_mask=attention_mask,
             scene_graphs=scene_graphs,
             token_type_ids=token_type_ids,
-            question_types=question_types
+            question_types=question_types,
+            view_encodings=view_encodings,
         )
         
         loss, _ = criterion(
@@ -786,13 +895,19 @@ def validate(
         total_loss += loss.item()
         num_batches += 1
         
-        # Update metrics
+        # Update metrics with all available data
         metrics_calculator.update(
             outputs,
             vqa_targets,
             chexpert_labels,
             chexpert_mask,
-            question_types
+            question_types,
+            reference_answers=reference_answers,
+            gt_sg_entities=gt_sg_entities,
+            gt_sg_regions=gt_sg_regions,
+            gt_sg_bboxes=gt_sg_bboxes,
+            gt_grounding_bboxes=gt_grounding_bboxes,
+            gt_pointing_valid=gt_pointing_valid,
         )
     
     # Compute final metrics
