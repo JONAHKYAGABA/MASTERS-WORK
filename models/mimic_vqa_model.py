@@ -1547,8 +1547,16 @@ class MIMICCXRVQAModel(nn.Module):
         batch_size = images.shape[0]
         local_scene_graphs = scene_graphs[:batch_size]
         
-        # Get bboxes from scene graphs
-        bboxes = [torch.tensor(sg['bboxes'], dtype=torch.float, device=device) for sg in local_scene_graphs]
+        # Get model dtype for mixed precision compatibility (DeepSpeed FP16)
+        # Use visual_proj as reference since it's always present
+        model_dtype = next(self.visual_proj.parameters()).dtype
+        
+        # Cast images to model dtype if needed
+        if images.dtype != model_dtype:
+            images = images.to(dtype=model_dtype)
+        
+        # Get bboxes from scene graphs (use model dtype for consistency)
+        bboxes = [torch.tensor(sg['bboxes'], dtype=model_dtype, device=device) for sg in local_scene_graphs]
         
         # Get feature maps for scene graph generation
         feature_maps = self.visual_encoder.get_feature_maps(images)
@@ -1556,8 +1564,8 @@ class MIMICCXRVQAModel(nn.Module):
         # Visual features
         visual_features = self.visual_proj(self.visual_encoder(images, bboxes))
         
-        # Visual mask
-        visual_mask = torch.zeros(batch_size, visual_features.shape[1], device=device)
+        # Visual mask (use model dtype for consistency)
+        visual_mask = torch.zeros(batch_size, visual_features.shape[1], dtype=model_dtype, device=device)
         for i, sg in enumerate(local_scene_graphs):
             num_objects = min(sg['num_objects'], visual_features.shape[1])
             visual_mask[i, :num_objects] = 1.0
