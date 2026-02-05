@@ -499,8 +499,10 @@ class MIMICCXRVQADataset(Dataset):
     
     def _load_samples_with_cache(self) -> List[Dict[str, Any]]:
         """Load samples with caching support for faster distributed training."""
+        import gc
+        import time
+        
         # Detect distributed environment (DeepSpeed/DDP)
-        # Each rank loads only its shard to avoid OOM from 4× cache copies
         world_size = int(os.environ.get('WORLD_SIZE', 1))
         rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', 0)))
         is_distributed = world_size > 1
@@ -511,6 +513,26 @@ class MIMICCXRVQADataset(Dataset):
             p = Path(self.prebuilt_cache_path)
             if p.exists():
                 try:
+                    # ============================================================
+                    # DISTRIBUTED: Check for pre-sharded cache files first
+                    # Format: cache.pkl -> cache.shard0of4.pkl, cache.shard1of4.pkl, etc.
+                    # ============================================================
+                    if is_distributed:
+                        shard_path = p.parent / f"{p.stem}.shard{rank}of{world_size}.pkl"
+                        if shard_path.exists():
+                            logger.info(f"[Rank {rank}] Loading PRE-SHARDED cache: {shard_path}")
+                            with open(shard_path, 'rb') as f:
+                                samples = pickle.load(f)
+                            logger.info(f"[Rank {rank}] Loaded {len(samples)} samples from shard")
+                            return samples
+                        
+                        # No pre-sharded cache exists - use staggered loading
+                        # Each rank waits (rank * 30 seconds) before loading to avoid simultaneous OOM
+                        wait_time = rank * 30  # 0s, 30s, 60s, 90s for ranks 0,1,2,3
+                        if wait_time > 0:
+                            logger.info(f"[Rank {rank}] Waiting {wait_time}s for staggered loading (avoids OOM)...")
+                            time.sleep(wait_time)
+                    
                     logger.info(f"[Rank {rank}/{world_size}] Loading samples from PREBUILT cache: {p}")
                     with open(p, 'rb') as f:
                         samples = pickle.load(f)
@@ -542,19 +564,30 @@ class MIMICCXRVQADataset(Dataset):
                     
                     # ============================================================
                     # DISTRIBUTED SHARDING: Each rank keeps only its portion
-                    # This reduces memory from N×cache to 1×cache across all ranks
                     # ============================================================
                     if is_distributed:
                         total_samples = len(samples)
                         # Shard samples: rank i gets samples[i::world_size]
-                        samples = samples[rank::world_size]
+                        my_samples = samples[rank::world_size]
+                        
+                        # Save shard to disk for future fast loading
+                        shard_path = p.parent / f"{p.stem}.shard{rank}of{world_size}.pkl"
+                        try:
+                            logger.info(f"[Rank {rank}] Saving shard to {shard_path} for future runs...")
+                            with open(shard_path, 'wb') as f:
+                                pickle.dump(my_samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+                        except Exception as e:
+                            logger.warning(f"[Rank {rank}] Could not save shard: {e}")
+                        
+                        # Clear full samples list and keep only our shard
+                        del samples
+                        samples = my_samples
+                        gc.collect()
+                        
                         logger.info(
                             f"[Rank {rank}/{world_size}] Sharded: keeping {len(samples)}/{total_samples} samples "
-                            f"(~{100/world_size:.0f}% per rank, saves {(world_size-1)*100//world_size}% RAM)"
+                            f"(~{100/world_size:.0f}% per rank)"
                         )
-                        # Force garbage collection to free the filtered-out samples
-                        import gc
-                        gc.collect()
 
                     logger.info(f"[Rank {rank}] Loaded {len(samples)} samples from PREBUILT cache")
                     return samples
