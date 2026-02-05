@@ -145,6 +145,13 @@ class ConvNeXtFeatureExtractor(nn.Module):
         self.roi_pool_size = 7
     
     def forward(self, images: torch.Tensor, bboxes: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+        # Cast images to match model dtype (handles FP16/mixed precision)
+        if TIMM_AVAILABLE and hasattr(self.backbone, 'stem'):
+            # Get dtype from first conv layer
+            first_param = next(self.backbone.parameters())
+            if images.dtype != first_param.dtype:
+                images = images.to(dtype=first_param.dtype)
+        
         if TIMM_AVAILABLE:
             feature_maps = self.backbone(images)[-1]
         else:
@@ -189,7 +196,11 @@ class ConvNeXtFeatureExtractor(nn.Module):
     
     def get_feature_maps(self, images: torch.Tensor) -> torch.Tensor:
         """Get raw feature maps for scene graph generation."""
+        # Cast images to match model dtype (handles FP16/mixed precision)
         if TIMM_AVAILABLE:
+            first_param = next(self.backbone.parameters())
+            if images.dtype != first_param.dtype:
+                images = images.to(dtype=first_param.dtype)
             return self.backbone(images)[-1]
         return self.backbone(images)
 
