@@ -499,13 +499,19 @@ class MIMICCXRVQADataset(Dataset):
     
     def _load_samples_with_cache(self) -> List[Dict[str, Any]]:
         """Load samples with caching support for faster distributed training."""
+        # Detect distributed environment (DeepSpeed/DDP)
+        # Each rank loads only its shard to avoid OOM from 4× cache copies
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+        rank = int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', 0)))
+        is_distributed = world_size > 1
+        
         # If an explicit external cache is provided (e.g., produced by scripts/prebuild_cache.py),
         # load it directly. This is especially useful for subset caches for pretraining.
         if self.prebuilt_cache_path:
             p = Path(self.prebuilt_cache_path)
             if p.exists():
                 try:
-                    logger.info(f"Loading samples from PREBUILT cache: {p}")
+                    logger.info(f"[Rank {rank}/{world_size}] Loading samples from PREBUILT cache: {p}")
                     with open(p, 'rb') as f:
                         samples = pickle.load(f)
 
@@ -533,8 +539,24 @@ class MIMICCXRVQADataset(Dataset):
                     # Apply max_samples limit if needed
                     if self.max_samples and len(samples) > self.max_samples:
                         samples = samples[:self.max_samples]
+                    
+                    # ============================================================
+                    # DISTRIBUTED SHARDING: Each rank keeps only its portion
+                    # This reduces memory from N×cache to 1×cache across all ranks
+                    # ============================================================
+                    if is_distributed:
+                        total_samples = len(samples)
+                        # Shard samples: rank i gets samples[i::world_size]
+                        samples = samples[rank::world_size]
+                        logger.info(
+                            f"[Rank {rank}/{world_size}] Sharded: keeping {len(samples)}/{total_samples} samples "
+                            f"(~{100/world_size:.0f}% per rank, saves {(world_size-1)*100//world_size}% RAM)"
+                        )
+                        # Force garbage collection to free the filtered-out samples
+                        import gc
+                        gc.collect()
 
-                    logger.info(f"Loaded {len(samples)} samples from PREBUILT cache")
+                    logger.info(f"[Rank {rank}] Loaded {len(samples)} samples from PREBUILT cache")
                     return samples
                 except Exception as e:
                     logger.warning(f"Failed to load prebuilt cache '{p}', falling back to normal loading: {e}")
@@ -546,15 +568,25 @@ class MIMICCXRVQADataset(Dataset):
         # Try to load from cache
         if self.use_cache and not self.force_rebuild_cache and cache_path.exists():
             try:
-                logger.info(f"Loading samples from cache: {cache_path}")
+                logger.info(f"[Rank {rank}/{world_size}] Loading samples from cache: {cache_path}")
                 with open(cache_path, 'rb') as f:
                     samples = pickle.load(f)
-                logger.info(f"Loaded {len(samples)} samples from cache (instant!)")
                 
                 # Apply max_samples limit if needed
                 if self.max_samples and len(samples) > self.max_samples:
                     samples = samples[:self.max_samples]
-                    
+                
+                # Distributed sharding for regular cache too
+                if is_distributed:
+                    total_samples = len(samples)
+                    samples = samples[rank::world_size]
+                    logger.info(
+                        f"[Rank {rank}/{world_size}] Sharded: keeping {len(samples)}/{total_samples} samples"
+                    )
+                    import gc
+                    gc.collect()
+                
+                logger.info(f"[Rank {rank}] Loaded {len(samples)} samples from cache")
                 return samples
             except Exception as e:
                 logger.warning(f"Failed to load cache, rebuilding: {e}")
