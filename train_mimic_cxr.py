@@ -135,8 +135,11 @@ def seed_everything(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # PERFORMANCE: benchmark=True auto-tunes convolution algorithms for fixed input sizes (224×224)
+    # This alone can give 1.5-2× speedup for conv-heavy models like ConvNeXt.
+    # deterministic=False allows faster non-deterministic algorithms.
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 def setup_distributed(args) -> tuple[int, int, bool]:

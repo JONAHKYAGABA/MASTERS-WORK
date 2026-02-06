@@ -71,13 +71,13 @@ training:
   # Phase identifier
   phase: "pretrain"
   
-  # Batch settings for 4x L4 GPUs (no gradient checkpointing)
-  # Effective batch size: 12 * 4 * 4 = 192
-  batch_size_per_gpu: 12
-  gradient_accumulation_steps: 4
+  # Batch settings for 4x L4 GPUs (22GB each)
+  # Effective batch size: 24 * 4 * 2 = 192
+  batch_size_per_gpu: 24
+  gradient_accumulation_steps: 2
   
-  # Pretraining: 3-5 epochs
-  num_epochs: 5
+  # Pretraining: 3 epochs (sufficient for pretraining with 2M samples/shard)
+  num_epochs: 3
   
   # Optimizer
   learning_rate: 1.0e-4  # Slightly higher for pretraining
@@ -85,9 +85,9 @@ training:
   warmup_ratio: 0.05  # 5% warmup for pretraining
   max_grad_norm: 1.0
   
-  # Mixed precision (disabled - CUDA toolkit too old to compile DeepSpeed FP16 ops)
-  fp16: false
-  gradient_checkpointing: false  # Disabled - causes deadlock with DataParallel
+  # Mixed precision - ENABLED for L4 GPUs (compute 8.9)
+  fp16: true
+  gradient_checkpointing: true
   
   # Loss weights
   vqa_loss_weight: 1.0
@@ -105,11 +105,10 @@ training:
   save_total_limit: 3
   eval_steps: 5000
   
-  # DataLoader - SET TO 0 TO AVOID TOKENIZER FORK DEADLOCK
-  # Once training works, can try increasing to 2-4
-  dataloader_num_workers: 0
+  # DataLoader - 8 workers/GPU for 48 vCPU machine
+  dataloader_num_workers: 8
   dataloader_pin_memory: true
-  dataloader_prefetch_factor: 2
+  dataloader_prefetch_factor: 4
   
   # Hugging Face Hub - UPDATE WITH YOUR HF USERNAME
   hub_model_id: "KYAGABA/mimic-cxr-vqa-pretrain"  # Your HF repo

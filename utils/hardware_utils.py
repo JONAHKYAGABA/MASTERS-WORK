@@ -200,11 +200,11 @@ def _calculate_optimal_settings(info: HardwareInfo):
     min_gpu_mem = info.min_gpu_memory_gb
     
     if min_gpu_mem >= 20:  # L4, A10, RTX 3090, RTX 4090
-        info.optimal_batch_size = 16
+        info.optimal_batch_size = 24  # L4 (22GB) only uses ~1-2 GB; plenty of headroom
         info.use_gradient_checkpointing = True
         info.deepspeed_stage = 2
     elif min_gpu_mem >= 14:  # T4, RTX 4080
-        info.optimal_batch_size = 12
+        info.optimal_batch_size = 16
         info.use_gradient_checkpointing = True
         info.deepspeed_stage = 2
     elif min_gpu_mem >= 10:  # RTX 3060
@@ -225,18 +225,21 @@ def _calculate_optimal_settings(info: HardwareInfo):
         min_compute = min(g.compute_capability[0] for g in info.gpus)
         info.use_fp16 = min_compute >= 7
     
-    # Calculate gradient accumulation to target effective batch ~256
-    target_effective_batch = 256
+    # Calculate gradient accumulation to target effective batch ~192
+    # Lower accumulation = fewer wasted cycles = faster wall-clock time
+    target_effective_batch = 192
     current_effective = info.optimal_batch_size * info.num_gpus
     info.optimal_grad_accum = max(1, target_effective_batch // current_effective)
     
     # Cap grad accum at reasonable levels
-    info.optimal_grad_accum = min(info.optimal_grad_accum, 16)
+    info.optimal_grad_accum = min(info.optimal_grad_accum, 8)
     
-    # Workers: 3 per GPU, capped at available CPUs - 2 (leave some for main process)
+    # Workers: 8 per GPU for high-CPU machines, capped at available CPUs - 4
+    # Data loading is often the bottleneck — maximize prefetching
+    workers_per_gpu = 8 if info.num_cpus >= 32 else 4
     info.optimal_num_workers = min(
-        3 * info.num_gpus,
-        max(1, info.num_cpus - 2)
+        workers_per_gpu * max(1, info.num_gpus),
+        max(1, info.num_cpus - 4)
     )
     
     # Prefetch factor based on available RAM
