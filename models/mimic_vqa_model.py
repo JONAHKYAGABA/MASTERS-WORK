@@ -315,6 +315,12 @@ class SceneEmbeddedInteraction(nn.Module):
         self.ffn_norm = nn.LayerNorm(hidden_size)
     
     def forward(self, visual_features, text_features, scene_features, visual_mask=None, text_mask=None, scene_mask=None):
+        # Get authoritative dtype from parameters (handles DeepSpeed FP16)
+        try:
+            dt = next(self.ffn.parameters()).dtype
+        except StopIteration:
+            dt = visual_features.dtype
+        
         visual_key_padding_mask = ~visual_mask.bool() if visual_mask is not None else None
         text_key_padding_mask = ~text_mask.bool() if text_mask is not None else None
         scene_key_padding_mask = ~scene_mask.bool() if scene_mask is not None else None
@@ -354,6 +360,9 @@ class SceneEmbeddedInteraction(nn.Module):
             scene_pooled = scene_features.mean(1)
         
         combined = visual_pooled + text_pooled + scene_pooled
+        # Ensure dtype matches FFN params before Linear layers (DeepSpeed FP16 safety)
+        if combined.dtype != dt:
+            combined = combined.to(dtype=dt)
         output = self.ffn_norm(combined + self.ffn(combined))
         
         attention_dict = {
@@ -380,6 +389,13 @@ class MultiHeadAnswerModule(nn.Module):
         self.severity_head = nn.Sequential(nn.Linear(hidden_size, 128), nn.ReLU(), nn.Dropout(dropout), nn.Linear(128, num_severity_classes))
     
     def forward(self, pooled_output: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # Ensure input matches head dtype (DeepSpeed FP16 safety)
+        try:
+            dt = next(self.binary_head.parameters()).dtype
+            if pooled_output.dtype != dt:
+                pooled_output = pooled_output.to(dtype=dt)
+        except StopIteration:
+            pass
         return {'binary': self.binary_head(pooled_output), 'category': self.category_head(pooled_output), 'region': self.region_head(pooled_output), 'severity': self.severity_head(pooled_output)}
 
 
@@ -459,6 +475,13 @@ class AnswerDecoder(nn.Module):
         # Memory projection (from fused features)
         self.memory_proj = nn.Linear(hidden_size, hidden_size)
     
+    def _get_param_dtype(self) -> torch.dtype:
+        """Get authoritative dtype from module parameters (handles DeepSpeed FP16)."""
+        try:
+            return next(self.memory_proj.parameters()).dtype
+        except StopIteration:
+            return torch.float32
+    
     def forward(
         self,
         fused_features: torch.Tensor,      # (B, D) or (B, N, D)
@@ -481,6 +504,13 @@ class AnswerDecoder(nn.Module):
         """
         device = fused_features.device
         batch_size = fused_features.shape[0]
+        dt = self._get_param_dtype()
+        
+        # Ensure inputs match parameter dtype (DeepSpeed FP16 safety)
+        if fused_features.dtype != dt:
+            fused_features = fused_features.to(dtype=dt)
+        if encoder_hidden.dtype != dt:
+            encoder_hidden = encoder_hidden.to(dtype=dt)
         
         # Prepare memory for cross-attention
         if fused_features.dim() == 2:
@@ -501,23 +531,35 @@ class AnswerDecoder(nn.Module):
         """Training forward with teacher forcing."""
         B, T = target_ids.shape
         device = target_ids.device
+        dt = memory.dtype  # Use memory dtype as reference
         
         # Embed target tokens
         positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
         tgt_embeds = self.token_embedding(target_ids) + self.position_embedding(positions)
         tgt_embeds = self.dropout(self.layer_norm(tgt_embeds))
         
-        # Causal mask
+        # Ensure embeddings match memory dtype (LayerNorm may upcast)
+        if tgt_embeds.dtype != dt:
+            tgt_embeds = tgt_embeds.to(dtype=dt)
+        
+        # Causal mask - must match tensor dtype for some PyTorch versions
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device)
+        if tgt_mask.dtype != dt:
+            tgt_mask = tgt_mask.to(dtype=dt)
         
         # Decode
         decoder_out = self.decoder(tgt_embeds, memory, tgt_mask=tgt_mask)
+        # Guard after decoder (internal LayerNorm may upcast)
+        if decoder_out.dtype != dt:
+            decoder_out = decoder_out.to(dtype=dt)
         logits = self.output_proj(decoder_out)
         
         return {'logits': logits, 'generated_ids': target_ids}
     
     def _forward_generate(self, memory: torch.Tensor, batch_size: int, device: torch.device, encoder_mask: Optional[torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Autoregressive generation."""
+        dt = memory.dtype  # Use memory dtype as reference
+        
         # Start with BOS token
         generated = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
         
@@ -526,10 +568,16 @@ class AnswerDecoder(nn.Module):
             positions = torch.arange(T, device=device).unsqueeze(0).expand(batch_size, -1)
             tgt_embeds = self.token_embedding(generated) + self.position_embedding(positions)
             tgt_embeds = self.layer_norm(tgt_embeds)
+            if tgt_embeds.dtype != dt:
+                tgt_embeds = tgt_embeds.to(dtype=dt)
             
             tgt_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device)
+            if tgt_mask.dtype != dt:
+                tgt_mask = tgt_mask.to(dtype=dt)
             
             decoder_out = self.decoder(tgt_embeds, memory, tgt_mask=tgt_mask)
+            if decoder_out.dtype != dt:
+                decoder_out = decoder_out.to(dtype=dt)
             logits = self.output_proj(decoder_out[:, -1:, :])  # Last token
             
             next_token = logits.argmax(dim=-1)  # (B, 1)
@@ -544,8 +592,14 @@ class AnswerDecoder(nn.Module):
         positions = torch.arange(T, device=device).unsqueeze(0).expand(batch_size, -1)
         tgt_embeds = self.token_embedding(generated) + self.position_embedding(positions)
         tgt_embeds = self.layer_norm(tgt_embeds)
+        if tgt_embeds.dtype != dt:
+            tgt_embeds = tgt_embeds.to(dtype=dt)
         tgt_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device)
+        if tgt_mask.dtype != dt:
+            tgt_mask = tgt_mask.to(dtype=dt)
         decoder_out = self.decoder(tgt_embeds, memory, tgt_mask=tgt_mask)
+        if decoder_out.dtype != dt:
+            decoder_out = decoder_out.to(dtype=dt)
         logits = self.output_proj(decoder_out)
         
         return {'logits': logits, 'generated_ids': generated}
@@ -662,6 +716,13 @@ class CheXpertHead(nn.Module):
         self.classifier = nn.Sequential(nn.Linear(hidden_size, 512), nn.ReLU(), nn.Dropout(dropout), nn.Linear(512, num_classes))
     
     def forward(self, pooled_output: torch.Tensor) -> torch.Tensor:
+        # Ensure input matches classifier dtype (DeepSpeed FP16 safety)
+        try:
+            dt = next(self.classifier.parameters()).dtype
+            if pooled_output.dtype != dt:
+                pooled_output = pooled_output.to(dtype=dt)
+        except StopIteration:
+            pass
         return self.classifier(pooled_output)
 
 
@@ -694,12 +755,31 @@ class SceneGraphGenerator(nn.Module):
         self.rel_classifier = nn.Sequential(nn.Linear(hidden_size * 2 + hidden_size // 4, hidden_size), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden_size, num_relationships))
         self.spatial_encoder = nn.Sequential(nn.Linear(8, 64), nn.ReLU(), nn.Linear(64, hidden_size // 4))
     
+    def _get_param_dtype(self) -> torch.dtype:
+        """Get the dtype of this module's parameters (handles DeepSpeed FP16)."""
+        try:
+            return next(self.entity_classifier.parameters()).dtype
+        except StopIteration:
+            return torch.float32
+    
     def forward(self, visual_features: torch.Tensor, gt_bboxes=None, gt_entities=None, gt_regions=None) -> Dict[str, Any]:
         B, C, H, W = visual_features.shape
         device = visual_features.device
-        dtype = visual_features.dtype  # Match dtype for FP16 compatibility
+        
+        # Get the dtype that classifiers expect (DeepSpeed may convert params to fp16)
+        # This is the authoritative dtype - all tensors must match before hitting Linear layers
+        param_dtype = self._get_param_dtype()
+        
+        # Cast input to match parameter dtype for RPN conv layers
+        if visual_features.dtype != param_dtype:
+            visual_features = visual_features.to(dtype=param_dtype)
         
         rpn_feat = self.rpn_conv(visual_features)
+        
+        # BatchNorm2d may upcast to fp32 for numerical stability - cast back
+        if rpn_feat.dtype != param_dtype:
+            rpn_feat = rpn_feat.to(dtype=param_dtype)
+        
         rpn_cls = self.rpn_cls(rpn_feat)
         rpn_reg = self.rpn_reg(rpn_feat)
         centerness = self.rpn_centerness(rpn_feat)
@@ -710,13 +790,13 @@ class SceneGraphGenerator(nn.Module):
         scores = torch.sigmoid(scores)
         
         bbox_flat = rpn_reg.view(B, 4, -1).permute(0, 2, 1)
-        boxes = torch.zeros(B, self.max_objects, 4, dtype=dtype, device=device)
+        boxes = torch.zeros(B, self.max_objects, 4, dtype=param_dtype, device=device)
         for b in range(B):
             selected = bbox_flat[b, indices[b] % bbox_flat.shape[1]]
             boxes[b, :selected.shape[0]] = torch.sigmoid(selected)
         
-        # ROI features (use same dtype as visual_features for FP16 compatibility)
-        roi_features = torch.zeros(B, self.max_objects, C * self.roi_pool_size * self.roi_pool_size, dtype=dtype, device=device)
+        # ROI features - use param_dtype to match classifier weights
+        roi_features = torch.zeros(B, self.max_objects, C * self.roi_pool_size * self.roi_pool_size, dtype=param_dtype, device=device)
         for b in range(B):
             for n in range(self.max_objects):
                 box = boxes[b, n]
@@ -726,7 +806,7 @@ class SceneGraphGenerator(nn.Module):
                 if y2 <= y1: y2 = y1 + 1
                 roi = visual_features[b:b+1, :, y1:y2, x1:x2]
                 pooled = F.adaptive_avg_pool2d(roi, (self.roi_pool_size, self.roi_pool_size))
-                roi_features[b, n] = pooled.flatten()
+                roi_features[b, n] = pooled.flatten().to(dtype=param_dtype)
         
         entity_logits = self.entity_classifier(roi_features)
         region_logits = self.region_classifier(roi_features)
@@ -740,7 +820,8 @@ class SceneGraphGenerator(nn.Module):
         
         subj_bbox = boxes.unsqueeze(2).expand(B, N, N, 4)
         obj_bbox = boxes.unsqueeze(1).expand(B, N, N, 4)
-        spatial = self.spatial_encoder(torch.cat([subj_bbox, obj_bbox], dim=-1))
+        spatial_input = torch.cat([subj_bbox, obj_bbox], dim=-1).to(dtype=param_dtype)
+        spatial = self.spatial_encoder(spatial_input)
         
         rel_input = torch.cat([subj_exp, obj_exp, spatial], dim=-1)
         relationship_logits = self.rel_classifier(rel_input)
@@ -803,6 +884,18 @@ class VisualGroundingHead(nn.Module):
             scene_features: (B, N_sg, D) scene graph node features (optional)
             scene_mask: (B, N_sg) mask for scene graph (optional)
         """
+        # Get authoritative dtype from parameters (handles DeepSpeed FP16)
+        try:
+            dt = next(self.query_proj.parameters()).dtype
+        except StopIteration:
+            dt = fused_features.dtype
+        
+        # Ensure inputs match parameter dtype
+        if fused_features.dtype != dt:
+            fused_features = fused_features.to(dtype=dt)
+        if visual_features.dtype != dt:
+            visual_features = visual_features.to(dtype=dt)
+        
         query = self.query_proj(fused_features).unsqueeze(1)
         visual = self.visual_proj(visual_features)
         key_padding_mask = ~visual_mask.bool() if visual_mask is not None else None
@@ -814,9 +907,14 @@ class VisualGroundingHead(nn.Module):
             need_weights=True
         )
         grounding_features = grounding_out.squeeze(1)
+        # Guard: MultiheadAttention may produce fp32 output
+        if grounding_features.dtype != dt:
+            grounding_features = grounding_features.to(dtype=dt)
         
         # Scene graph-guided refinement (if scene features available)
         if scene_features is not None and scene_features.shape[1] > 0:
+            if scene_features.dtype != dt:
+                scene_features = scene_features.to(dtype=dt)
             # Pool scene graph features
             if scene_mask is not None:
                 scene_pooled = (scene_features * scene_mask.unsqueeze(-1)).sum(1) / scene_mask.sum(1, keepdim=True).clamp(min=1)
@@ -827,6 +925,10 @@ class VisualGroundingHead(nn.Module):
             scene_guide = self.scene_guide_proj(scene_pooled)
             gate = self.scene_gate(torch.cat([grounding_features, scene_guide], dim=-1))
             grounding_features = grounding_features + gate * scene_guide
+        
+        # Ensure dtype before final heads
+        if grounding_features.dtype != dt:
+            grounding_features = grounding_features.to(dtype=dt)
         
         bbox_pred = torch.sigmoid(self.bbox_head(grounding_features))
         pointing_score = self.pointing_head(grounding_features)
@@ -1124,6 +1226,16 @@ class HyperConnection(nn.Module):
         Returns:
             y = x + α * gate * weighted sum of manifold-projected residuals
         """
+        # Ensure inputs match parameter dtype (DeepSpeed FP16 safety)
+        try:
+            dt = next(self.gate_proj.parameters()).dtype
+            if x.dtype != dt:
+                x = x.to(dtype=dt)
+            if f_x.dtype != dt:
+                f_x = f_x.to(dtype=dt)
+        except StopIteration:
+            pass
+        
         residual = f_x - x
         
         # Track input Amax for stability analysis
@@ -1259,13 +1371,28 @@ class mHCBlock(nn.Module):
         # For gradient checkpointing
         self._gradient_checkpointing = False
     
+    def _get_param_dtype(self) -> torch.dtype:
+        """Get authoritative dtype from module parameters (handles DeepSpeed FP16)."""
+        try:
+            return next(self.ff.parameters()).dtype
+        except StopIteration:
+            return torch.float32
+    
     def _attention_block(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> torch.Tensor:
         """Attention sub-block (for gradient checkpointing)."""
+        dt = self._get_param_dtype()
+        if x.dtype != dt:
+            x = x.to(dtype=dt)
         attn_out, _ = self.attention(x, x, x, key_padding_mask=key_padding_mask)
+        if attn_out.dtype != dt:
+            attn_out = attn_out.to(dtype=dt)
         return self.attn_mhc(x, self.attn_norm(x + attn_out))
     
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
         """Feed-forward sub-block (for gradient checkpointing)."""
+        dt = self._get_param_dtype()
+        if x.dtype != dt:
+            x = x.to(dtype=dt)
         ff_out = self.ff(x)
         return self.ff_mhc(x, self.ff_norm(x + ff_out))
     
@@ -1525,6 +1652,25 @@ class MIMICCXRVQAModel(nn.Module):
         if self.mhc_fusion is not None:
             self.mhc_fusion._gradient_checkpointing = False
     
+    def _get_model_dtype(self) -> torch.dtype:
+        """
+        Get the authoritative dtype for this model's parameters.
+        
+        With DeepSpeed FP16, parameters are converted to fp16. However, some
+        operations (BatchNorm, LayerNorm, etc.) may upcast intermediate tensors
+        to fp32. This method returns the dtype that Linear layers expect.
+        """
+        try:
+            return next(self.visual_proj.parameters()).dtype
+        except StopIteration:
+            return torch.float32
+    
+    def _ensure_dtype(self, tensor: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
+        """Cast tensor to target dtype if needed (no-op if already correct)."""
+        if tensor.dtype != target_dtype:
+            return tensor.to(dtype=target_dtype)
+        return tensor
+    
     def get_mhc_metrics(self) -> Dict[str, float]:
         """Get mHC-specific metrics for logging (path weights, gate values)."""
         if self.mhc_fusion is not None:
@@ -1599,89 +1745,95 @@ class MIMICCXRVQAModel(nn.Module):
         batch_size = images.shape[0]
         local_scene_graphs = scene_graphs[:batch_size]
         
-        # Get model dtype for mixed precision compatibility (DeepSpeed FP16)
-        # Use visual_proj as reference since it's always present
-        model_dtype = next(self.visual_proj.parameters()).dtype
+        # =====================================================================
+        # DTYPE MANAGEMENT: DeepSpeed FP16 converts params to fp16, but some
+        # PyTorch ops (BatchNorm, LayerNorm, etc.) may upcast to fp32.
+        # We must ensure all tensors match param dtype before each Linear layer.
+        # =====================================================================
+        dt = self._get_model_dtype()  # Authoritative dtype from model params
         
-        # Cast images to model dtype if needed
-        if images.dtype != model_dtype:
-            images = images.to(dtype=model_dtype)
+        # Cast images to model dtype
+        images = self._ensure_dtype(images, dt)
         
-        # Get bboxes from scene graphs (use model dtype for consistency)
-        bboxes = [torch.tensor(sg['bboxes'], dtype=model_dtype, device=device) for sg in local_scene_graphs]
+        # Get bboxes from scene graphs
+        bboxes = [torch.tensor(sg['bboxes'], dtype=dt, device=device) for sg in local_scene_graphs]
         
-        # Get feature maps for scene graph generation (cast to model dtype)
-        feature_maps = self.visual_encoder.get_feature_maps(images)
-        if feature_maps.dtype != model_dtype:
-            feature_maps = feature_maps.to(dtype=model_dtype)
-        
-        # Visual features (cast encoder output to model dtype for FP16 compatibility)
-        encoder_output = self.visual_encoder(images, bboxes)
-        if encoder_output.dtype != model_dtype:
-            encoder_output = encoder_output.to(dtype=model_dtype)
+        # --- VISUAL BACKBONE ---
+        feature_maps = self._ensure_dtype(self.visual_encoder.get_feature_maps(images), dt)
+        encoder_output = self._ensure_dtype(self.visual_encoder(images, bboxes), dt)
         visual_features = self.visual_proj(encoder_output)
+        visual_features = self._ensure_dtype(visual_features, dt)  # Guard after projection
         
-        # Visual mask (use model dtype for consistency)
-        visual_mask = torch.zeros(batch_size, visual_features.shape[1], dtype=model_dtype, device=device)
+        # Visual mask
+        visual_mask = torch.zeros(batch_size, visual_features.shape[1], dtype=dt, device=device)
         for i, sg in enumerate(local_scene_graphs):
             num_objects = min(sg['num_objects'], visual_features.shape[1])
             visual_mask[i, :num_objects] = 1.0
         
-        # Scene Graph Generation
+        # --- SCENE GRAPH GENERATION ---
         scene_graph_outputs = self.scene_graph_generator(feature_maps, gt_bboxes, gt_entities, gt_regions)
         
-        # Text encoding (cast to model dtype for FP16 compatibility)
+        # --- TEXT ENCODING ---
         text_features, text_pooled = self.text_encoder(input_ids, attention_mask, token_type_ids)
-        if text_features.dtype != model_dtype:
-            text_features = text_features.to(dtype=model_dtype)
-            text_pooled = text_pooled.to(dtype=model_dtype)
+        text_features = self._ensure_dtype(text_features, dt)
+        text_pooled = self._ensure_dtype(text_pooled, dt)
         
-        # Scene graph encoding (cast to model dtype for FP16 compatibility)
+        # --- SCENE GRAPH ENCODING ---
         scene_features, scene_mask = self.scene_encoder(local_scene_graphs, device)
-        if scene_features.dtype != model_dtype:
-            scene_features = scene_features.to(dtype=model_dtype)
+        scene_features = self._ensure_dtype(scene_features, dt)
         scene_features = self.scene_proj(scene_features)
+        scene_features = self._ensure_dtype(scene_features, dt)  # Guard after projection
         
-        # Multimodal fusion with attention extraction
-        text_mask = attention_mask.to(dtype=model_dtype)
-        fused, attention_weights, text_hidden = self.sim(visual_features, text_features, scene_features, visual_mask=visual_mask, text_mask=text_mask, scene_mask=scene_mask.to(dtype=model_dtype))
+        # --- MULTIMODAL FUSION (SIM) ---
+        text_mask = attention_mask.to(dtype=dt)
+        scene_mask_dt = scene_mask.to(dtype=dt)
+        fused, attention_weights, text_hidden = self.sim(
+            visual_features, text_features, scene_features,
+            visual_mask=visual_mask, text_mask=text_mask, scene_mask=scene_mask_dt
+        )
+        # LayerNorm/attention may upcast - ensure fused stays in dt
+        fused = self._ensure_dtype(fused, dt)
+        text_hidden = self._ensure_dtype(text_hidden, dt)
         
-        # Apply Manifold-Constrained Hyper-Connection for enhanced fusion (if enabled)
+        # --- mHC FUSION (if enabled) ---
         if self.mhc_fusion is not None:
-            # Expand fused features for mHC processing
             fused_seq = fused.unsqueeze(1)  # (B, 1, D)
             fused_seq = self.mhc_fusion(fused_seq)
-            fused = fused_seq.squeeze(1)  # (B, D)
+            fused = self._ensure_dtype(fused_seq.squeeze(1), dt)  # (B, D)
         
-        # Visual Grounding (scene graph-guided)
-        # Pass scene features to grounding head for better localization
+        # --- VISUAL GROUNDING (scene graph-guided) ---
         grounding_outputs = self.grounding_head(
-            fused, 
-            visual_features, 
+            self._ensure_dtype(fused, dt),
+            self._ensure_dtype(visual_features, dt),
             visual_mask,
-            scene_features=scene_features,
+            scene_features=self._ensure_dtype(scene_features, dt),
             scene_mask=scene_mask,
         )
         
-        # Classification VQA predictions
-        vqa_logits = self.answer_module(fused)
+        # --- CLASSIFICATION VQA ---
+        vqa_logits = self.answer_module(self._ensure_dtype(fused, dt))
         
-        # Free-form answer generation
-        decoder_outputs = self.answer_decoder(fused, text_hidden, target_ids=answer_ids, encoder_mask=attention_mask)
+        # --- FREE-FORM ANSWER GENERATION (PRIMARY - trained on MIMIC-Ext-CXR-QBA) ---
+        decoder_outputs = self.answer_decoder(
+            self._ensure_dtype(fused, dt),
+            self._ensure_dtype(text_hidden, dt),
+            target_ids=answer_ids,
+            encoder_mask=attention_mask
+        )
         generated_ids = decoder_outputs['generated_ids']
         generation_logits = decoder_outputs['logits']
         
         # Decode to text (inference only)
         generated_text = self.decode_generated_ids(generated_ids) if answer_ids is None else None
         
-        # Template-based answers
+        # --- TEMPLATE ANSWERS (FALLBACK) ---
         template_answers = self.template_generator(vqa_logits, question_types)
         
-        # CheXpert prediction
+        # --- CHEXPERT PREDICTION ---
         chexpert_logits = None
         if self.chexpert_head:
             visual_pooled = (visual_features * visual_mask.unsqueeze(-1)).sum(1) / visual_mask.sum(1, keepdim=True).clamp(min=1)
-            chexpert_logits = self.chexpert_head(visual_pooled)
+            chexpert_logits = self.chexpert_head(self._ensure_dtype(visual_pooled, dt))
         
         # Get mHC metrics if enabled
         mhc_metrics = self.get_mhc_metrics() if self.use_mhc else {}
