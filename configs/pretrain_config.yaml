@@ -105,9 +105,10 @@ training:
   save_total_limit: 3
   eval_steps: 5000
   
-  # DataLoader - 4 workers/GPU (4 ranks × 4 = 16 total; keeps RAM under control)
-  # Each rank forks workers that inherit the ~40GB sample cache → too many kills RAM
-  dataloader_num_workers: 4
+  # DataLoader - 2 workers per rank (4 ranks × 2 = 8 total forked processes)
+  # Each worker forks the parent's 2M sample cache via copy-on-write.
+  # More workers → gradual RAM growth → OOM kill. 2 is the safe maximum.
+  dataloader_num_workers: 2
   dataloader_pin_memory: true
   dataloader_prefetch_factor: 2
   

@@ -235,13 +235,15 @@ def _calculate_optimal_settings(info: HardwareInfo):
     info.optimal_grad_accum = min(info.optimal_grad_accum, 8)
     
     # Workers PER RANK (each DeepSpeed/DDP rank spawns its own workers).
-    # With 4 ranks × N workers = 4N total processes, each forking the parent's RAM
-    # (which includes the multi-GB sample cache). Keep conservative to avoid OOM.
-    workers_per_gpu = 4 if info.num_gpus <= 2 else 2
-    info.optimal_num_workers = min(
-        workers_per_gpu * max(1, info.num_gpus),
-        max(1, info.num_cpus // max(1, info.num_gpus) - 1)
-    )
+    # With 4 ranks × N workers = 4N total forked processes, each inheriting
+    # the parent's multi-GB sample cache via copy-on-write → RAM grows over time.
+    # Safe: 2 workers/rank for multi-GPU, 4 for single GPU.
+    if info.num_gpus >= 4:
+        info.optimal_num_workers = 2   # 4 ranks × 2 = 8 total
+    elif info.num_gpus >= 2:
+        info.optimal_num_workers = 4   # 2 ranks × 4 = 8 total
+    else:
+        info.optimal_num_workers = min(8, max(1, info.num_cpus - 2))
     
     # Prefetch factor based on available RAM
     if info.available_ram_gb > 64:
