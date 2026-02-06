@@ -168,9 +168,9 @@ class MultiTaskLoss(nn.Module):
         chexpert_loss = torch.tensor(0.0, device=device)
         
         if chexpert_logits is not None:
-            # Match label/mask dtype to logits (DeepSpeed FP16 safety)
-            raw_loss = self.bce_loss(chexpert_logits, chexpert_labels.to(dtype=chexpert_logits.dtype))
-            masked_loss = raw_loss * chexpert_mask.to(dtype=raw_loss.dtype)
+            # Compute BCE in float32 (avoids FP16 overflow in exp/log)
+            raw_loss = self.bce_loss(chexpert_logits.float(), chexpert_labels.float())
+            masked_loss = raw_loss * chexpert_mask.float()
             valid_count = chexpert_mask.sum()
             if valid_count > 0:
                 chexpert_loss = masked_loss.sum() / valid_count
@@ -204,14 +204,14 @@ class MultiTaskLoss(nn.Module):
         loss_dict['grounding_loss'] = grounding_loss
         
         # =====================================================
-        # TOTAL LOSS
+        # TOTAL LOSS (computed in float32 to prevent FP16 overflow)
         # =====================================================
         total_loss = (
-            self.vqa_weight * total_vqa_loss +
-            self.generation_weight * generation_loss +
-            self.chexpert_weight * chexpert_loss +
-            self.scene_graph_weight * sg_loss +
-            self.grounding_weight * grounding_loss
+            self.vqa_weight * total_vqa_loss.float() +
+            self.generation_weight * generation_loss.float() +
+            self.chexpert_weight * chexpert_loss.float() +
+            self.scene_graph_weight * sg_loss.float() +
+            self.grounding_weight * grounding_loss.float()
         )
         
         return total_loss, loss_dict
@@ -259,11 +259,11 @@ class MultiTaskLoss(nn.Module):
             pred_box = bbox_preds[b, :K]
             gt_box_matched = gt_box[:K]
             
-            # Bbox loss
+            # Bbox loss (float32 for numerical safety)
             if self.use_giou:
                 bbox_loss = bbox_loss + self._giou_loss(pred_box, gt_box_matched).mean()
             else:
-                bbox_loss = bbox_loss + F.smooth_l1_loss(pred_box, gt_box_matched)
+                bbox_loss = bbox_loss + F.smooth_l1_loss(pred_box.float(), gt_box_matched.float())
             
             # Entity loss
             if gt_entities is not None and b < len(gt_entities) and gt_entities[b] is not None:
@@ -275,10 +275,10 @@ class MultiTaskLoss(nn.Module):
                 reg_target = gt_regions[b].to(device)[:K].long()
                 region_loss = region_loss + self.ce_loss(region_logits[b, :K].float(), reg_target)
             
-            # Objectness loss (target must match objectness dtype)
-            obj_target = torch.zeros(N, dtype=model_dt, device=device)
+            # Objectness loss (float32 — bce_with_logits can overflow in FP16)
+            obj_target = torch.zeros(N, dtype=torch.float32, device=device)
             obj_target[:K] = 1.0
-            obj_loss = obj_loss + F.binary_cross_entropy_with_logits(objectness[b], obj_target)
+            obj_loss = obj_loss + F.binary_cross_entropy_with_logits(objectness[b].float(), obj_target)
             
             num_valid += 1
         
@@ -311,21 +311,20 @@ class MultiTaskLoss(nn.Module):
         
         B = bbox_pred.shape[0]
         
-        # Bbox loss (match gt dtype to pred dtype for DeepSpeed FP16)
-        gt_bboxes_matched = gt_bboxes.to(dtype=bbox_pred.dtype)
+        # Bbox loss (float32 for numerical stability)
         if self.use_giou:
-            bbox_loss = self._giou_loss(bbox_pred, gt_bboxes_matched).mean()
+            bbox_loss = self._giou_loss(bbox_pred, gt_bboxes).mean()
         else:
-            bbox_loss = F.smooth_l1_loss(bbox_pred, gt_bboxes_matched)
+            bbox_loss = F.smooth_l1_loss(bbox_pred.float(), gt_bboxes.float())
         
         loss_dict['grounding_bbox_loss'] = bbox_loss
         
-        # Pointing loss (ensure target shape and dtype match score)
-        score = pointing_score.view(B, 1)
+        # Pointing loss (compute in float32 — BCE can produce -inf in FP16 for p≈0 or p≈1)
+        score = pointing_score.view(B, 1).float().clamp(1e-6, 1.0 - 1e-6)
         if gt_pointing_valid is not None:
-            pointing_target = gt_pointing_valid.to(dtype=score.dtype).view(B, 1)
+            pointing_target = gt_pointing_valid.float().view(B, 1)
         else:
-            pointing_target = torch.ones(B, 1, dtype=score.dtype, device=device)
+            pointing_target = torch.ones(B, 1, dtype=torch.float32, device=device)
         
         pointing_loss = F.binary_cross_entropy(score, pointing_target)
         loss_dict['grounding_pointing_loss'] = pointing_loss
@@ -334,7 +333,11 @@ class MultiTaskLoss(nn.Module):
         return total, loss_dict
     
     def _giou_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Compute GIoU loss."""
+        """Compute GIoU loss in float32 (FP16-safe)."""
+        # Upcast to float32 — area/division ops overflow FP16 easily
+        pred = pred.float()
+        target = target.float()
+        
         x1 = torch.max(pred[:, 0], target[:, 0])
         y1 = torch.max(pred[:, 1], target[:, 1])
         x2 = torch.min(pred[:, 2], target[:, 2])
@@ -346,7 +349,7 @@ class MultiTaskLoss(nn.Module):
         target_area = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
         union_area = pred_area + target_area - inter_area
         
-        iou = inter_area / (union_area + 1e-8)
+        iou = inter_area / (union_area + 1e-6)
         
         enc_x1 = torch.min(pred[:, 0], target[:, 0])
         enc_y1 = torch.min(pred[:, 1], target[:, 1])
@@ -354,7 +357,7 @@ class MultiTaskLoss(nn.Module):
         enc_y2 = torch.max(pred[:, 3], target[:, 3])
         enc_area = (enc_x2 - enc_x1) * (enc_y2 - enc_y1)
         
-        giou = iou - (enc_area - union_area) / (enc_area + 1e-8)
+        giou = iou - (enc_area - union_area) / (enc_area + 1e-6)
         
         return 1 - giou
     
