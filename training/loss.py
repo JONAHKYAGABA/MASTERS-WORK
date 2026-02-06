@@ -135,7 +135,7 @@ class MultiTaskLoss(nn.Module):
                     head_logits = head_logits[indices_tensor]
                     head_targets = head_targets[indices_tensor]
                 
-                head_loss = self.ce_loss(head_logits, head_targets)
+                head_loss = self.ce_loss(head_logits.float(), head_targets)
                 
                 if not torch.isnan(head_loss):
                     loss_dict[f'vqa_{head_name}_loss'] = head_loss
@@ -157,7 +157,7 @@ class MultiTaskLoss(nn.Module):
             # Flatten and compute loss
             B, T, V = shift_logits.shape
             generation_loss = self.generation_ce_loss(
-                shift_logits.view(B * T, V),
+                shift_logits.view(B * T, V).float(),
                 shift_labels.view(B * T)
             )
             loss_dict['generation_loss'] = generation_loss
@@ -168,8 +168,9 @@ class MultiTaskLoss(nn.Module):
         chexpert_loss = torch.tensor(0.0, device=device)
         
         if chexpert_logits is not None:
-            raw_loss = self.bce_loss(chexpert_logits, chexpert_labels)
-            masked_loss = raw_loss * chexpert_mask
+            # Match label/mask dtype to logits (DeepSpeed FP16 safety)
+            raw_loss = self.bce_loss(chexpert_logits, chexpert_labels.to(dtype=chexpert_logits.dtype))
+            masked_loss = raw_loss * chexpert_mask.to(dtype=raw_loss.dtype)
             valid_count = chexpert_mask.sum()
             if valid_count > 0:
                 chexpert_loss = masked_loss.sum() / valid_count
@@ -242,11 +243,14 @@ class MultiTaskLoss(nn.Module):
         if gt_bboxes is None:
             return torch.tensor(0.0, device=device), {}
         
+        # Get model output dtype for target matching (DeepSpeed FP16)
+        model_dt = bbox_preds.dtype
+        
         for b in range(B):
             if b >= len(gt_bboxes) or gt_bboxes[b] is None:
                 continue
             
-            gt_box = gt_bboxes[b].to(device)
+            gt_box = gt_bboxes[b].to(device=device, dtype=model_dt)
             M = gt_box.shape[0]
             if M == 0:
                 continue
@@ -264,15 +268,15 @@ class MultiTaskLoss(nn.Module):
             # Entity loss
             if gt_entities is not None and b < len(gt_entities) and gt_entities[b] is not None:
                 ent_target = gt_entities[b].to(device)[:K].long()
-                entity_loss = entity_loss + self.ce_loss(entity_logits[b, :K], ent_target)
+                entity_loss = entity_loss + self.ce_loss(entity_logits[b, :K].float(), ent_target)
             
             # Region loss
             if gt_regions is not None and b < len(gt_regions) and gt_regions[b] is not None:
                 reg_target = gt_regions[b].to(device)[:K].long()
-                region_loss = region_loss + self.ce_loss(region_logits[b, :K], reg_target)
+                region_loss = region_loss + self.ce_loss(region_logits[b, :K].float(), reg_target)
             
-            # Objectness loss
-            obj_target = torch.zeros(N, device=device)
+            # Objectness loss (target must match objectness dtype)
+            obj_target = torch.zeros(N, dtype=model_dt, device=device)
             obj_target[:K] = 1.0
             obj_loss = obj_loss + F.binary_cross_entropy_with_logits(objectness[b], obj_target)
             
@@ -307,21 +311,23 @@ class MultiTaskLoss(nn.Module):
         
         B = bbox_pred.shape[0]
         
-        # Bbox loss
+        # Bbox loss (match gt dtype to pred dtype for DeepSpeed FP16)
+        gt_bboxes_matched = gt_bboxes.to(dtype=bbox_pred.dtype)
         if self.use_giou:
-            bbox_loss = self._giou_loss(bbox_pred, gt_bboxes).mean()
+            bbox_loss = self._giou_loss(bbox_pred, gt_bboxes_matched).mean()
         else:
-            bbox_loss = F.smooth_l1_loss(bbox_pred, gt_bboxes)
+            bbox_loss = F.smooth_l1_loss(bbox_pred, gt_bboxes_matched)
         
         loss_dict['grounding_bbox_loss'] = bbox_loss
         
-        # Pointing loss (ensure target shape matches score shape)
+        # Pointing loss (ensure target shape and dtype match score)
+        score = pointing_score.view(B, 1)
         if gt_pointing_valid is not None:
-            pointing_target = gt_pointing_valid.float().view(B, 1)
+            pointing_target = gt_pointing_valid.to(dtype=score.dtype).view(B, 1)
         else:
-            pointing_target = torch.ones(B, 1, device=device)
+            pointing_target = torch.ones(B, 1, dtype=score.dtype, device=device)
         
-        pointing_loss = F.binary_cross_entropy(pointing_score.view(B, 1), pointing_target)
+        pointing_loss = F.binary_cross_entropy(score, pointing_target)
         loss_dict['grounding_pointing_loss'] = pointing_loss
         
         total = bbox_loss + 0.5 * pointing_loss
