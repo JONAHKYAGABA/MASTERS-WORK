@@ -343,19 +343,22 @@ class SceneEmbeddedInteraction(nn.Module):
             all_visual_to_text_attn.append(v2t_attn)
             all_scene_to_text_attn.append(s2t_attn)
         
-        # Pool each modality
+        # Pool each modality (cast masks to dt to prevent fp32 upcast from broadcasting)
         if visual_mask is not None:
-            visual_pooled = (visual_features * visual_mask.unsqueeze(-1)).sum(1) / visual_mask.sum(1, keepdim=True).clamp(min=1)
+            vm = visual_mask.unsqueeze(-1).to(dtype=dt)
+            visual_pooled = (visual_features * vm).sum(1) / vm.sum(1).clamp(min=1)
         else:
             visual_pooled = visual_features.mean(1)
         
         if text_mask is not None:
-            text_pooled = (text_features * text_mask.unsqueeze(-1)).sum(1) / text_mask.sum(1, keepdim=True).clamp(min=1)
+            tm = text_mask.unsqueeze(-1).to(dtype=dt)
+            text_pooled = (text_features * tm).sum(1) / tm.sum(1).clamp(min=1)
         else:
             text_pooled = text_features.mean(1)
         
         if scene_mask is not None:
-            scene_pooled = (scene_features * scene_mask.unsqueeze(-1)).sum(1) / scene_mask.sum(1, keepdim=True).clamp(min=1)
+            sm = scene_mask.unsqueeze(-1).to(dtype=dt)
+            scene_pooled = (scene_features * sm).sum(1) / sm.sum(1).clamp(min=1)
         else:
             scene_pooled = scene_features.mean(1)
         
@@ -915,13 +918,16 @@ class VisualGroundingHead(nn.Module):
         if scene_features is not None and scene_features.shape[1] > 0:
             if scene_features.dtype != dt:
                 scene_features = scene_features.to(dtype=dt)
-            # Pool scene graph features
+            # Pool scene graph features (cast mask to dt to prevent fp32 upcast)
             if scene_mask is not None:
-                scene_pooled = (scene_features * scene_mask.unsqueeze(-1)).sum(1) / scene_mask.sum(1, keepdim=True).clamp(min=1)
+                scene_mask_dt = scene_mask.unsqueeze(-1).to(dtype=dt)
+                scene_pooled = (scene_features * scene_mask_dt).sum(1) / scene_mask_dt.sum(1).clamp(min=1)
             else:
                 scene_pooled = scene_features.mean(1)
             
             # Gated fusion with scene graph
+            if scene_pooled.dtype != dt:
+                scene_pooled = scene_pooled.to(dtype=dt)
             scene_guide = self.scene_guide_proj(scene_pooled)
             gate = self.scene_gate(torch.cat([grounding_features, scene_guide], dim=-1))
             grounding_features = grounding_features + gate * scene_guide
@@ -1832,7 +1838,8 @@ class MIMICCXRVQAModel(nn.Module):
         # --- CHEXPERT PREDICTION ---
         chexpert_logits = None
         if self.chexpert_head:
-            visual_pooled = (visual_features * visual_mask.unsqueeze(-1)).sum(1) / visual_mask.sum(1, keepdim=True).clamp(min=1)
+            vm = visual_mask.unsqueeze(-1).to(dtype=dt)
+            visual_pooled = (visual_features * vm).sum(1) / vm.sum(1).clamp(min=1)
             chexpert_logits = self.chexpert_head(self._ensure_dtype(visual_pooled, dt))
         
         # Get mHC metrics if enabled
