@@ -315,13 +315,13 @@ class MultiTaskLoss(nn.Module):
         
         loss_dict['grounding_bbox_loss'] = bbox_loss
         
-        # Pointing loss
+        # Pointing loss (ensure target shape matches score shape)
         if gt_pointing_valid is not None:
-            pointing_target = gt_pointing_valid.float().unsqueeze(1)
+            pointing_target = gt_pointing_valid.float().view(B, 1)
         else:
             pointing_target = torch.ones(B, 1, device=device)
         
-        pointing_loss = F.binary_cross_entropy(pointing_score, pointing_target)
+        pointing_loss = F.binary_cross_entropy(pointing_score.view(B, 1), pointing_target)
         loss_dict['grounding_pointing_loss'] = pointing_loss
         
         total = bbox_loss + 0.5 * pointing_loss
