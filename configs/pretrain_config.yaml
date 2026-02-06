@@ -105,10 +105,11 @@ training:
   save_total_limit: 3
   eval_steps: 5000
   
-  # DataLoader - 8 workers/GPU for 48 vCPU machine
-  dataloader_num_workers: 8
+  # DataLoader - 4 workers/GPU (4 ranks × 4 = 16 total; keeps RAM under control)
+  # Each rank forks workers that inherit the ~40GB sample cache → too many kills RAM
+  dataloader_num_workers: 4
   dataloader_pin_memory: true
-  dataloader_prefetch_factor: 4
+  dataloader_prefetch_factor: 2
   
   # Hugging Face Hub - UPDATE WITH YOUR HF USERNAME
   hub_model_id: "KYAGABA/mimic-cxr-vqa-pretrain"  # Your HF repo

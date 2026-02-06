@@ -234,12 +234,13 @@ def _calculate_optimal_settings(info: HardwareInfo):
     # Cap grad accum at reasonable levels
     info.optimal_grad_accum = min(info.optimal_grad_accum, 8)
     
-    # Workers: 8 per GPU for high-CPU machines, capped at available CPUs - 4
-    # Data loading is often the bottleneck — maximize prefetching
-    workers_per_gpu = 8 if info.num_cpus >= 32 else 4
+    # Workers PER RANK (each DeepSpeed/DDP rank spawns its own workers).
+    # With 4 ranks × N workers = 4N total processes, each forking the parent's RAM
+    # (which includes the multi-GB sample cache). Keep conservative to avoid OOM.
+    workers_per_gpu = 4 if info.num_gpus <= 2 else 2
     info.optimal_num_workers = min(
         workers_per_gpu * max(1, info.num_gpus),
-        max(1, info.num_cpus - 4)
+        max(1, info.num_cpus // max(1, info.num_gpus) - 1)
     )
     
     # Prefetch factor based on available RAM
