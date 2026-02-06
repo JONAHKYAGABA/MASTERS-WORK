@@ -1579,8 +1579,8 @@ class MIMICCXRVQADataset(Dataset):
         """
         encoding = [0.0, 0.0, 0.0, 0.0]
         
-        if view_position is None:
-            encoding[3] = 1.0  # Unknown
+        if view_position is None or not isinstance(view_position, str):
+            encoding[3] = 1.0  # Unknown / missing / NaN
         elif view_position.upper() in ('PA', 'PA LLD'):
             encoding[0] = 1.0  # PA
         elif view_position.upper() in ('AP', 'AP AXIAL'):
