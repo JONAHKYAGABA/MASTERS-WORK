@@ -108,9 +108,13 @@ class TrainingConfig:
     # Gradient checkpointing (disabled by default - causes deadlock with DataParallel)
     gradient_checkpointing: bool = False
     
-    # Loss weights
+    # Loss weights (top-level task weights)
     vqa_loss_weight: float = 1.0
+    generation_loss_weight: float = 0.5
     chexpert_loss_weight: float = 0.3
+    scene_graph_loss_weight: float = 0.1
+    grounding_loss_weight: float = 0.1
+    # Per-head VQA classification weights
     binary_head_weight: float = 1.0
     category_head_weight: float = 0.5
     region_head_weight: float = 0.5
@@ -123,7 +127,7 @@ class TrainingConfig:
     eval_steps: int = 2500
     
     # Best model tracking
-    metric_for_best_model: str = "accuracy"
+    metric_for_best_model: str = "classification_accuracy"
     greater_is_better: bool = True
     
     # Early stopping

@@ -1679,6 +1679,57 @@ class MIMICCXRVQAModel(nn.Module):
             return tensor.to(dtype=target_dtype)
         return tensor
     
+    def _sg_outputs_to_dicts(
+        self,
+        sg_outputs: Dict[str, Any],
+        objectness_threshold: float = 0.3,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert SceneGraphGenerator outputs to the dict format that
+        SceneGraphEncoder expects.  This closes the inference gap:
+        the model generates a scene graph from the image and then
+        feeds it back into the multimodal fusion pipeline.
+        
+        Args:
+            sg_outputs: Dict from SceneGraphGenerator.forward()
+            objectness_threshold: Min score to keep a detected object
+            
+        Returns:
+            List[dict] with keys: bboxes, region_ids, entity_ids,
+            positiveness, num_objects  (one per batch element)
+        """
+        bbox_preds = sg_outputs['bbox_preds']           # (B, N, 4)
+        entity_logits = sg_outputs['entity_logits']     # (B, N, num_entities)
+        region_logits = sg_outputs['region_logits']      # (B, N, num_regions)
+        objectness = sg_outputs['objectness_scores']     # (B, N)
+        positiveness_logits = sg_outputs['positiveness_logits']  # (B, N, 2)
+        
+        B, N = bbox_preds.shape[:2]
+        scene_graph_dicts = []
+        
+        for b in range(B):
+            # Determine which objects pass the threshold
+            scores = objectness[b]  # (N,)
+            keep = scores >= objectness_threshold
+            n_keep = int(keep.sum().item())
+            
+            if n_keep == 0:
+                # At least 1 object (whole-image fallback)
+                n_keep = 1
+                keep = torch.zeros(N, dtype=torch.bool, device=bbox_preds.device)
+                keep[0] = True
+            
+            sg_dict = {
+                'bboxes': bbox_preds[b, keep].detach().cpu().numpy(),
+                'entity_ids': entity_logits[b, keep].argmax(dim=-1).detach().cpu().numpy(),
+                'region_ids': region_logits[b, keep].argmax(dim=-1).detach().cpu().numpy(),
+                'positiveness': positiveness_logits[b, keep].argmax(dim=-1).detach().cpu().numpy(),
+                'num_objects': n_keep,
+            }
+            scene_graph_dicts.append(sg_dict)
+        
+        return scene_graph_dicts
+    
     def get_mhc_metrics(self) -> Dict[str, float]:
         """Get mHC-specific metrics for logging (path weights, gate values)."""
         if self.mhc_fusion is not None:
@@ -1787,7 +1838,18 @@ class MIMICCXRVQAModel(nn.Module):
         text_pooled = self._ensure_dtype(text_pooled, dt)
         
         # --- SCENE GRAPH ENCODING ---
-        scene_features, scene_mask = self.scene_encoder(local_scene_graphs, device)
+        # At inference (not training), use the GENERATED scene graph from the
+        # SceneGraphGenerator instead of the input scene graphs (which may be
+        # dummies).  This closes the inference gap: image → SG Generator →
+        # SG Encoder → multimodal fusion.
+        # During training we keep using the dataset's ground-truth scene graphs
+        # so the encoder learns from high-quality supervision.
+        if not self.training:
+            sg_dicts_for_encoder = self._sg_outputs_to_dicts(scene_graph_outputs)
+        else:
+            sg_dicts_for_encoder = local_scene_graphs
+        
+        scene_features, scene_mask = self.scene_encoder(sg_dicts_for_encoder, device)
         scene_features = self._ensure_dtype(scene_features, dt)
         scene_features = self.scene_proj(scene_features)
         scene_features = self._ensure_dtype(scene_features, dt)  # Guard after projection
@@ -1869,6 +1931,10 @@ class MIMICCXRVQAModel(nn.Module):
             
             # === SCENE GRAPH GENERATION ===
             'scene_graph_outputs': scene_graph_outputs,  # Dict: bbox_preds, entity_logits, etc.
+            # At inference the generated SG dicts (from SceneGraphGenerator) are
+            # fed back into SceneGraphEncoder for fusion.  Expose them here so
+            # callers can inspect the predicted scene graph.
+            'generated_scene_graphs': sg_dicts_for_encoder if not self.training else None,
             
             # === VISUAL GROUNDING ===
             'grounding_outputs': grounding_outputs,  # Dict: bbox_pred, pointing_score, etc.

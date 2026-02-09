@@ -31,25 +31,67 @@ from configs import load_config_from_file, get_default_config
 
 
 def load_model(model_path: str, device: torch.device):
-    """Load model from checkpoint or Hugging Face Hub."""
+    """
+    Load model from a checkpoint directory.
+    
+    Expected directory structure (created by save_checkpoint / final_model):
+        model_path/
+            pytorch_model.bin   — checkpoint dict or raw state_dict
+            config.json         — model + training config
+    """
     model_path = Path(model_path)
     
     # Load config
     config_path = model_path / "config.json"
     if config_path.exists():
-        config = load_config_from_file(config_path)
+        config = load_config_from_file(str(config_path))
     else:
         print("Config not found, using defaults")
         config = get_default_config()
     
-    # Initialize model
-    model = MIMICCXRVQAModel(config)
+    # Initialize model with architecture params from config
+    mc = config.model
+    model = MIMICCXRVQAModel(
+        visual_backbone=mc.visual_backbone,
+        text_encoder=mc.text_encoder,
+        visual_feature_dim=mc.visual_feature_dim,
+        scene_graph_dim=mc.scene_graph_dim,
+        num_regions=mc.num_regions,
+        num_entities=mc.num_entities,
+        hidden_size=mc.hidden_size,
+        num_hidden_layers=mc.num_hidden_layers,
+        num_attention_heads=mc.num_attention_heads,
+        sim_layers=mc.sim_layers,
+        num_binary_classes=mc.num_binary_classes,
+        num_category_classes=mc.num_category_classes,
+        num_region_classes=mc.num_region_classes,
+        num_severity_classes=mc.num_severity_classes,
+        dropout=mc.hidden_dropout_prob,
+        use_chexpert_head=True,
+    )
     
-    # Load weights
+    # Load weights — handle our checkpoint format
     weights_path = model_path / "pytorch_model.bin"
     if weights_path.exists():
-        state_dict = torch.load(weights_path, map_location=device)
-        model.load_state_dict(state_dict)
+        checkpoint = torch.load(weights_path, map_location='cpu')
+        
+        # Our checkpoints wrap the state dict in a top-level dict
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            epoch = checkpoint.get('epoch', '?')
+            step = checkpoint.get('global_step', '?')
+            print(f"Loading checkpoint from epoch {epoch}, step {step}")
+        elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            # Assume the file IS the state dict
+            state_dict = checkpoint
+        
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  Warning: {len(missing)} missing keys (new heads?): {missing[:3]}...")
+        if unexpected:
+            print(f"  Warning: {len(unexpected)} unexpected keys: {unexpected[:3]}...")
         print(f"Loaded model from {weights_path}")
     else:
         print("Warning: No weights found, using randomly initialized model")
@@ -114,7 +156,11 @@ def predict(
     # Get question type
     question_type = get_question_type(question)
     
-    # Create dummy scene graph (in practice, you'd use detected objects)
+    # Minimal scene graph placeholder.
+    # At inference the model automatically generates a scene graph from
+    # the image via SceneGraphGenerator and feeds it back into the
+    # SceneGraphEncoder for multimodal fusion.  This placeholder only
+    # provides a default bbox for the visual encoder's ROI pooling.
     import numpy as np
     scene_graphs = [{
         'bboxes': np.array([[0.0, 0.0, 1.0, 1.0]], dtype=np.float32),
@@ -145,23 +191,28 @@ def predict(
             image_heights=image_heights
         )
     
-    # Parse outputs based on question type
+    # Parse outputs (outputs is a dict)
     results = {
         'question': question,
         'question_type': question_type,
     }
     
-    # Get relevant logits
+    # --- PRIMARY ANSWER: Decoder-generated free-form text ---
+    generated_text = outputs.get('generated_answer_text')
+    if generated_text:
+        results['generated_answer'] = generated_text[0]
+    
+    # --- CLASSIFICATION ANSWER (backup): VQA head prediction ---
     from data.mimic_cxr_dataset import QUESTION_TYPE_MAP
+    vqa_logits = outputs.get('vqa_logits', {})
     
     head_type = QUESTION_TYPE_MAP.get(question_type, 'binary')
-    if head_type in outputs.vqa_logits:
-        logits = outputs.vqa_logits[head_type]
+    if head_type in vqa_logits:
+        logits = vqa_logits[head_type]
         probs = torch.softmax(logits, dim=-1)
         pred_class = torch.argmax(probs, dim=-1).item()
         confidence = probs[0, pred_class].item()
         
-        # Convert class to answer
         if head_type == 'binary':
             answer = 'Yes' if pred_class == 1 else 'No'
         elif head_type == 'severity':
@@ -170,13 +221,31 @@ def predict(
         else:
             answer = f"Class {pred_class}"
         
-        results['answer'] = answer
-        results['confidence'] = confidence
+        results['classification_answer'] = answer
+        results['classification_confidence'] = confidence
         results['probabilities'] = probs[0].cpu().numpy().tolist()
     
-    # Get CheXpert predictions
-    if outputs.chexpert_logits is not None:
-        chexpert_probs = torch.sigmoid(outputs.chexpert_logits)
+    # --- GENERATED SCENE GRAPH (from SceneGraphGenerator) ---
+    generated_sgs = outputs.get('generated_scene_graphs')
+    if generated_sgs:
+        sg = generated_sgs[0]
+        results['generated_scene_graph'] = {
+            'num_objects': sg['num_objects'],
+            'entity_ids': sg['entity_ids'].tolist(),
+            'region_ids': sg['region_ids'].tolist(),
+            'bboxes': sg['bboxes'].tolist(),
+        }
+    
+    # --- VISUAL GROUNDING ---
+    grounding = outputs.get('grounding_outputs')
+    if grounding:
+        results['grounding_bbox'] = grounding['bbox_pred'][0].cpu().numpy().tolist()
+        results['pointing_score'] = grounding['pointing_score'][0].item()
+    
+    # --- CHEXPERT FINDINGS ---
+    chexpert_logits = outputs.get('chexpert_logits')
+    if chexpert_logits is not None:
+        chexpert_probs = torch.sigmoid(chexpert_logits)
         chexpert_labels = [
             'Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema',
             'Enlarged Cardiomediastinum', 'Fracture', 'Lung Lesion',
@@ -232,11 +301,30 @@ def main():
     print("=" * 60)
     print(f"Question: {results['question']}")
     print(f"Question Type: {results['question_type']}")
-    print(f"Answer: {results.get('answer', 'N/A')}")
-    print(f"Confidence: {results.get('confidence', 0):.2%}")
+    
+    if 'generated_answer' in results:
+        print(f"\n[Decoder Answer] {results['generated_answer']}")
+    
+    if 'classification_answer' in results:
+        print(f"[Classification] {results['classification_answer']} "
+              f"(confidence: {results.get('classification_confidence', 0):.1%})")
+    
+    if 'generated_scene_graph' in results:
+        sg = results['generated_scene_graph']
+        print(f"\n[Scene Graph] {sg['num_objects']} detected objects")
+        for i in range(min(sg['num_objects'], 5)):
+            bbox = sg['bboxes'][i]
+            print(f"  Object {i}: entity={sg['entity_ids'][i]}, "
+                  f"region={sg['region_ids'][i]}, "
+                  f"bbox=[{bbox[0]:.2f}, {bbox[1]:.2f}, {bbox[2]:.2f}, {bbox[3]:.2f}]")
+    
+    if 'grounding_bbox' in results:
+        bbox = results['grounding_bbox']
+        print(f"\n[Grounding] bbox=[{bbox[0]:.2f}, {bbox[1]:.2f}, {bbox[2]:.2f}, {bbox[3]:.2f}], "
+              f"pointing={results.get('pointing_score', 0):.2f}")
     
     if 'chexpert_findings' in results:
-        print("\nCheXpert Findings (probability):")
+        print("\n[CheXpert Findings] (top-5 by probability):")
         for label, prob in sorted(results['chexpert_findings'].items(), key=lambda x: -x[1])[:5]:
             print(f"  {label}: {prob:.1%}")
     

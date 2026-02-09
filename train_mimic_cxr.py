@@ -795,10 +795,22 @@ def train_epoch(
         
         # Update progress bar (main process only)
         if is_main_process(local_rank) and hasattr(progress_bar, 'set_postfix'):
+            _gen_display = loss_dict.get("generation_loss", 0)
+            _sg_display = loss_dict.get("scene_graph_loss", 0)
+            _grd_display = loss_dict.get("grounding_loss", 0)
+            if torch.is_tensor(_gen_display):
+                _gen_display = _gen_display.item()
+            if torch.is_tensor(_sg_display):
+                _sg_display = _sg_display.item()
+            if torch.is_tensor(_grd_display):
+                _grd_display = _grd_display.item()
             progress_bar.set_postfix({
                 'loss': f'{_loss_display:.4f}',
                 'vqa': f'{_vqa_display:.4f}',
                 'chex': f'{_chex_display:.4f}',
+                'gen': f'{_gen_display:.4f}',
+                'sg': f'{_sg_display:.4f}',
+                'grd': f'{_grd_display:.4f}',
                 'step': global_step
             })
         
@@ -822,15 +834,39 @@ def train_epoch(
             
             log_dict = {
                 'train/loss': loss.item() * (grad_accum_steps if not use_deepspeed else 1),
+                # --- Top-level task losses ---
                 'train/vqa_loss': get_loss_val('vqa_loss'),
                 'train/chexpert_loss': get_loss_val('chexpert_loss'),
                 'train/generation_loss': get_loss_val('generation_loss'),
                 'train/scene_graph_loss': get_loss_val('scene_graph_loss'),
                 'train/grounding_loss': get_loss_val('grounding_loss'),
+                # --- Per-head VQA sub-losses ---
+                'train/vqa_binary_loss': get_loss_val('vqa_binary_loss'),
+                'train/vqa_category_loss': get_loss_val('vqa_category_loss'),
+                'train/vqa_region_loss': get_loss_val('vqa_region_loss'),
+                'train/vqa_severity_loss': get_loss_val('vqa_severity_loss'),
+                # --- Scene graph sub-losses ---
+                'train/sg_entity_loss': get_loss_val('sg_entity_loss'),
+                'train/sg_region_loss': get_loss_val('sg_region_loss'),
+                'train/sg_bbox_loss': get_loss_val('sg_bbox_loss'),
+                'train/sg_objectness_loss': get_loss_val('sg_objectness_loss'),
+                # --- Grounding sub-losses ---
+                'train/grounding_bbox_loss': get_loss_val('grounding_bbox_loss'),
+                'train/grounding_pointing_loss': get_loss_val('grounding_pointing_loss'),
+                # --- Training dynamics ---
                 'train/learning_rate': lr,
                 'train/epoch': epoch,
                 'global_step': global_step,
             }
+            
+            # FP16 loss scale (useful for debugging NaN/overflow)
+            if use_deepspeed and hasattr(model, 'optimizer') and hasattr(model.optimizer, 'cur_scale'):
+                log_dict['train/fp16_loss_scale'] = model.optimizer.cur_scale
+            
+            # GPU memory usage
+            if torch.cuda.is_available():
+                log_dict['train/gpu_mem_allocated_gb'] = torch.cuda.memory_allocated() / 1e9
+                log_dict['train/gpu_mem_reserved_gb'] = torch.cuda.memory_reserved() / 1e9
             
             # Log mHC metrics if available
             mhc_metrics = outputs.get('mhc_metrics', {})
@@ -1113,6 +1149,11 @@ def main(args):
         config.training.fp16 = False
         logger.info("FP16 FORCE DISABLED via --no_fp16")
 
+    # Override phase from CLI
+    if args.phase:
+        config.training.phase = args.phase
+        logger.info(f"Training phase set to '{args.phase}' via --phase")
+
     # ----- Phase detection and dataset quality alignment -----
     phase = getattr(config.training, 'phase', 'finetune')
     phase = phase.lower() if isinstance(phase, str) else 'finetune'
@@ -1356,6 +1397,74 @@ def main(args):
         gradient_checkpointing=config.training.gradient_checkpointing
     )
     
+    # ==================================================================
+    # LOAD PRETRAINED CHECKPOINT (for finetuning or resuming)
+    # ==================================================================
+    resume_step = 0
+    resume_epoch = 0
+    if args.resume_from_checkpoint:
+        ckpt_path = Path(args.resume_from_checkpoint)
+        ckpt_file = None
+        
+        # Find the actual .bin file
+        if ckpt_path.is_dir():
+            for candidate in ['pytorch_model.bin', 'model.bin', 'checkpoint.bin']:
+                if (ckpt_path / candidate).exists():
+                    ckpt_file = ckpt_path / candidate
+                    break
+            # Also check for DeepSpeed-style checkpoint
+            if ckpt_file is None:
+                ds_ckpt = ckpt_path / 'mp_rank_00_model_states.pt'
+                if ds_ckpt.exists():
+                    ckpt_file = ds_ckpt
+        elif ckpt_path.is_file():
+            ckpt_file = ckpt_path
+        
+        if ckpt_file is not None:
+            if is_main_process(local_rank):
+                logger.info(f"Loading checkpoint from: {ckpt_file}")
+            
+            checkpoint = torch.load(ckpt_file, map_location='cpu')
+            
+            # Extract model state dict (handle different checkpoint formats)
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            elif 'module' in checkpoint:
+                state_dict = checkpoint['module']
+            elif 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                # Assume the checkpoint IS the state dict
+                state_dict = checkpoint
+            
+            # Load with strict=False to handle architecture changes between
+            # pretrain and finetune (e.g., new heads, different projections)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            
+            if is_main_process(local_rank):
+                if missing:
+                    logger.warning(f"  Missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing) > 5 else ''}")
+                if unexpected:
+                    logger.warning(f"  Unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+                logger.info(f"  Loaded {len(state_dict) - len(missing) - len(unexpected)}/{len(state_dict)} parameters")
+            
+            # Optionally resume training step/epoch (only if NOT finetuning)
+            phase = getattr(config.training, 'phase', 'pretrain').lower()
+            if phase != 'finetune' and 'global_step' in checkpoint:
+                resume_step = checkpoint.get('global_step', 0)
+                resume_epoch = checkpoint.get('epoch', 0)
+                if is_main_process(local_rank):
+                    logger.info(f"  Resuming from step {resume_step}, epoch {resume_epoch}")
+            elif phase == 'finetune':
+                if is_main_process(local_rank):
+                    logger.info("  Finetuning mode: starting fresh optimizer/scheduler (not resuming step)")
+            
+            del checkpoint, state_dict  # Free memory
+            _reclaim_cpu_memory()
+        else:
+            logger.error(f"Could not find checkpoint file in {ckpt_path}")
+            logger.error("Expected: pytorch_model.bin, model.bin, or mp_rank_00_model_states.pt")
+    
     # Enable/disable gradient checkpointing based on config
     if config.training.gradient_checkpointing:
         if hasattr(model, 'gradient_checkpointing_enable'):
@@ -1369,15 +1478,34 @@ def main(args):
         if is_main_process(local_rank):
             logger.info("Gradient checkpointing DISABLED")
     
-    # Loss function
+    # ==================================================================
+    # LOSS FUNCTION — uses training_mode from config.training.phase
+    # ==================================================================
+    # 'pretrain' → vqa=1.0, generation=0.5, chexpert=0.3, SG=0.2, grounding=0.15
+    # 'finetune' → vqa=1.0, generation=0.8, chexpert=0.1, SG=0.05, grounding=0.2
+    # 'standard' → vqa=1.0, generation=0.5, chexpert=0.3, SG=0.1, grounding=0.1
+    training_mode = getattr(config.training, 'phase', 'standard').lower()
+    if training_mode not in ('pretrain', 'finetune', 'standard'):
+        training_mode = 'standard'
+    
     criterion = MultiTaskLoss(
+        training_mode=training_mode,
         vqa_weight=config.training.vqa_loss_weight,
+        generation_weight=getattr(config.training, 'generation_loss_weight', None),
         chexpert_weight=config.training.chexpert_loss_weight,
+        scene_graph_weight=getattr(config.training, 'scene_graph_loss_weight', None),
+        grounding_weight=getattr(config.training, 'grounding_loss_weight', None),
         binary_weight=config.training.binary_head_weight,
         category_weight=config.training.category_head_weight,
         region_weight=config.training.region_head_weight,
         severity_weight=config.training.severity_head_weight,
     )
+    
+    if is_main_process(local_rank):
+        logger.info(f"Loss mode: {training_mode} | "
+                     f"vqa={criterion.vqa_weight}, gen={criterion.generation_weight}, "
+                     f"chex={criterion.chexpert_weight}, sg={criterion.scene_graph_weight}, "
+                     f"grd={criterion.grounding_weight}")
     
     # Calculate scheduler steps (accounting for gradient accumulation)
     steps_per_epoch = len(train_dataloader) // config.training.gradient_accumulation_steps
@@ -1496,57 +1624,11 @@ def main(args):
         
         scaler = GradScaler('cuda') if config.training.fp16 else None
     
-    # Allow resuming from checkpoint: set defaults
-    start_epoch = 1
-    global_step = 0
-
-    # Resume checkpoint loader (best-effort; works for standard torch checkpoints)
-    if args.resume_from_checkpoint:
-        ckpt_path = Path(args.resume_from_checkpoint)
-        # If directory provided, expect pytorch_model.bin inside
-        if ckpt_path.is_dir():
-            ckpt_file = ckpt_path / 'pytorch_model.bin'
-        else:
-            ckpt_file = ckpt_path
-
-        if ckpt_file.exists():
-            try:
-                map_location = 'cpu' if device.type == 'cpu' else f'cuda:{local_rank}'
-                checkpoint = torch.load(str(ckpt_file), map_location=map_location)
-
-                # Get underlying model (unwrapped)
-                model_to_load = model.module if hasattr(model, 'module') else model
-
-                # Load model state dict if present
-                model_state = checkpoint.get('model_state_dict', checkpoint)
-                try:
-                    model_to_load.load_state_dict(model_state, strict=False)
-                    logger.info(f"Loaded model weights from {ckpt_file}")
-                except Exception as e:
-                    logger.warning(f"Partial model load: {e}")
-
-                # Try to load optimizer and scheduler states (skip for DeepSpeed)
-                if not use_deepspeed and 'optimizer_state_dict' in checkpoint and 'optimizer' in locals():
-                    try:
-                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                        logger.info("Loaded optimizer state from checkpoint")
-                    except Exception as e:
-                        logger.warning(f"Failed to load optimizer state: {e}")
-
-                if 'scheduler_state_dict' in checkpoint and 'scheduler' in locals() and scheduler is not None:
-                    try:
-                        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                        logger.info("Loaded scheduler state from checkpoint")
-                    except Exception as e:
-                        logger.warning(f"Failed to load scheduler state: {e}")
-
-                start_epoch = int(checkpoint.get('epoch', 1))
-                global_step = int(checkpoint.get('global_step', 0))
-
-            except Exception as e:
-                logger.warning(f"Could not load checkpoint {ckpt_file}: {e}")
-        else:
-            logger.warning(f"Checkpoint not found: {ckpt_file}")
+    # Start epoch and global step (may be set by --resume_from_checkpoint above)
+    # For finetuning: always start from epoch 1, step 0 (fresh optimizer/scheduler)
+    # For resuming pretrain: pick up where we left off
+    start_epoch = resume_epoch + 1 if resume_epoch > 0 else 1
+    global_step = resume_step
 
     # Print training info (main process only)
     if is_main_process(local_rank):
@@ -1557,14 +1639,18 @@ def main(args):
     
     # Training loop
     best_metric = 0.0
-    global_step = 0
+    # global_step is already set from resume_step above (0 for fresh / finetune)
     epochs_without_improvement = 0
     
     if is_main_process(local_rank):
         logger.info("Starting training...")
+        logger.info(f"Phase: {getattr(config.training, 'phase', 'standard')}")
+        logger.info(f"Start epoch: {start_epoch}, Start step: {global_step}")
         logger.info(f"Effective batch size: {get_effective_batch_size(config, world_size)}")
         logger.info(f"Steps per epoch: {len(train_dataloader) // config.training.gradient_accumulation_steps}")
         logger.info(f"Total training steps: {total_steps}")
+        if args.resume_from_checkpoint:
+            logger.info(f"Resumed from: {args.resume_from_checkpoint}")
     
     for epoch in range(start_epoch, config.training.num_epochs + 1):
         # Set epoch for distributed sampler
@@ -1607,20 +1693,57 @@ def main(args):
         # Only main process handles logging and checkpointing
         if is_main_process(local_rank):
             logger.info(f"Val Loss: {val_metrics['loss']:.4f}")
-            logger.info(f"Val Accuracy: {val_metrics.get('accuracy', 0):.4f}")
+            logger.info(f"Val Accuracy: {val_metrics.get('classification_accuracy', 0):.4f}")
             logger.info(f"Val Binary Acc: {val_metrics.get('binary_accuracy', 0):.4f}")
+            logger.info(f"Val Category F1: {val_metrics.get('category_f1', 0):.4f}")
+            logger.info(f"Val CheXpert AUROC: {val_metrics.get('chexpert_auroc', 0):.4f}")
+            logger.info(f"Val SG Entity Acc: {val_metrics.get('sg_entity_accuracy', 0):.4f}")
+            logger.info(f"Val Grounding IoU: {val_metrics.get('grounding_mean_iou', 0):.4f}")
+            if val_metrics.get('generation_bleu', 0) > 0:
+                logger.info(f"Val Gen BLEU: {val_metrics.get('generation_bleu', 0):.4f}")
+                logger.info(f"Val Gen ROUGE-L: {val_metrics.get('generation_rouge_l', 0):.4f}")
             
-            # Log to wandb
+            # Log to wandb — ALL available metrics
             if WANDB_AVAILABLE and config.wandb.enabled:
-                wandb.log({
+                val_log = {
                     'epoch': epoch,
                     'train/epoch_loss': train_loss,
                     'val/loss': val_metrics['loss'],
-                    'val/accuracy': val_metrics.get('accuracy', 0),
+                    # --- VQA Classification ---
+                    'val/classification_accuracy': val_metrics.get('classification_accuracy', 0),
                     'val/binary_accuracy': val_metrics.get('binary_accuracy', 0),
+                    'val/binary_f1': val_metrics.get('binary_f1', 0),
+                    'val/binary_precision': val_metrics.get('binary_precision', 0),
+                    'val/binary_recall': val_metrics.get('binary_recall', 0),
+                    'val/category_accuracy': val_metrics.get('category_accuracy', 0),
                     'val/category_f1': val_metrics.get('category_f1', 0),
+                    'val/region_accuracy': val_metrics.get('region_accuracy', 0),
+                    'val/region_f1': val_metrics.get('region_f1', 0),
+                    'val/severity_accuracy': val_metrics.get('severity_accuracy', 0),
+                    'val/severity_f1': val_metrics.get('severity_f1', 0),
+                    # --- CheXpert ---
                     'val/chexpert_auroc': val_metrics.get('chexpert_auroc', 0),
-                })
+                    # --- Answer Generation ---
+                    'val/generation_bleu': val_metrics.get('generation_bleu', 0),
+                    'val/generation_rouge_l': val_metrics.get('generation_rouge_l', 0),
+                    'val/generation_exact_match': val_metrics.get('generation_exact_match', 0),
+                    'val/generation_word_overlap': val_metrics.get('generation_word_overlap', 0),
+                    # --- Scene Graph ---
+                    'val/sg_entity_accuracy': val_metrics.get('sg_entity_accuracy', 0),
+                    'val/sg_entity_recall': val_metrics.get('sg_entity_recall', 0),
+                    'val/sg_region_accuracy': val_metrics.get('sg_region_accuracy', 0),
+                    'val/sg_mean_iou': val_metrics.get('sg_mean_iou', 0),
+                    'val/sg_iou_50': val_metrics.get('sg_iou_50', 0),
+                    # --- Visual Grounding ---
+                    'val/grounding_mean_iou': val_metrics.get('grounding_mean_iou', 0),
+                    'val/grounding_acc_iou25': val_metrics.get('grounding_acc_iou25', 0),
+                    'val/grounding_acc_iou50': val_metrics.get('grounding_acc_iou50', 0),
+                    'val/pointing_accuracy': val_metrics.get('pointing_accuracy', 0),
+                    # --- Attention ---
+                    'val/attention_mean_entropy': val_metrics.get('attention_mean_entropy', 0),
+                    'val/attention_focused_ratio': val_metrics.get('attention_focused_ratio', 0),
+                }
+                wandb.log(val_log)
             
             # Check for best model
             current_metric = val_metrics.get(config.training.metric_for_best_model, 0)
@@ -1633,25 +1756,24 @@ def main(args):
             else:
                 epochs_without_improvement += 1
             
-            # Save checkpoint
-            if global_step % config.training.save_steps == 0 or is_best:
-                # Get the underlying model for saving
-                model_to_save = model
-                if use_deepspeed:
-                    model_to_save = model.module
-                elif hasattr(model, 'module'):
-                    model_to_save = model.module
-                
-                save_checkpoint(
-                    model=model_to_save,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    metrics=val_metrics,
-                    config=config,
-                    is_best=is_best
-                )
+            # Save checkpoint: always at epoch end, plus best model
+            # (cleanup will keep only the most recent save_total_limit)
+            model_to_save = model
+            if use_deepspeed:
+                model_to_save = model.module
+            elif hasattr(model, 'module'):
+                model_to_save = model.module
+            
+            save_checkpoint(
+                model=model_to_save,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                global_step=global_step,
+                metrics=val_metrics,
+                config=config,
+                is_best=is_best
+            )
             
             # Push to hub
             if is_best and config.training.hub_model_id:
@@ -1672,7 +1794,7 @@ def main(args):
         if is_distributed:
             dist.barrier() if dist.is_initialized() else None
     
-    # Final save (main process only)
+    # Final save (main process only) — ALWAYS saves final epoch checkpoint
     if is_main_process(local_rank):
         logger.info("\nTraining complete!")
         logger.info(f"Best {config.training.metric_for_best_model}: {best_metric:.4f}")
@@ -1684,6 +1806,7 @@ def main(args):
         elif hasattr(model, 'module'):
             model_to_save = model.module
         
+        # Always save a numbered checkpoint at the end
         save_checkpoint(
             model=model_to_save,
             optimizer=optimizer,
@@ -1694,6 +1817,30 @@ def main(args):
             config=config,
             is_best=False
         )
+        
+        # Also save as 'final_model' (never cleaned up) so finetuning always has a fixed path
+        final_dir = Path(config.training.output_dir) / "final_model"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        final_ckpt = {
+            'epoch': epoch,
+            'global_step': global_step,
+            'model_state_dict': model_to_save.state_dict(),
+            'metrics': val_metrics,
+            'config': config.to_dict(),
+            'phase': getattr(config.training, 'phase', 'unknown'),
+        }
+        torch.save(final_ckpt, final_dir / "pytorch_model.bin")
+        with open(final_dir / "config.json", 'w') as f:
+            json.dump(config.to_dict(), f, indent=2)
+        with open(final_dir / "training_metadata.json", 'w') as f:
+            json.dump({
+                'epoch': epoch,
+                'global_step': global_step,
+                'metrics': val_metrics,
+                'phase': getattr(config.training, 'phase', 'unknown'),
+                'timestamp': datetime.now().isoformat(),
+            }, f, indent=2)
+        logger.info(f"Saved FINAL MODEL to {final_dir}")
         
         # Final push to hub
         if config.training.hub_model_id:
@@ -1751,10 +1898,14 @@ if __name__ == "__main__":
     parser.add_argument('--no_auto_optimize', action='store_false', dest='auto_optimize',
                        help='Disable hardware auto-optimization')
     
+    # Training phase
+    parser.add_argument('--phase', type=str, default=None, choices=['pretrain', 'finetune'],
+                       help='Training phase: pretrain or finetune (overrides config)')
+    
     # Hub
     parser.add_argument('--hub_model_id', type=str, help='Hugging Face Hub model ID')
     parser.add_argument('--resume_from_checkpoint', type=str, default=None,
-                       help='Path to a checkpoint directory or file to resume training from')
+                       help='Path to pretrained checkpoint dir/file to load weights from')
     
     # Wandb
     parser.add_argument('--wandb_project', type=str, default='mimic-cxr-vqa', help='W&B project name')

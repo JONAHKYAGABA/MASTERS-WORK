@@ -89,11 +89,20 @@ training:
   fp16: true
   gradient_checkpointing: true
   
-  # Loss weights
+  # =====================================================
+  # Loss weights (pretraining emphasis)
+  # =====================================================
+  # VQA classification (core task)
   vqa_loss_weight: 1.0
-  chexpert_loss_weight: 0.3  # Auxiliary CheXpert supervision
-  
-  # Per-head loss weights (for pretraining, focus on binary)
+  # Answer generation
+  generation_loss_weight: 0.5
+  # CheXpert auxiliary supervision (helpful for feature learning)
+  chexpert_loss_weight: 0.3
+  # Scene graph generation (moderate — learn SG structure)
+  scene_graph_loss_weight: 0.2
+  # Visual grounding (moderate — learn localization)
+  grounding_loss_weight: 0.15
+  # Per-head VQA weights (pretraining: focus on binary)
   binary_head_weight: 1.0
   category_head_weight: 0.3
   region_head_weight: 0.3
