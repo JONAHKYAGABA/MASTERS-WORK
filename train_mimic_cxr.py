@@ -39,6 +39,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Any
 
+import gc
+import ctypes
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -47,6 +50,26 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# CPU memory reclamation helper (Linux only)
+# On Linux glibc, freed memory is NOT returned to the OS by default. Over
+# thousands of training steps the RSS grows monotonically even though the
+# Python heap has plenty of free space.  Calling malloc_trim(0) after
+# gc.collect() forces glibc to release free pages back to the OS.
+# ---------------------------------------------------------------------------
+_LIBC = None
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except OSError:
+    pass  # Not Linux — skip
+
+
+def _reclaim_cpu_memory():
+    """Force Python GC + glibc malloc_trim to return memory to the OS."""
+    gc.collect()
+    if _LIBC is not None:
+        _LIBC.malloc_trim(0)
 
 # DeepSpeed import (optional)
 try:
@@ -754,16 +777,28 @@ def train_epoch(
         
         # DeepSpeed tracks its own steps
         if use_deepspeed:
-            total_loss += loss.item()
+            step_loss = loss.item()  # scalar — no graph reference
+            total_loss += step_loss
             num_batches += 1
             global_step += 1
+        
+        # ------------------------------------------------------------------
+        # Snapshot scalar values BEFORE deleting tensors
+        # ------------------------------------------------------------------
+        _loss_display = loss.item() * (grad_accum_steps if not use_deepspeed else 1)
+        _vqa_display = loss_dict.get("vqa_loss", 0)
+        _chex_display = loss_dict.get("chexpert_loss", 0)
+        if torch.is_tensor(_vqa_display):
+            _vqa_display = _vqa_display.item()
+        if torch.is_tensor(_chex_display):
+            _chex_display = _chex_display.item()
         
         # Update progress bar (main process only)
         if is_main_process(local_rank) and hasattr(progress_bar, 'set_postfix'):
             progress_bar.set_postfix({
-                'loss': f'{loss.item() * (grad_accum_steps if not use_deepspeed else 1):.4f}',
-                'vqa': f'{loss_dict.get("vqa_loss", 0):.4f}',
-                'chex': f'{loss_dict.get("chexpert_loss", 0):.4f}',
+                'loss': f'{_loss_display:.4f}',
+                'vqa': f'{_vqa_display:.4f}',
+                'chex': f'{_chex_display:.4f}',
                 'step': global_step
             })
         
@@ -803,6 +838,26 @@ def train_epoch(
                 log_dict[f'train/mhc_{k}'] = v
             
             wandb.log(log_dict)
+        
+        # ------------------------------------------------------------------
+        # FREE large per-step objects to avoid holding references across
+        # iterations.  Without this, Python's refcount collector may keep
+        # the entire autograd graph alive until the *next* iteration
+        # re-assigns these names, doubling peak RSS.
+        # ------------------------------------------------------------------
+        del outputs, loss, loss_dict
+        del images, input_ids, attention_mask, token_type_ids
+        del scene_graphs, vqa_targets
+        
+        # ------------------------------------------------------------------
+        # CRITICAL: Reclaim CPU RSS every 50 steps.
+        # Python/glibc never returns freed heap pages to the OS on their
+        # own.  gc.collect() + malloc_trim(0) forces this, preventing the
+        # monotonic RSS growth that leads to OOM-kill at ~step 468.
+        # ------------------------------------------------------------------
+        if batch_idx % 50 == 0:
+            torch.cuda.empty_cache()
+            _reclaim_cpu_memory()
     
     avg_loss = total_loss / max(num_batches, 1)
     return avg_loss, global_step

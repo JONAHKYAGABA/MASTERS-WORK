@@ -1759,5 +1759,5 @@ def create_dataloader(
         collate_fn=collate_fn,
         sampler=sampler,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        persistent_workers=False  # Disabled: workers inherit multi-GB sample cache via fork COW; persistent ones accumulate RAM over time → OOM
+        persistent_workers=num_workers > 0  # Keep workers alive between batches for speed; RSS growth is handled by malloc_trim in train loop
     )
