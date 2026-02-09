@@ -582,6 +582,25 @@ class MIMICCXRVQADataset(Dataset):
                             with open(shard_path, 'rb') as f:
                                 samples = pickle.load(f)
                             logger.info(f"[Rank {rank}] Loaded {len(samples)} samples from shard")
+                            
+                            # ── Apply max_samples to shard ──────────────
+                            if self.max_samples and len(samples) > self.max_samples:
+                                orig_len = len(samples)
+                                samples = samples[:self.max_samples]
+                                # The old list (2M items) lost its reference;
+                                # 1.5M tail items are now unreachable → GC them
+                                gc.collect()
+                                try:
+                                    import ctypes
+                                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                                except (OSError, AttributeError):
+                                    pass
+                                logger.info(
+                                    f"[Rank {rank}] Truncated shard from {orig_len:,} → "
+                                    f"{self.max_samples:,} samples (freed ~"
+                                    f"{(orig_len - self.max_samples) * 15 / 1024:.0f} MB)"
+                                )
+                            
                             return samples
                         
                         # No pre-sharded cache exists - use staggered loading

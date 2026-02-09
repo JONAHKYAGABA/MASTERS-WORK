@@ -1192,6 +1192,38 @@ def main(args):
     # Cache directory for instant loading on distributed training
     cache_dir = getattr(config.data, 'cache_dir', '.cache/dataset_samples')
     
+    # ------------------------------------------------------------------
+    # AUTO-COMPUTE safe max_samples if not provided by user.
+    # Each cached sample is ~15 KB (Python dict overhead).  With 4 ranks
+    # each loading 2M samples, that's ~128 GB — leaving almost no room
+    # for training.  We cap samples so data uses ≤35% of total RAM.
+    # ------------------------------------------------------------------
+    if args.max_samples is None:
+        try:
+            import psutil
+            total_ram_gb = psutil.virtual_memory().total / (1024**3)
+            data_budget_gb = total_ram_gb * 0.35
+            system_overhead_gb = 15  # OS + Python + libraries
+            per_rank_budget_gb = max(2, (data_budget_gb - system_overhead_gb) / max(1, world_size))
+            BYTES_PER_SAMPLE = 15 * 1024  # empirical for MIMIC-Ext-CXR-QBA
+            auto_max = int(per_rank_budget_gb * 1024**3 / BYTES_PER_SAMPLE)
+            auto_max = max(50_000, auto_max)
+            args.max_samples = auto_max
+            if is_main_process(local_rank):
+                logger.info(
+                    f"Auto-computed max_samples={auto_max:,} per rank "
+                    f"(RAM={total_ram_gb:.0f}GB, {world_size} ranks, "
+                    f"~{per_rank_budget_gb:.1f}GB/rank for data)"
+                )
+        except ImportError:
+            if is_main_process(local_rank):
+                logger.warning(
+                    "psutil not installed — cannot auto-limit samples. "
+                    "If OOM, pass --max_samples 500000"
+                )
+    elif is_main_process(local_rank):
+        logger.info(f"Using user-specified max_samples={args.max_samples:,}")
+    
     if is_main_process(local_rank):
         logger.info("Loading datasets (using cache if available)...")
     
@@ -1235,9 +1267,26 @@ def main(args):
     if is_distributed:
         dist.barrier()
     
+    # ------------------------------------------------------------------
+    # Reclaim memory after dataset loading.  The pickle.load() creates
+    # all 2M dicts, then we truncate to max_samples.  The freed dicts
+    # are unreachable but glibc hasn't returned the pages to the OS.
+    # ------------------------------------------------------------------
+    _reclaim_cpu_memory()
+    
     if is_main_process(local_rank):
-        logger.info(f"Train samples: {len(train_dataset)}")
-        logger.info(f"Val samples: {len(val_dataset)}")
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            logger.info(
+                f"Train samples: {len(train_dataset)} | "
+                f"Val samples: {len(val_dataset)} | "
+                f"RAM after load: {mem.used/1024**3:.1f}GB / {mem.total/1024**3:.1f}GB "
+                f"({mem.percent}%)"
+            )
+        except ImportError:
+            logger.info(f"Train samples: {len(train_dataset)}")
+            logger.info(f"Val samples: {len(val_dataset)}")
     
     # Create distributed samplers for multi-GPU training
     train_sampler = None
