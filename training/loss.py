@@ -338,6 +338,19 @@ class MultiTaskLoss(nn.Module):
         pred = pred.float()
         target = target.float()
         
+        # Ensure box ordering: x1<=x2, y1<=y2 (prevents negative areas)
+        pred_x1 = torch.min(pred[:, 0], pred[:, 2])
+        pred_y1 = torch.min(pred[:, 1], pred[:, 3])
+        pred_x2 = torch.max(pred[:, 0], pred[:, 2])
+        pred_y2 = torch.max(pred[:, 1], pred[:, 3])
+        pred = torch.stack([pred_x1, pred_y1, pred_x2, pred_y2], dim=-1)
+        
+        tgt_x1 = torch.min(target[:, 0], target[:, 2])
+        tgt_y1 = torch.min(target[:, 1], target[:, 3])
+        tgt_x2 = torch.max(target[:, 0], target[:, 2])
+        tgt_y2 = torch.max(target[:, 1], target[:, 3])
+        target = torch.stack([tgt_x1, tgt_y1, tgt_x2, tgt_y2], dim=-1)
+        
         x1 = torch.max(pred[:, 0], target[:, 0])
         y1 = torch.max(pred[:, 1], target[:, 1])
         x2 = torch.min(pred[:, 2], target[:, 2])
