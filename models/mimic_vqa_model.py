@@ -803,10 +803,12 @@ class SceneGraphGenerator(nn.Module):
         for b in range(B):
             for n in range(self.max_objects):
                 box = boxes[b, n]
-                x1, y1 = max(0, int(box[0].item() * W)), max(0, int(box[1].item() * H))
-                x2, y2 = min(W, int(box[2].item() * W)), min(H, int(box[3].item() * H))
-                if x2 <= x1: x2 = x1 + 1
-                if y2 <= y1: y2 = y1 + 1
+                # Clamp coordinates to valid feature-map bounds so the
+                # crop always has ≥1 pixel in both H and W dimensions.
+                x1 = max(0, min(int(box[0].item() * W), W - 1))
+                y1 = max(0, min(int(box[1].item() * H), H - 1))
+                x2 = max(x1 + 1, min(int(box[2].item() * W) + 1, W))
+                y2 = max(y1 + 1, min(int(box[3].item() * H) + 1, H))
                 roi = visual_features[b:b+1, :, y1:y2, x1:x2]
                 pooled = F.adaptive_avg_pool2d(roi, (self.roi_pool_size, self.roi_pool_size))
                 roi_features[b, n] = pooled.flatten().to(dtype=param_dtype)
