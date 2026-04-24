@@ -61,8 +61,13 @@ class HardwareInfo:
     optimal_num_workers: int = 4
     optimal_prefetch_factor: int = 2
     use_fp16: bool = True
+    use_bf16: bool = False
     use_gradient_checkpointing: bool = True
     deepspeed_stage: int = 2
+    # V2: when compute capability is below sm_80 (Ampere), bf16 isn't
+    # supported in hardware. Force QLoRA (4-bit NF4 weights, fp16 compute).
+    force_qlora: bool = False
+    min_compute_capability: Tuple[int, int] = (0, 0)
 
 
 def get_gpu_info() -> List[GPUInfo]:
@@ -221,9 +226,21 @@ def _calculate_optimal_settings(info: HardwareInfo):
         info.deepspeed_stage = 3  # ZeRO-3 for very limited memory
     
     # FP16 supported on all modern GPUs (compute capability >= 7.0)
+    # V2: bf16 only on sm_80+ (Ampere/Hopper/Blackwell). Below that we must
+    # force QLoRA (4-bit NF4 weights with fp16 compute) for the Qwen backbone.
     if info.gpus:
-        min_compute = min(g.compute_capability[0] for g in info.gpus)
-        info.use_fp16 = min_compute >= 7
+        min_cc = min(g.compute_capability for g in info.gpus)
+        info.min_compute_capability = min_cc
+        info.use_fp16 = min_cc[0] >= 7
+        info.use_bf16 = min_cc >= (8, 0)
+        # Below Ampere: no bf16 → force QLoRA. Above: still allow opt-in QLoRA
+        # for memory savings, but don't force.
+        info.force_qlora = min_cc < (8, 0)
+        if info.force_qlora:
+            logger.warning(
+                f"Detected GPU with compute capability {min_cc[0]}.{min_cc[1]} (<8.0). "
+                f"Forcing QLoRA (4-bit NF4 weights, fp16 compute). bf16 unavailable."
+            )
     
     # Calculate gradient accumulation to target effective batch ~192
     # Lower accumulation = fewer wasted cycles = faster wall-clock time
@@ -314,8 +331,13 @@ def get_optimal_config_overrides(info: HardwareInfo) -> Dict[str, Any]:
             'gradient_accumulation_steps': info.optimal_grad_accum,
             'dataloader_num_workers': info.optimal_num_workers,
             'dataloader_prefetch_factor': info.optimal_prefetch_factor,
-            'fp16': info.use_fp16,
+            'fp16': info.use_fp16 and not info.use_bf16,
+            'bf16': info.use_bf16,
             'gradient_checkpointing': info.use_gradient_checkpointing,
+        },
+        'model': {
+            # V2: force 4-bit QLoRA on Turing-and-below GPUs.
+            'use_quantization': info.force_qlora,
         },
         'deepspeed': {
             'enabled': info.num_gpus > 1 and info.deepspeed_stage > 0,

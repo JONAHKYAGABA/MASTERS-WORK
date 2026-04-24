@@ -1,18 +1,25 @@
 """
-Multi-Task Loss Functions for MIMIC-CXR VQA
+Multi-Task Loss Functions for MIMIC-CXR VQA (v2)
 
 Single unified MultiTaskLoss class that handles all tasks:
-- VQA multi-head classification loss
-- Answer generation loss (cross-entropy for decoder)
+- VQA multi-head classification loss (auxiliary in v2)
+- Answer generation loss (consumes Qwen's lm_loss directly when present)
 - CheXpert auxiliary classification loss
-- Scene graph generation loss
-- Visual grounding loss
+- Scene graph generation loss (only active in 'sg_only' mode for v2)
+- Visual grounding loss (priority #1 in v2)
 
-Training Mode Weights:
-======================
-'standard': vqa=1.0, generation=0.5, chexpert=0.3, sg=0.1, grounding=0.1
-'pretrain': vqa=1.0, generation=0.5, chexpert=0.3, sg=0.2, grounding=0.15
-'finetune': vqa=1.0, generation=0.8, chexpert=0.1, sg=0.05, grounding=0.2
+V2 priorities (in order): grounding, generation, classification, chexpert.
+Therefore grounding gets the largest weight and classification/chexpert are
+demoted to small auxiliary signals.
+
+Training Mode Weights (v2):
+============================
+'sg_only':    sg=1.0, others=0          # Stage 1
+'alignment':  generation=1.0, others=0  # Stage 2 (LLM frozen, SG-text contrastive done elsewhere)
+'pretrain':   generation=1.0, grounding=2.0, vqa=0.05, chexpert=0.05, sg=0   # Stage 3a
+'finetune':   generation=1.0, grounding=3.0, vqa=0.05, chexpert=0.05, sg=0   # Stage 3b
+'rl':         generation=0, grounding=2.0, vqa=0, chexpert=0, sg=0           # Stage 4 (rewards drive)
+'standard':   alias for 'pretrain' (back-compat)
 """
 
 import torch
@@ -29,11 +36,22 @@ class MultiTaskLoss(nn.Module):
     corresponding losses. Set training_mode to adjust weights.
     """
     
-    # Preset weights for different training stages
+    # Preset weights for v2 training stages.
+    # generation absorbs Qwen's lm_loss when outputs['lm_loss'] is present,
+    # otherwise falls back to CE on outputs['generated_answer_logits'].
     MODE_WEIGHTS = {
-        'standard': {'vqa': 1.0, 'generation': 0.5, 'chexpert': 0.3, 'scene_graph': 0.1, 'grounding': 0.1},
-        'pretrain': {'vqa': 1.0, 'generation': 0.5, 'chexpert': 0.3, 'scene_graph': 0.2, 'grounding': 0.15},
-        'finetune': {'vqa': 1.0, 'generation': 0.8, 'chexpert': 0.1, 'scene_graph': 0.05, 'grounding': 0.2},
+        # Stage 1: SG generator solo on Chest ImaGenome
+        'sg_only':   {'vqa': 0.0,  'generation': 0.0, 'chexpert': 0.0,  'scene_graph': 1.0, 'grounding': 0.0},
+        # Stage 2: SG-LLM alignment (LLM frozen; contrastive often run separately)
+        'alignment': {'vqa': 0.0,  'generation': 1.0, 'chexpert': 0.05, 'scene_graph': 0.0, 'grounding': 0.0},
+        # Stage 3a: SFT on B-grade QA
+        'pretrain':  {'vqa': 0.05, 'generation': 1.0, 'chexpert': 0.05, 'scene_graph': 0.0, 'grounding': 2.0},
+        # Stage 3b: SFT on A-grade QA (boost grounding)
+        'finetune':  {'vqa': 0.05, 'generation': 1.0, 'chexpert': 0.05, 'scene_graph': 0.0, 'grounding': 3.0},
+        # Stage 4: GRPO outer loop drives the gradient; SFT signals stay light
+        'rl':        {'vqa': 0.0,  'generation': 0.0, 'chexpert': 0.0,  'scene_graph': 0.0, 'grounding': 2.0},
+        # Back-compat alias
+        'standard':  {'vqa': 0.05, 'generation': 1.0, 'chexpert': 0.05, 'scene_graph': 0.0, 'grounding': 2.0},
     }
     
     def __init__(
@@ -114,6 +132,10 @@ class MultiTaskLoss(nn.Module):
         sg_outputs = outputs.get('scene_graph_outputs') if isinstance(outputs, dict) else None
         grounding_outputs = outputs.get('grounding_outputs') if isinstance(outputs, dict) else None
         generation_logits = outputs.get('generated_answer_logits') if isinstance(outputs, dict) else None
+        # V2: Qwen returns lm_loss directly. Prefer it over recomputing CE on
+        # generated_answer_logits, which avoids a redundant softmax pass and
+        # respects Qwen's own label masking (assistant-turn-only).
+        precomputed_lm_loss = outputs.get('lm_loss') if isinstance(outputs, dict) else None
         
         # =====================================================
         # VQA CLASSIFICATION LOSS
@@ -146,14 +168,20 @@ class MultiTaskLoss(nn.Module):
         # =====================================================
         # ANSWER GENERATION LOSS
         # =====================================================
+        # V2: prefer Qwen's precomputed lm_loss (already shifts + masks the
+        # assistant turn). Fall back to manual CE on logits for the legacy
+        # decoder path or for any non-Qwen forward.
         generation_loss = torch.tensor(0.0, device=device)
-        
-        if generation_logits is not None and answer_ids is not None:
+
+        if precomputed_lm_loss is not None and torch.is_tensor(precomputed_lm_loss):
+            generation_loss = precomputed_lm_loss
+            loss_dict['generation_loss'] = generation_loss
+        elif generation_logits is not None and answer_ids is not None:
             # Shift logits and labels for causal LM
             # logits: (B, T, V), answer_ids: (B, T)
             shift_logits = generation_logits[:, :-1, :].contiguous()
             shift_labels = answer_ids[:, 1:].contiguous()
-            
+
             # Flatten and compute loss
             B, T, V = shift_logits.shape
             generation_loss = self.generation_ce_loss(

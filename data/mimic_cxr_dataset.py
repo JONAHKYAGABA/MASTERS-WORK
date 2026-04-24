@@ -1527,6 +1527,32 @@ class MIMICCXRVQADataset(Dataset):
         # Encode view position for model (useful for view-aware processing)
         view_encoding = self._encode_view_position(view_position)
         
+        # =====================================================
+        # V2 STRUCTURED ANSWER (for Qwen LM supervision)
+        # =====================================================
+        # Format: <think>{cot}</think><box>{x1:.3f},{y1:.3f},{x2:.3f},{y2:.3f}</box><answer>{ans}</answer>
+        # cot is rule-generated from CheXpert labels + answer regions when no
+        # teacher trace is available. Replace the cot string here with a
+        # distilled trace (GPT-4o / Claude / Qwen-72B) once one exists.
+        if grounding_data['valid']:
+            _bx = grounding_data['bbox']
+        else:
+            _bx = [0.0, 0.0, 1.0, 1.0]  # whole-image fallback
+        _box_str = f"{_bx[0]:.3f},{_bx[1]:.3f},{_bx[2]:.3f},{_bx[3]:.3f}"
+        _cot_bits: List[str] = []
+        if answer_regions:
+            _cot_bits.append(f"Region(s) of interest: {', '.join(map(str, answer_regions))}.")
+        if answer_entities:
+            _cot_bits.append(f"Observed: {', '.join(map(str, answer_entities))}.")
+        if answer_positiveness:
+            _cot_bits.append(f"Positiveness: {answer_positiveness}.")
+        _cot = " ".join(_cot_bits) if _cot_bits else "Reviewing the chest radiograph."
+        structured_answer_text = (
+            f"<think>{_cot}</think>"
+            f"<box>{_box_str}</box>"
+            f"<answer>{full_answer_text}</answer>"
+        )
+
         return {
             # === MODEL INPUTS ===
             'images': image_tensor,
@@ -1534,6 +1560,11 @@ class MIMICCXRVQADataset(Dataset):
             'attention_mask': question_inputs['attention_mask'].squeeze(0),
             'token_type_ids': question_inputs.get('token_type_ids', torch.zeros_like(question_inputs['input_ids'])).squeeze(0),
             'scene_graphs': sg_features,
+
+            # === V2 INPUTS (raw text + raw PIL image for Qwen processor) ===
+            'pil_image': image,                 # PIL.Image.Image (pre-transform RGB)
+            'question_text': sample['question'],  # raw question string
+            'structured_answer_text': structured_answer_text,  # <think><box><answer> format
             
             # === ROUTING ===
             'question_types': sample['question_type'],
@@ -1677,6 +1708,13 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     original_rows = torch.tensor([item.get('original_rows', 224) for item in batch], dtype=torch.long)
     original_cols = torch.tensor([item.get('original_cols', 224) for item in batch], dtype=torch.long)
     
+    # === V2 raw inputs for Qwen processor ===
+    pil_images = [item.get('pil_image') for item in batch]
+    questions = [item.get('question_text', '') for item in batch]
+    structured_answer_texts = [
+        item.get('structured_answer_text', '') for item in batch
+    ]
+
     result = {
         # === Model Inputs ===
         'images': images,
@@ -1684,6 +1722,14 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'attention_mask': attention_mask,
         'token_type_ids': token_type_ids,
         'scene_graphs': scene_graphs,
+
+        # === V2 (Qwen) raw inputs ===
+        'pil_images': pil_images,                # List[PIL.Image]
+        'questions': questions,                  # List[str]
+        # 'answer_texts' below holds the structured <think><box><answer> string
+        # used for Qwen LM supervision. The plain reference answer remains
+        # available via 'reference_answers' / 'answer_texts_raw' for metrics.
+        'answer_texts': structured_answer_texts, # List[str]
         
         # === Routing ===
         'question_types': question_types,
@@ -1719,7 +1765,9 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     
     # === Study/Patient Metadata (for evaluation & tracking) ===
     if 'answer_text' in batch[0]:
-        result['answer_texts'] = [item.get('answer_text', '') for item in batch]
+        # Plain reference answer text (un-structured); 'answer_texts' above
+        # holds the v2 structured <think><box><answer> string.
+        result['answer_texts_raw'] = [item.get('answer_text', '') for item in batch]
     if 'answer_regions' in batch[0]:
         result['answer_regions'] = [item.get('answer_regions', []) for item in batch]
     if 'answer_entities' in batch[0]:

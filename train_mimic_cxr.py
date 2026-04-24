@@ -126,7 +126,11 @@ from configs.mimic_cxr_config import (
     load_config_from_file
 )
 from data.mimic_cxr_dataset import MIMICCXRVQADataset, create_dataloader
-from models.mimic_vqa_model import MIMICCXRVQAModel, MIMICVQAOutput
+# V2 model: Qwen2.5-VL backbone + SG soft tokens + grounding refinement head.
+# The legacy MIMICCXRVQAModel was retired; SSGVQANetV2 lives in
+# models/ssg_vqa_net_v2.py and exposes the same forward output keys consumed
+# by training.loss.MultiTaskLoss and training.metrics.VQAMetrics.
+from models import SSGVQANetV2
 from training.loss import MultiTaskLoss
 from training.metrics import VQAMetrics
 from utils.hardware_utils import (
@@ -505,9 +509,9 @@ using the MIMIC-CXR-JPG images and MIMIC-Ext-CXR-QBA question-answer pairs.
 ## Usage
 
 ```python
-from models.mimic_vqa_model import MIMICCXRVQAModel
+from models import SSGVQANetV2
 
-model = MIMICCXRVQAModel.from_pretrained("{config.training.hub_model_id}")
+model = SSGVQANetV2(qwen_model_id="{config.training.hub_model_id}")
 ```
 
 ## Citation
@@ -575,6 +579,15 @@ def train_epoch(
         token_type_ids = batch.get('token_type_ids', torch.zeros_like(input_ids)).to(device)
         scene_graphs = batch['scene_graphs']
         question_types = batch['question_types']
+
+        # === V2 raw inputs for Qwen processor (added by collate_fn) ===
+        pil_images = batch.get('pil_images')          # List[PIL.Image]
+        questions = batch.get('questions')            # List[str]
+        answer_texts = batch.get('answer_texts')      # List[str] structured
+        # Pass scene_graphs=None to let v2 generate fresh from Qwen's ViT.
+        # When ground-truth scene graphs from the dataset are preferred (Stage
+        # 1 / debugging), keep batch['scene_graphs']. Default: trust dataset SG
+        # during training, regenerate at inference (handled inside SSGVQANetV2).
         answer_idx = batch['answer_idx'].to(device)
         chexpert_labels = batch['chexpert_labels'].to(device)
         chexpert_mask = batch['chexpert_mask'].to(device)
@@ -630,6 +643,9 @@ def train_epoch(
         if use_deepspeed:
             outputs = model(
                 images=images,
+                pil_images=pil_images,
+                questions=questions,
+                answer_texts=answer_texts,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 scene_graphs=scene_graphs,
@@ -641,6 +657,12 @@ def train_epoch(
                 gt_bboxes=gt_sg_bboxes,
                 gt_entities=gt_sg_entities,
                 gt_regions=gt_sg_regions,
+                # V2: thread grounding GT into the model so the refinement
+                # head trains on a noised-GT init_bbox instead of a fixed
+                # anchor — matches the inference distribution where init
+                # comes from the LLM's parsed <box>.
+                gt_grounding_bboxes=gt_grounding_bboxes,
+                gt_pointing_valid=gt_pointing_valid,
                 answer_ids=answer_ids,
             )
             
@@ -669,6 +691,9 @@ def train_epoch(
                 with autocast('cuda'):
                     outputs = model(
                         images=images,
+                        pil_images=pil_images,
+                        questions=questions,
+                        answer_texts=answer_texts,
                         input_ids=input_ids,
                         attention_mask=attention_mask,
                         scene_graphs=scene_graphs,
@@ -680,6 +705,8 @@ def train_epoch(
                         gt_bboxes=gt_sg_bboxes,
                         gt_entities=gt_sg_entities,
                         gt_regions=gt_sg_regions,
+                        gt_grounding_bboxes=gt_grounding_bboxes,
+                        gt_pointing_valid=gt_pointing_valid,
                         answer_ids=answer_ids,
                     )
                     
@@ -706,6 +733,9 @@ def train_epoch(
             else:
                 outputs = model(
                     images=images,
+                    pil_images=pil_images,
+                    questions=questions,
+                    answer_texts=answer_texts,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     scene_graphs=scene_graphs,
@@ -717,6 +747,8 @@ def train_epoch(
                     gt_bboxes=gt_sg_bboxes,
                     gt_entities=gt_sg_entities,
                     gt_regions=gt_sg_regions,
+                    gt_grounding_bboxes=gt_grounding_bboxes,
+                    gt_pointing_valid=gt_pointing_valid,
                     answer_ids=answer_ids,
                 )
                 
@@ -927,7 +959,12 @@ def validate(
         answer_idx = batch['answer_idx'].to(device)
         chexpert_labels = batch['chexpert_labels'].to(device)
         chexpert_mask = batch['chexpert_mask'].to(device)
-        
+
+        # === V2 raw inputs for Qwen processor ===
+        # In validation we omit answer_texts so SSGVQANetV2 runs free generation.
+        pil_images = batch.get('pil_images')
+        questions = batch.get('questions')
+
         # === Image Metadata (from MIMIC-CXR-JPG) ===
         view_encodings = batch.get('view_encodings', None)
         if view_encodings is not None:
@@ -967,9 +1004,11 @@ def validate(
         if images is None:
             continue
         
-        # Forward pass (inference mode - no answer_ids for free generation)
+        # Forward pass (inference mode - no answer_texts/answer_ids → free generation)
         outputs = model(
             images=images,
+            pil_images=pil_images,
+            questions=questions,
             input_ids=input_ids,
             attention_mask=attention_mask,
             scene_graphs=scene_graphs,
@@ -1377,25 +1416,78 @@ def main(args):
     if is_main_process(local_rank):
         logger.info("Initializing model...")
     
-    model = MIMICCXRVQAModel(
-        visual_backbone=config.model.visual_backbone,
-        text_encoder=config.model.text_encoder,
-        visual_feature_dim=config.model.visual_feature_dim,
-        scene_graph_dim=config.model.scene_graph_dim,
+    # ------------------------------------------------------------------
+    # V2 model construction — Qwen2.5-VL + LoRA + SG soft tokens
+    # ------------------------------------------------------------------
+    # Compute-capability guard: Turing (cc<8.0, e.g. RTX 8000 / V100) lacks
+    # bf16 and FlashAttention-2 — force fp16 compute and 4-bit NF4 weights.
+    _phase = getattr(config.training, 'phase', 'pretrain').lower()
+    _gpu0_cc = (0, 0)
+    if torch.cuda.is_available():
+        _props = torch.cuda.get_device_properties(0)
+        _gpu0_cc = (_props.major, _props.minor)
+    _force_qlora = _gpu0_cc < (8, 0)
+    _qwen_dtype = torch.float16 if _force_qlora else torch.bfloat16
+
+    _qwen_id = getattr(config.model, 'qwen_model_id', 'Qwen/Qwen2.5-VL-7B-Instruct')
+    _use_quant = bool(getattr(config.model, 'use_quantization', _force_qlora))
+    _lora_rank = int(getattr(config.model, 'lora_rank', 16))
+    _num_sg_tokens = int(getattr(config.model, 'num_sg_tokens', 8))
+
+    if is_main_process(local_rank):
+        logger.info(
+            f"V2 model: {_qwen_id} | cc={_gpu0_cc} | quantization={_use_quant} "
+            f"| lora_rank={_lora_rank} | num_sg_tokens={_num_sg_tokens} "
+            f"| dtype={_qwen_dtype} | training_mode={_phase}"
+        )
+        if _force_qlora and not _use_quant:
+            logger.warning(
+                "Compute capability < 8.0 detected but use_quantization=False. "
+                "Forcing QLoRA (4-bit NF4) for memory safety."
+            )
+
+    model = SSGVQANetV2(
+        qwen_model_id=_qwen_id,
+        use_quantization=_use_quant or _force_qlora,
+        lora_rank=_lora_rank,
+        num_sg_tokens=_num_sg_tokens,
         num_regions=config.model.num_regions,
         num_entities=config.model.num_entities,
-        hidden_size=config.model.hidden_size,
-        num_hidden_layers=config.model.num_hidden_layers,
-        num_attention_heads=config.model.num_attention_heads,
-        sim_layers=config.model.sim_layers,
-        num_binary_classes=config.model.num_binary_classes,
-        num_category_classes=config.model.num_category_classes,
+        num_binary=config.model.num_binary_classes,
+        num_category=config.model.num_category_classes,
         num_region_classes=config.model.num_region_classes,
-        num_severity_classes=config.model.num_severity_classes,
-        dropout=config.model.hidden_dropout_prob,
-        use_chexpert_head=True,
-        gradient_checkpointing=config.training.gradient_checkpointing
+        num_severity=config.model.num_severity_classes,
+        training_mode=_phase if _phase in {'sg_only', 'alignment', 'pretrain', 'finetune', 'rl'} else 'pretrain',
+        torch_dtype=_qwen_dtype,
     )
+
+    # Dtype consistency: Qwen runs in fp16 (or bf16 on Ampere+) but the v2
+    # custom modules (SG encoder/projector, grounding head, aux heads, mHC)
+    # initialize in fp32 by default. Without an explicit cast every cross-
+    # module hop pays an implicit upcast/downcast — ~10-15% throughput tax
+    # on Turing cards. The forward path's _ensure_dtype helpers keep things
+    # numerically correct, but we'd rather pay the cast once at startup.
+    # NOTE: do NOT cast the SG generator — its BatchNorm layers misbehave
+    # in fp16 on Turing. Leave it fp32; _extract_qwen_vit_feature_maps
+    # handles the dtype boundary.
+    for _mod_name in ("sg_encoder", "sg_projector", "grounding_head", "aux_heads"):
+        _mod = getattr(model, _mod_name, None)
+        if _mod is not None:
+            _mod.to(dtype=_qwen_dtype)
+    if is_main_process(local_rank):
+        logger.info(f"Cast SG/grounding/aux modules to {_qwen_dtype} to match Qwen.")
+
+    # Mode-specific LR override (ADR-026 / migration notes):
+    #   pretrain → 2e-4 (LoRA warmup), finetune → 5e-5 (refinement)
+    _MODE_LR = {'sg_only': 1e-4, 'alignment': 5e-5, 'pretrain': 2e-4, 'finetune': 5e-5, 'rl': 1e-5}
+    if _phase in _MODE_LR:
+        _new_lr = _MODE_LR[_phase]
+        if is_main_process(local_rank):
+            logger.info(
+                f"Mode-specific LR override for '{_phase}': "
+                f"{config.training.learning_rate} -> {_new_lr}"
+            )
+        config.training.learning_rate = _new_lr
     
     # ==================================================================
     # LOAD PRETRAINED CHECKPOINT (for finetuning or resuming)
