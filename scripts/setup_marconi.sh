@@ -182,12 +182,14 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
         warn "nvidia-smi not found — installing CPU PyTorch (you can override later)"
     fi
 
-    # Pick a torch wheel index. bnb-0.43+ supports cu118 and cu121 wheels.
+    # Pick a torch wheel index. NVIDIA drivers are forward-compatible, so
+    # cu121 wheels run fine on driver-reported CUDA 12.x and 13.x. Below
+    # 12.x we drop to cu118.
     case "${DRV_CUDA}" in
-        12.[1-9]*|12.[1-9]) TORCH_INDEX="https://download.pytorch.org/whl/cu121" ;;
-        12.0*|11.8*|11.[8-9])     TORCH_INDEX="https://download.pytorch.org/whl/cu118" ;;
-        "")                       TORCH_INDEX="https://download.pytorch.org/whl/cpu"   ;;
-        *)                        TORCH_INDEX="https://download.pytorch.org/whl/cu121" ;;
+        13.*|12.[1-9]*|12.[1-9]) TORCH_INDEX="https://download.pytorch.org/whl/cu121" ;;
+        12.0*|11.8*|11.[8-9])    TORCH_INDEX="https://download.pytorch.org/whl/cu118" ;;
+        "")                      TORCH_INDEX="https://download.pytorch.org/whl/cpu"   ;;
+        *)                       TORCH_INDEX="https://download.pytorch.org/whl/cu121" ;;
     esac
     log "torch wheel index: $TORCH_INDEX"
 
@@ -197,6 +199,47 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
     log "  → installing PyTorch"
     python -m pip install --index-url "$TORCH_INDEX" \
         "torch>=2.3,<2.6" "torchvision" "torchaudio"
+
+    # ---------------- post-install torch verification ----------------------
+    # If pip silently fell back to a CPU build (transitive-dep conflict,
+    # broken cache, wheel-index hiccup), torch.cuda.is_available() will be
+    # False even though nvidia-smi works. Catch that here, force-reinstall
+    # from the chosen GPU index, and verify again. If it STILL fails after a
+    # clean reinstall, error out with diagnostics — better than continuing
+    # silently into a CPU smoke test.
+    if [[ "$TORCH_INDEX" != *"/cpu" ]]; then
+        log "  → verifying torch CUDA build"
+        VERIFY="$(python - <<'PY' 2>&1
+import torch
+print(f"torch={torch.__version__}  cuda_build={torch.version.cuda}  is_available={torch.cuda.is_available()}")
+PY
+)"
+        log "    $VERIFY"
+        if [[ "$VERIFY" != *"is_available=True"* ]]; then
+            warn "torch installed without CUDA — force-reinstalling from $TORCH_INDEX"
+            python -m pip install --no-cache-dir --force-reinstall \
+                --index-url "$TORCH_INDEX" \
+                "torch>=2.3,<2.6" "torchvision" "torchaudio"
+            VERIFY2="$(python - <<'PY' 2>&1
+import torch
+print(f"torch={torch.__version__}  cuda_build={torch.version.cuda}  is_available={torch.cuda.is_available()}")
+PY
+)"
+            log "    after reinstall: $VERIFY2"
+            if [[ "$VERIFY2" != *"is_available=True"* ]]; then
+                err "torch CUDA install failed twice."
+                err "  Driver CUDA reported: ${DRV_CUDA:-unknown}"
+                err "  Wheel index used:    $TORCH_INDEX"
+                err "  Manual recovery:"
+                err "    conda activate $ENV_NAME"
+                err "    pip uninstall -y torch torchvision torchaudio"
+                err "    pip install --index-url $TORCH_INDEX 'torch>=2.3,<2.6' torchvision torchaudio"
+                err "    python -c 'import torch; print(torch.cuda.is_available())'"
+                exit 1
+            fi
+        fi
+        ok "torch CUDA verified"
+    fi
 
     log "  → installing transformers + peft + bitsandbytes + accelerate + deepspeed"
     python -m pip install \
