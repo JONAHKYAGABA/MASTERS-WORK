@@ -125,11 +125,24 @@ if [[ "${SKIP_ENV:-0}" != "1" ]]; then
     fi
     # shellcheck disable=SC1091
     source "$(conda info --base)/etc/profile.d/conda.sh"
+
+    # Accept Anaconda channel ToS (required since 2024 for repo.anaconda.com).
+    # The `|| true` keeps this safe on older conda versions that lack `tos`.
+    conda tos accept --override-channels \
+        --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
+    conda tos accept --override-channels \
+        --channel https://repo.anaconda.com/pkgs/r    >/dev/null 2>&1 || true
+
     if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
         ok "env '$ENV_NAME' already exists"
     else
-        log "creating env '$ENV_NAME' (Python $PY_VERSION)"
-        conda create -n "$ENV_NAME" "python=${PY_VERSION}" -y
+        log "creating env '$ENV_NAME' (Python $PY_VERSION) from conda-forge"
+        # conda-forge is community-maintained, has no ToS gate, and ships
+        # newer Python builds. Override defaults so we don't hit Anaconda's
+        # ToS even if the auto-accept above silently failed.
+        conda create -n "$ENV_NAME" \
+            -c conda-forge --override-channels \
+            "python=${PY_VERSION}" -y
         ok "env created"
     fi
     conda activate "$ENV_NAME"
