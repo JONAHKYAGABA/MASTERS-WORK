@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # scripts/quickrun.sh
 #
-# Fast end-to-end runner using a Python venv (NO conda).
-# Defaults: 5 scenarios on the train split, scoring vs ground truth.
+# Self-healing fast runner: verifies project files, fetches missing ones,
+# creates a venv, installs deps, runs the agent end-to-end against an
+# OpenAI-compatible LLM endpoint, and scores against ground truth.
 #
-# Single command from the project root (the dir containing server.py):
+# Single command from the project root (the dir that should contain server.py):
 #     bash scripts/quickrun.sh
 #
-# Override with env vars:
-#     N_SCENARIOS=50 bash scripts/quickrun.sh
-#     MODEL_URL=https://my-endpoint/v1 MODEL_NAME=Qwen/... bash scripts/quickrun.sh
-#     TRAIN_URL=https://example.com/train.json bash scripts/quickrun.sh
-#     PYTHON_BIN=python3.10 bash scripts/quickrun.sh
-#     SKIP_INSTALL=1 bash scripts/quickrun.sh        # reuse existing .venv
-#     SKIP_SERVER=1 bash scripts/quickrun.sh         # server already running
+# Common overrides:
+#     N_SCENARIOS=50  bash scripts/quickrun.sh
+#     MODEL_URL=https://my-endpoint/v1   MODEL_NAME=Qwen/...   bash ...
+#     PYTHON_BIN=python3.10              bash scripts/quickrun.sh
+#     REPO_URL=https://raw.githubusercontent.com/<user>/<repo>/main/Track%20A
+#         bash scripts/quickrun.sh        # auto-curl missing project files
+#     TRAIN_URL=https://example.com/train.json   bash scripts/quickrun.sh
+#     SKIP_INSTALL=1   SKIP_SERVER=1     bash scripts/quickrun.sh
 
 set -euo pipefail
 
@@ -25,11 +27,116 @@ fail()  { printf "ERROR: %s\n" "$*" >&2; exit 1; }
 
 step "Project: $PROJECT_DIR"
 
+# ---------- 0. verify / fetch project files ----------
+step "[0/7] Verify project files"
+
+REQUIRED_FILES=(server.py _types.py utils.py logger.py main.py requirements.txt)
+REQUIRED_DATA=(data/Phase_1/train.json data/Phase_1/test.json)
+
+REQUIREMENTS_FALLBACK="fastapi
+openai
+pydantic
+pandas
+datasets"
+
+# Helper: fetch <relpath> from $REPO_URL via curl. Returns 0 on success.
+fetch_one() {
+    local rel="$1"
+    [ -n "${REPO_URL:-}" ] || return 1
+    local url="${REPO_URL%/}/$rel"
+    mkdir -p "$(dirname "$rel")"
+    if curl -fL --retry 2 -sS -o "$rel" "$url"; then
+        echo "  fetched $rel from $url"
+        return 0
+    else
+        echo "  failed to fetch $rel from $url" >&2
+        return 1
+    fi
+}
+
+missing_files=()
+for f in "${REQUIRED_FILES[@]}"; do
+    if [ ! -f "$f" ]; then
+        missing_files+=("$f")
+    fi
+done
+
+if [ "${#missing_files[@]}" -gt 0 ]; then
+    echo "Missing project files: ${missing_files[*]}"
+    if [ -n "${REPO_URL:-}" ]; then
+        echo "Trying to fetch from REPO_URL=$REPO_URL"
+        for f in "${missing_files[@]}"; do
+            fetch_one "$f" || true
+        done
+    fi
+fi
+
+# Special-case: if requirements.txt is STILL missing, write the known content.
+if [ ! -f requirements.txt ]; then
+    echo "Writing requirements.txt fallback (5 packages)"
+    printf '%s\n' "$REQUIREMENTS_FALLBACK" > requirements.txt
+fi
+
+# Re-check; non-data files are non-negotiable.
+still_missing=()
+for f in "${REQUIRED_FILES[@]}"; do
+    [ -f "$f" ] || still_missing+=("$f")
+done
+
+if [ "${#still_missing[@]}" -gt 0 ]; then
+    cat >&2 <<EOF
+
+The following required files are still missing:
+EOF
+    for f in "${still_missing[@]}"; do echo "  - $f" >&2; done
+    cat >&2 <<EOF
+
+Pick ONE of these and re-run:
+
+  1. Set REPO_URL to a base URL that contains these files. For a public
+     GitHub repo it looks like:
+        REPO_URL=https://raw.githubusercontent.com/<user>/<repo>/main/Track%20A \\
+            bash scripts/quickrun.sh
+
+  2. Re-clone the repo into this directory:
+        git clone <repo-url> /tmp/repo
+        cp -r /tmp/repo/Track\\ A/* $PROJECT_DIR/
+
+  3. scp the missing files from the machine where you have them.
+
+EOF
+    exit 1
+fi
+echo "All required code files present."
+
 # ---------- 1. venv ----------
 step "[1/7] Python venv"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail "$PYTHON_BIN not on PATH (set PYTHON_BIN)"
-if [ ! -d ".venv" ]; then
+# Prefer 3.10 or 3.11 if available; some wheels (e.g. datasets, pandas) may
+# lag behind on Python 3.13.
+if [ -z "${PYTHON_BIN:-}" ]; then
+    for cand in python3.11 python3.10 python3.12 python3; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            PYTHON_BIN="$cand"
+            break
+        fi
+    done
+fi
+[ -n "${PYTHON_BIN:-}" ] || fail "no python3 on PATH"
+echo "PYTHON_BIN=$PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
+
+# If an existing .venv was made with a python that no longer matches, scrap it.
+if [ -d .venv ]; then
+    if [ -x .venv/bin/python ]; then
+        venv_ver=$(.venv/bin/python --version 2>&1 || true)
+        wanted_ver=$($PYTHON_BIN --version 2>&1 || true)
+        if [ "$venv_ver" != "$wanted_ver" ] && [ "${REUSE_VENV:-0}" != "1" ]; then
+            echo "Existing .venv ($venv_ver) != desired ($wanted_ver). Recreating."
+            rm -rf .venv
+        fi
+    fi
+fi
+
+if [ ! -d .venv ]; then
     "$PYTHON_BIN" -m venv .venv
     echo "Created .venv with $($PYTHON_BIN --version 2>&1)"
 else
@@ -45,9 +152,11 @@ if [ "${SKIP_INSTALL:-0}" = "1" ]; then
     echo "SKIP_INSTALL=1 → not touching pip"
 else
     python -m pip install -q --upgrade pip wheel setuptools
-    # Locked server-side deps
-    pip install -q -r requirements.txt
-    # Agent + server runtime extras (these aren't in the locked file)
+    if ! pip install -q -r requirements.txt; then
+        echo "Locked requirements.txt failed to install on $(python --version)."
+        echo "Falling back to a minimal subset (skipping 'datasets')."
+        pip install -q fastapi openai "pydantic>=2" pandas
+    fi
     pip install -q "openai>=1.50.0" httpx requests python-dateutil tqdm \
                   "uvicorn[standard]" python-multipart
     echo "deps installed"
@@ -67,45 +176,49 @@ ok_size() {
 }
 
 if ! ok_size "$TRAIN_JSON"; then
-    echo "$TRAIN_JSON missing or too small (likely an LFS pointer). Trying recovery..."
-    # 3a. git-lfs pull (works only if this is a real git clone with LFS configured)
+    echo "$TRAIN_JSON missing or too small. Trying recovery..."
+    # 3a. git-lfs
     if command -v git-lfs >/dev/null 2>&1 \
        && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         git lfs install --skip-repo 2>/dev/null || true
         git lfs pull 2>/dev/null || true
     fi
-    # 3b. TRAIN_URL fallback (point at a public mirror you have)
+    # 3b. TRAIN_URL fallback
     if ! ok_size "$TRAIN_JSON" && [ -n "${TRAIN_URL:-}" ]; then
         mkdir -p "$(dirname "$TRAIN_JSON")"
         echo "Downloading from TRAIN_URL..."
         curl -fL --retry 3 -o "$TRAIN_JSON" "$TRAIN_URL"
+    fi
+    # 3c. REPO_URL fallback
+    if ! ok_size "$TRAIN_JSON" && [ -n "${REPO_URL:-}" ]; then
+        echo "Trying REPO_URL for train.json..."
+        fetch_one "$TRAIN_JSON" || true
     fi
 fi
 
 if ! ok_size "$TRAIN_JSON"; then
     cat <<EOF >&2
 
-train.json is missing or too small to be the real 24 MB file.
+train.json missing or too small (likely a 133-byte LFS pointer).
 
-Pick ONE of these and re-run:
+Recovery options:
 
-  1. Re-clone the repo with git-lfs installed:
-        git lfs install
-        git clone <repo-url>
-        cd <repo>/Track\ A
-        bash scripts/quickrun.sh
-
-  2. Download train.json manually from the Zindi data tab and place it at:
-        $PROJECT_DIR/$TRAIN_JSON
-
-  3. Set TRAIN_URL to a direct download URL (raw GitHub or signed S3):
+  1. Set TRAIN_URL to a direct download (raw GitHub or signed S3):
         TRAIN_URL=https://... bash scripts/quickrun.sh
 
+  2. Re-clone with git-lfs:
+        git lfs install
+        git clone <repo-url>
+
+  3. Download manually from the Zindi data tab to:
+        $PROJECT_DIR/$TRAIN_JSON
 EOF
     exit 1
 fi
 echo "$TRAIN_JSON OK ($(wc -c < "$TRAIN_JSON" | tr -d ' ') bytes)"
-ok_size "$TEST_JSON" && echo "$TEST_JSON OK" || echo "$TEST_JSON missing (only needed for Phase 1 submission)"
+ok_size "$TEST_JSON" \
+    && echo "$TEST_JSON OK" \
+    || echo "$TEST_JSON missing (only needed for Phase 1 submission)"
 
 # ---------- 4. LLM endpoint ----------
 step "[4/7] LLM endpoint check"
@@ -121,6 +234,7 @@ No OpenAI-compatible endpoint at $MODEL_URL.
 
 Start vLLM in another terminal (RTX 8000-friendly flags):
 
+    pip install vllm                                 # one-time, ~10 GB
     python -m vllm.entrypoints.openai.api_server \\
       --model $MODEL_NAME \\
       --port 8000 \\
@@ -135,11 +249,8 @@ Start vLLM in another terminal (RTX 8000-friendly flags):
       --tool-call-parser hermes \\
       --trust-remote-code
 
-(vLLM and its CUDA stack are NOT installed by this script — they're 10+ GB.
- Install once with:  pip install vllm)
-
-OR set MODEL_URL to any OpenAI-compatible endpoint that serves Qwen3.5-35B-A3B
-and rerun:  MODEL_URL=https://your-endpoint/v1 bash scripts/quickrun.sh
+OR set MODEL_URL to any OpenAI-compatible endpoint that serves the model:
+    MODEL_URL=https://your-endpoint/v1 bash scripts/quickrun.sh
 EOF
     exit 1
 fi

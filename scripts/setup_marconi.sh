@@ -131,7 +131,7 @@ ensure_conda() {
             ok "found conda at $d"
             return 0
         fi
-    done
+    don
     if [[ "${AUTO_INSTALL_CONDA:-1}" != "1" ]]; then
         err "conda not found and AUTO_INSTALL_CONDA=0; install it manually."
         return 1
