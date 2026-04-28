@@ -41,6 +41,57 @@ ok()   { printf "${G}[ ok ]${N} %s\n" "$*"; }
 warn() { printf "${Y}[warn]${N} %s\n" "$*"; }
 err()  { printf "${R}[fail]${N} %s\n" "$*" 1>&2; }
 
+# ---------------- conda discovery / auto-install --------------------------
+# Look for an existing conda first; if none and AUTO_INSTALL_CONDA != 0,
+# silently install Miniconda to $HOME/miniconda3. Returns 0 if conda is
+# usable on PATH after this function returns.
+ensure_conda() {
+    if command -v conda >/dev/null 2>&1; then
+        ok "conda found: $(command -v conda)"
+        return 0
+    fi
+    for d in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3" \
+             "/opt/conda" "/opt/miniconda3" "/opt/anaconda3"; do
+        if [[ -x "$d/bin/conda" ]]; then
+            export PATH="$d/bin:$PATH"
+            ok "found conda at $d"
+            return 0
+        fi
+    done
+
+    if [[ "${AUTO_INSTALL_CONDA:-1}" != "1" ]]; then
+        err "conda not found and AUTO_INSTALL_CONDA=0; install it manually."
+        return 1
+    fi
+
+    local arch url installer
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64)  url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" ;;
+        aarch64|arm64) url="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh" ;;
+        *) err "no Miniconda installer for arch '$arch'; install conda manually."; return 1 ;;
+    esac
+    log "conda not found — auto-installing Miniconda to \$HOME/miniconda3 (~400 MB)"
+    log "  (skip with: AUTO_INSTALL_CONDA=0 bash scripts/setup_marconi.sh)"
+    installer="/tmp/miniconda_installer_$$.sh"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fSL "$url" -o "$installer"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --show-progress "$url" -O "$installer"
+    else
+        err "neither curl nor wget is available; cannot download Miniconda."
+        return 1
+    fi
+    bash "$installer" -b -u -p "$HOME/miniconda3"
+    rm -f "$installer"
+    export PATH="$HOME/miniconda3/bin:$PATH"
+    # Initialize conda for THIS shell (no permanent .bashrc edit)
+    # so the activate calls below work without sourcing .bashrc.
+    "$HOME/miniconda3/bin/conda" init bash >/dev/null 2>&1 || true
+    ok "Miniconda installed at \$HOME/miniconda3"
+    return 0
+}
+
 # ---------------- ONLY_SMOKE shortcut --------------------------------------
 if [[ "${ONLY_SMOKE:-0}" = "1" ]]; then
     SKIP_ENV=1; SKIP_DEPS=1
@@ -68,8 +119,8 @@ fi
 # ---------------- 1. Conda env --------------------------------------------
 if [[ "${SKIP_ENV:-0}" != "1" ]]; then
     log "[1/5] Conda env"
-    if ! command -v conda >/dev/null 2>&1; then
-        err "conda not on PATH. Install Miniconda or activate it first."
+    if ! ensure_conda; then
+        err "conda setup failed; aborting"
         exit 1
     fi
     # shellcheck disable=SC1091
@@ -86,7 +137,7 @@ if [[ "${SKIP_ENV:-0}" != "1" ]]; then
 else
     warn "[1/5] Skipping conda env creation (SKIP_ENV=1)"
     # Best-effort activate so downstream pip targets the right env
-    if command -v conda >/dev/null 2>&1; then
+    if ensure_conda 2>/dev/null; then
         # shellcheck disable=SC1091
         source "$(conda info --base)/etc/profile.d/conda.sh" || true
         conda activate "$ENV_NAME" 2>/dev/null || warn "could not activate $ENV_NAME"
