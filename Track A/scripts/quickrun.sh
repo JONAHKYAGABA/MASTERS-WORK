@@ -222,39 +222,71 @@ ok_size "$TEST_JSON" \
 
 # ---------- 4. LLM endpoint ----------
 step "[4/7] LLM endpoint check"
-MODEL_URL="${MODEL_URL:-http://localhost:8000/v1}"
+MODEL_URL="${MODEL_URL:-http://localhost:8001/v1}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-35B-A3B}"
+AGENT_API_KEY_VAL="${AGENT_API_KEY:-dummy}"
 echo "MODEL_URL=$MODEL_URL"
 echo "MODEL_NAME=$MODEL_NAME"
 
-if ! curl -sf "$MODEL_URL/models" >/dev/null 2>&1; then
+# Real validation: GET /v1/models must return JSON with a "data" field listing
+# the served model. Anything else (HTML, 4xx/5xx, JupyterHub redirects) is
+# rejected — those will silently 403 every chat.completions call.
+endpoint_check() {
+    python - <<PY
+import json, sys, urllib.request
+url = "$MODEL_URL/models"
+key = "$AGENT_API_KEY_VAL"
+req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+try:
+    with urllib.request.urlopen(req, timeout=5) as r:
+        body = r.read(4096)
+        ctype = r.headers.get("Content-Type", "")
+except Exception as e:
+    print(f"FAIL: cannot reach {url}: {e}", file=sys.stderr); sys.exit(2)
+if "json" not in ctype.lower():
+    print(f"FAIL: {url} returned Content-Type={ctype!r}, not JSON.", file=sys.stderr)
+    print("       This is likely NOT an OpenAI-compatible LLM endpoint.", file=sys.stderr)
+    print(f"       First 200 bytes: {body[:200]!r}", file=sys.stderr)
+    sys.exit(3)
+try:
+    obj = json.loads(body)
+except Exception as e:
+    print(f"FAIL: response not JSON: {e}", file=sys.stderr); sys.exit(4)
+data = obj.get("data") if isinstance(obj, dict) else None
+if not isinstance(data, list) or not data:
+    print(f"FAIL: response missing 'data' list: {obj!r}", file=sys.stderr); sys.exit(5)
+ids = [m.get("id") for m in data if isinstance(m, dict)]
+print(f"OK: served models = {ids}")
+PY
+}
+
+if ! endpoint_check; then
     cat <<EOF >&2
 
-No OpenAI-compatible endpoint at $MODEL_URL.
+$MODEL_URL is not an OpenAI-compatible LLM endpoint that serves the
+expected model. Common causes:
 
-Start vLLM in another terminal (RTX 8000-friendly flags):
+  - Port already used by another service (JupyterHub, Jupyter, etc.).
+    JupyterHub returns 200/HTML/403 to /v1/models which fools naive checks.
+    Pick a different port:
+        MODEL_URL=http://localhost:8001/v1 bash scripts/quickrun.sh
 
-    pip install vllm                                 # one-time, ~10 GB
-    python -m vllm.entrypoints.openai.api_server \\
-      --model $MODEL_NAME \\
-      --port 8000 \\
-      --dtype float16 \\
-      --tensor-parallel-size 2 \\
-      --gpu-memory-utilization 0.92 \\
-      --max-model-len 16384 \\
-      --enforce-eager \\
-      --quantization bitsandbytes \\
-      --load-format bitsandbytes \\
-      --enable-auto-tool-choice \\
-      --tool-call-parser hermes \\
-      --trust-remote-code
+  - vLLM is not running. Start it in another terminal:
+        pip install vllm                              # one-time, ~10 GB
+        python -m vllm.entrypoints.openai.api_server \\
+          --model $MODEL_NAME \\
+          --port 8001 --dtype float16 \\
+          --tensor-parallel-size 2 --enforce-eager \\
+          --quantization bitsandbytes --load-format bitsandbytes \\
+          --max-model-len 16384 \\
+          --enable-auto-tool-choice --tool-call-parser hermes \\
+          --trust-remote-code
 
-OR set MODEL_URL to any OpenAI-compatible endpoint that serves the model:
-    MODEL_URL=https://your-endpoint/v1 bash scripts/quickrun.sh
+  - Endpoint requires a different API key. Set:
+        export AGENT_API_KEY="<your-real-key>"
 EOF
     exit 1
 fi
-echo "endpoint healthy"
 
 # ---------- 5. server.py ----------
 step "[5/7] Start locked server.py"
