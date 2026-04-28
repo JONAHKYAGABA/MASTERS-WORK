@@ -132,7 +132,6 @@ ensure_conda() {
             return 0
         fi
     done
-
     if [[ "${AUTO_INSTALL_CONDA:-1}" != "1" ]]; then
         err "conda not found and AUTO_INSTALL_CONDA=0; install it manually."
         return 1
@@ -243,15 +242,12 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
     log "  → upgrading pip / wheel / setuptools"
     python -m pip install --upgrade pip wheel setuptools
 
-    log "  → installing PyTorch"
-    python -m pip install --index-url "$TORCH_INDEX" \
-        "torch>=2.3,<2.6" "torchvision" "torchaudio"
-
-    log "  → verifying torch CUDA build"
-    if ! ensure_torch_cuda "$TORCH_INDEX"; then
-        exit 1
-    fi
-
+    # ---- 2a. Install everything EXCEPT torch first ----------------------
+    # Order matters. If torch is installed first and then transformers /
+    # peft / bitsandbytes / deepspeed are pip-installed without a wheel
+    # index, those packages can pull in a CPU `torch` from PyPI as a
+    # transitive dependency, silently overwriting the GPU build. So we
+    # install torch LAST and force-pin it to the cu* index.
     log "  → installing transformers + peft + bitsandbytes + accelerate + deepspeed"
     python -m pip install \
         "transformers>=4.45,<5" \
@@ -272,6 +268,24 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
             "pillow>=10" "numpy>=1.24,<2" "pandas>=2" \
             "scikit-learn>=1.3" "scipy>=1.10" \
             "nltk>=3.8" "tqdm>=4.65" "pyyaml>=6"
+    fi
+
+    # ---- 2b. Install PyTorch LAST, authoritative ------------------------
+    # Wipe any CPU torch that the steps above may have dragged in, then
+    # install fresh from the chosen wheel index. ensure_torch_cuda will
+    # verify and re-attempt once if the first install still lands CPU.
+    log "  → wiping any pre-existing torch and installing from $TORCH_INDEX"
+    python -m pip uninstall -y torch torchvision torchaudio >/dev/null 2>&1 || true
+    python -m pip install --no-cache-dir --index-url "$TORCH_INDEX" \
+        "torch>=2.3,<2.6" "torchvision" "torchaudio"
+
+    log "  → torch install summary"
+    python -m pip show torch 2>/dev/null \
+        | grep -E "^(Name|Version|Location):" || true
+
+    log "  → verifying torch CUDA build"
+    if ! ensure_torch_cuda "$TORCH_INDEX"; then
+        exit 1
     fi
 
     log "  → downloading NLTK data"

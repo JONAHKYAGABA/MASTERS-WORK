@@ -1,0 +1,352 @@
+[
+  {
+    "scenario_id": "535afb0d-fa81-419b-9bcc-b456d032df5d",
+    "task": {
+      "question": "The link planning data of Gamma-Aegis-01 within the Big Data Zone has been accidentally deleted, and it is necessary to restore the link connections of the interfaces whose status is UP on the Gamma-Aegis-01 node. The link status of interfaces can be queried through several methods: 1. Query the link status directly. 2. Query the interface description (which contains the remote node and remote port), and then confirm the link status through the port and IP correspondence information in the ARP tables of the local node and the remote node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Link status query is the preferred query method. When the status cannot be queried through that method, use the second method to confirm the port connections.\nBased on the actual network topology, supplement the link information for the interfaces that are UP on the Gamma-Aegis-01 node in the plan. Format requirement: local node name(local port number)->remote node name(remote port number). Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or within each line.",
+      "id": 1
+    }
+  },
+  {
+    "scenario_id": "8ec59f8b-1a5a-4fb3-80ad-f0e2aaf6a499",
+    "task": {
+      "question": "The planning data of Gamma-Axis-02 within the Big Data Zone has been accidentally deleted. It is necessary to restore the link status of the interfaces whose state is UP on this node. However, the link status cannot be queried from the Gamma-Axis-02 node itself. It is known that the nodes connected to Gamma-Axis-02 are among these 9 nodes: Gamma-Portal-01/Gamma-Portal-02/Gamma-Aegis-01/Gamma-Aegis-02/Gamma-Axis-01/Gamma-Node-01/Gamma-Node-02/Gamma-Node-03/Gamma-Node-04. The link status can be queried through several methods: 1. Query the link status directly. 2. Query the interface description (which contains the remote node and remote port), and then confirm the link status by checking the port and IP correspondence information in the ARP tables of the local node and the remote node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Querying the link status is the preferred method. When the status cannot be queried through that method, use the second method to confirm the port link status.\nPlease based on the link status of surrounding nodes, supplement the link information for the UP interfaces of the Gamma-Axis-02 node. Format requirement: local node name(local port number)->remote node name(remote port number). Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or within each line.",
+      "id": 2
+    }
+  },
+  {
+    "scenario_id": "e4e23bbb-78c1-47f0-897b-e227ba8914d4",
+    "task": {
+      "question": "The link planning data of Beta-Aegis-02 within the Development and Testing Zone has been accidentally deleted, and it is necessary to restore the link status of the interfaces whose state is UP on this node. The link status of interfaces can be queried through several methods: 1. Query the link status; 2. Query the interface description (which contains the remote node and remote port), and then confirm the link status through the port and IP correspondence information in the ARP tables of the local node and the remote node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Link status query is the preferred query method; when this status cannot be queried, use the second method to confirm the port link status.\nBased on the actual network topology, supplement the topology links for the UP interfaces of Beta-Aegis-02 in the plan. Format requirement: LocalNodeName(LocalPortNumber)->RemoteNodeName(RemotePortNumber)\". Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or within each line",
+      "id": 3
+    }
+  },
+  {
+    "scenario_id": "c2effbaf-f3ce-4101-8f4b-e4412ba27e2c",
+    "task": {
+      "question": "The planning data of Beta-Portal-02 within the Development and Testing Zone has been accidentally deleted, and the link status of this node needs to be restored. The link status of interfaces can be queried through several methods: 1. Query the link status, 2. Query the interface description (which contains the remote node and remote port), and then confirm the link status through the port and IP correspondence information in the ARP tables of this node and the remote node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Link status query is the preferred query method; when the status cannot be queried through this method, use the second method to confirm the port link status.\nBased on the actual network topology, supplement the topology links for Beta-Portal-02 in the plan. Format requirement: local node name(local port number)->remote node name(remote port number). Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or within each line.",
+      "id": 4
+    }
+  },
+  {
+    "scenario_id": "50bb98fe-22f7-4f09-935d-8d53dc2f10f0",
+    "task": {
+      "question": "The planned data of Delta-Node-01 has been accidentally deleted, and it is necessary to restore the link status of the interfaces whose state is UP on this node. The link status of interfaces can be queried through several methods: 1. Query the link state; 2. Query the interface description (which contains the remote node and remote port), and then confirm the link state through the port and IP correspondence information in the ARP tables of this node and the remote node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Link state query is the preferred query method. When this state cannot be queried, use the second method to confirm the port link status.\nBased on the actual network topology, supplement and plan the topology links for Delta-Node-01. Format requirement: local-end node name(local-end port number)->remote-end node name(remote-end port number). Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or within each line.",
+      "id": 5
+    }
+  },
+  {
+    "scenario_id": "a4a771dd-bf78-485d-bc8a-6c69e966c4df",
+    "task": {
+      "question": "The planning data of Delta-Axis-01 within the management area has been accidentally deleted, and the link status of this node needs to be restored. The link status of interfaces can be queried through several methods: 1. Query the link status; 2. Query the interface description (which contains the remote node and remote port), and then confirm the link status through the port and IP correspondence information in the ARP tables of the local node and the remote node. If the interface description and the port information in the ARP table are different, the ARP table port information shall prevail. Link status query is the preferred query method; when the status cannot be queried through this method, use the second method to confirm the port link status.\nBased on the actual network topology, supplement the topology links of Delta-Axis-01 in the plan. Format requirement: local-end-node-name(local-end-port-number)->remote-end-node-name(remote-end-port-number). Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or within each line.",
+      "id": 6
+    }
+  },
+  {
+    "scenario_id": "fff16260-f768-4485-ac9c-e3d3c09a9739",
+    "task": {
+      "question": "Development-Test zone Beta-Node-01 addressing Big-Data zone Gamma-Node-01 node's GE1/0/2 (IP:192.168.70.22), the subnet mask of this interface is 30\nProvide the service path. Use the -> symbol to connect node names, output in one line, with no extra whitespace at the beginning, end, or in the middle.",
+      "id": 7
+    }
+  },
+  {
+    "scenario_id": "a4f0237a-3a3f-48c1-be1f-162ce15ec9cb",
+    "task": {
+      "question": "Big Data Zone Gamma-Node-01 addressing Management Zone Delta-Node-01's GE1/0/2, the subnet mask of this interface is 30\nPlease find the path from Gamma-Node-01 to GE1/0/2 of Delta-Node-01. Use the -> symbol to connect node names, output in one line, with no extra whitespace in the middle, at the beginning, or at the end.",
+      "id": 8
+    }
+  },
+  {
+    "scenario_id": "71073070-77e8-43d3-819c-f403c38e0caf",
+    "task": {
+      "question": "The GE1/0/2 port of Delta-Node-03 in the managed service zone, addressed from Beta-Node-03 in the development and testing zone, has an IP mask of 30.\nPlease provide the path for Beta-Node-03 to address the GE1/0/2 port of Delta-Node-03. Connect node names using the -> symbol, output in one line, with no extra whitespace characters in the middle, at the beginning, or at the end.",
+      "id": 9
+    }
+  },
+  {
+    "scenario_id": "634b9b95-9fe6-4e6d-a00f-536af1b9ee6e",
+    "task": {
+      "question": "Gamma-Node-01 addressing the GE1/0/2 interface of Beta-Node-04\nGamma-Node-01 routes to the GE1/0/2 interface of Beta-Node-04, give the path. Use the -> symbol to connect node names, output in one line, with no extra whitespace characters at the beginning, middle, or end.",
+      "id": 10
+    }
+  },
+  {
+    "scenario_id": "01455e30-c21f-44e0-9ca8-62af01e4e0bb",
+    "task": {
+      "question": "Beta-Node-03 is trying to reach GE1/0/2 of Alpha-Center-02, but the Test-Zone1-Spine02 node cannot find routing information. It is known that Test-Zone1-Spine02 is connected to Beta-Portal-01 and Beta-Portal-02.\nPlease provide the addressing path from Beta-Node-03 to GE1/0/2 of Alpha-Center-02. Use the -> symbol to connect node names, output in one line, with no extra whitespace in the middle, at the beginning, or at the end.",
+      "id": 11
+    }
+  },
+  {
+    "scenario_id": "ae420b76-ca25-4a60-b9b4-b3367aefb926",
+    "task": {
+      "question": "Beta-Node-01 is addressing GE1/0/2 of Gamma-Node-01. It is known that this path passes through the Gamma-Portal-02 node, and on this path there is only one intermediate node between Gamma-Portal-02 and Gamma-Node-01.\nTrace the service path from Beta-Node-01 to GE1/0/2 of Gamma-Node-01. Use the -> symbol to connect node names, output in one line, with no extra whitespace at the beginning, middle, or end.",
+      "id": 12
+    }
+  },
+  {
+    "scenario_id": "f002adc4-d603-4b10-b9b1-4f7b4a0526bf",
+    "task": {
+      "question": "Gamma-Node-02 addresses the destination GE1/0/4 of Beta-Node-04. Beta-Node-04 is connected to Beta-Axis-01, Beta-Axis-02, and Beta-Node-03.\nTrace the path from Gamma-Node-02 to the GE1/0/4 of Beta-Node-04. Use the -> symbol to connect node names, output in one line, with no extra whitespace characters at the beginning, end, or in the middle.",
+      "id": 13
+    }
+  },
+  {
+    "scenario_id": "c03fb42a-863f-4154-bfdc-e05fdf73b958",
+    "task": {
+      "question": "Delta-Node-02 addressing the destination GE1/0/2 of Gamma-Node-02, Gamma-Node-02 is connected to Gamma-Node-01, Gamma-Axis-02, and Gamma-Axis-01\nThe path from Delta-Node-02 addressing the destination Gamma-Node-02's GE1/0/2. Use the -> symbol to connect between node names, output in one line, with no extra whitespace characters in the middle, at the beginning, or at the end.",
+      "id": 14
+    }
+  },
+  {
+    "scenario_id": "c78207f0-3ea9-492f-8262-e97f6d759341",
+    "task": {
+      "question": "Big Data Zone Gamma-Node-04 addressing Management Zone Delta-Node-01's GE1/0/2, the subnet mask of this interface is 30, Delta-Axis-02 route is not reachable, this node is connected to Delta-Node-01, Delta-Node-02, Delta-Axis-01\nPlease find the path from Gamma-Node-04 to GE1/0/2 of Delta-Node-01. Use the -> symbol to connect node names, output in one line, with no extra whitespace characters in the middle, at the beginning, or at the end.",
+      "id": 15
+    }
+  },
+  {
+    "scenario_id": "ccc12121-03ca-461d-8999-99f1341fd2c7",
+    "task": {
+      "question": "The GE1/0/2 port of Delta-Node-04 in the addressing management zone is being addressed from Beta-Aegis-02 in the development and testing zone. The IP mask of this interface is 30.\nPlease provide the path from Beta-Aegis-02 to the GE1/0/2 port of Delta-Node-04 at this time. Connect node names using the -> symbol, output in one line, with no extra whitespace characters in the middle, at the beginning, or at the end.",
+      "id": 16
+    }
+  },
+  {
+    "scenario_id": "a643f2d3-a4af-46ae-aa5d-8c63b3804658",
+    "task": {
+      "question": "The question involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nWithin the development and testing area, Beta-Node-01 is addressing GE1/0/2 of Gamma-Node-01, the service is interrupted, and the fault is on one of the three nodes: Beta-Axis-02, Beta-Portal-02, Alpha-Center-02.\nPlease check the cause of traffic interruption. For path fault type questions, please answer according to the unified format requirements.",
+      "id": 17
+    }
+  },
+  {
+    "scenario_id": "b9a77dd0-39e5-4d7b-9e9c-af61213b30ea",
+    "task": {
+      "question": "The problem involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line separated by line break.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line separated by line break.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nBeta-Node-01 is addressing GE1/0/2 port of Gamma-Node-01, but the service is not reachable.\nPlease check the cause of traffic interruption. For path fault type questions, please answer according to the unified format requirements.",
+      "id": 18
+    }
+  },
+  {
+    "scenario_id": "674afa1d-ae0d-4a52-81d7-b391efbd2414",
+    "task": {
+      "question": "The problem involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, and all symbols use English characters.\nThe routing fault output format is: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nThe port fault output format is: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nBeta-Node-01 is addressing the GE1/0/2 port of Gamma-Node-01, but the service is not reachable.\nPlease check the cause of traffic interruption. For path fault type questions, please answer according to the unified format requirements.",
+      "id": 19
+    }
+  },
+  {
+    "scenario_id": "c1ee910f-54db-494c-b4ff-18ad7c671502",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nBeta-Node-01 is addressing a destination IP in an external zone, which is 192.168.74.13, mask 30, service is unreachable.\nPlease analyze the cause of traffic interruption. There is only one node with a fault in this question. For path fault type questions, please answer according to the unified format requirements.",
+      "id": 20
+    }
+  },
+  {
+    "scenario_id": "a6e3621c-5802-4f61-a266-b52643eff06c",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nBeta-Node-01 is addressing 192.168.70.22, mask 30, but the service is not reachable.\nPlease check the cause of traffic interruption. For path fault type questions, please answer according to the unified format requirements.",
+      "id": 21
+    }
+  },
+  {
+    "scenario_id": "25413f55-4923-4b8c-9da5-0b45367e9dd7",
+    "task": {
+      "question": "The question involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nBeta-Node-02 is addressing the GE1/0/2 port of Gamma-Node-01, but the service is unreachable.\nPlease check the cause of traffic interruption. There is only one node with a fault in this question. For the path fault question type, please answer according to the unified format requirements.",
+      "id": 22
+    }
+  },
+  {
+    "scenario_id": "936127eb-695a-4c3f-8705-23ce467c81f7",
+    "task": {
+      "question": "The question involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line separated by a line break.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line separated by a line break.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nDelta-Node-01 is addressing an external destination IP of 192.168.74.61, mask 30, and traffic is currently interrupted.\nPlease analyze the cause of traffic interruption. For path fault type questions, please answer according to the unified format requirements.",
+      "id": 23
+    }
+  },
+  {
+    "scenario_id": "1bbdb90e-e0d1-435c-aa52-cf8c27b0b724",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line separated by a line break.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line separated by a line break.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nBeta-Aegis-01 is addressing Delta-Aegis-02's GE0/0/1 (IP:192.168.72.78), mask 30, but the service is unreachable.\nPlease check the cause of traffic interruption. For path fault type questions, please answer according to the unified format requirements.",
+      "id": 24
+    }
+  },
+  {
+    "scenario_id": "acbae2eb-03e1-44ad-bc01-957e1d58dd3a",
+    "task": {
+      "question": "The problem involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nBeta-Node-01 is addressing 192.168.70.70, mask 30, but the service is not reachable.\nPlease check the cause of traffic interruption. For path fault type questions, please answer according to the unified format requirements.",
+      "id": 25
+    }
+  },
+  {
+    "scenario_id": "c408d8a4-b09b-49cf-a9c9-b783575cf547",
+    "task": {
+      "question": "The problem involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nGamma-Node-01 is addressing GE1/0/6 of Alpha-Center-02, but the service is not reachable\nPlease check the cause of traffic interruption. For path fault type questions, please answer according to the unified format requirements.",
+      "id": 26
+    }
+  },
+  {
+    "scenario_id": "05970bd7-fbe3-4cdd-9eef-1e0ac009c90c",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nBeta-Node-02 is addressing the GE1/0/2 port of Gamma-Node-01, but the service is not reachable.\nPlease check the cause of traffic interruption. For the path fault question type, please answer according to the unified format requirements.",
+      "id": 27
+    }
+  },
+  {
+    "scenario_id": "25808901-5993-4dde-b09f-bccfd99a09b8",
+    "task": {
+      "question": "The problem involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nBeta-Node-01 is addressing 192.168.70.93, mask 30, but the service is not reachable.\nPlease check the cause of traffic interruption. For the path fault question type, please answer according to the unified format requirements.",
+      "id": 28
+    }
+  },
+  {
+    "scenario_id": "dd11da6b-0ded-4417-bfd5-e36d996e1189",
+    "task": {
+      "question": "The planning data of Demeter-Prime-01 in the PJ area was accidentally deleted, and the UP link connections of this node need to be restored. The link status of interfaces can be queried through several methods: 1. Query link neighbor status; 2. Query interface descriptions (which contain the peer node and peer port), then confirm the link status through the port and IP information contained in the ARP tables of both the local node and the peer node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Link neighbor status query is the preferred query method. When this status cannot be queried, use the second method to confirm port connection status. Format requirement: LocalNodeName(LocalPortNumber)->PeerNodeName(PeerPortNumber). Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or within each line.",
+      "id": 29
+    }
+  },
+  {
+    "scenario_id": "dad1f1ad-a21e-4831-a6b2-763e8eebd026",
+    "task": {
+      "question": "The planning data of Atlas-Prime-01 in the PJ area was accidentally deleted, and the UP link connections of this node need to be restored. The link status of interfaces can be queried through several methods: 1. Query link neighbor status; 2. Query interface descriptions (which contain the remote node and remote port), and then confirm the link status through the port and IP information contained in the ARP tables of the local node and the remote node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Link neighbor status query is the preferred query method. When this status cannot be queried, use the second method to confirm the port connection situation. Format requirement: LocalNodeName(LocalPortNumber)->RemoteNodeName(RemotePortNumber).Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or in the middle of each line.",
+      "id": 30
+    }
+  },
+  {
+    "scenario_id": "a346ef65-4abd-4e27-b7c6-06fc70a4f1c0",
+    "task": {
+      "question": "The planning data of Janus-Prime-01 in the PJ area has been accidentally deleted, and the UP link connections of this node need to be restored. The link status of interfaces can be queried through several methods: 1. Query link neighbor status; 2. Query interface descriptions (which contain the peer node and peer port), then confirm the link status through the port and IP information contained in the ARP tables of the local node and the peer node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Link neighbor status query is the preferred query method. When this status cannot be queried, use the second method to confirm the port connection situation. Format requirement: LocalNodeName(LocalPortNumber)->PeerNodeName(PeerPortNumber). Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or in the middle of each line.",
+      "id": 31
+    }
+  },
+  {
+    "scenario_id": "d5a0f37b-4042-4570-ba17-7677fc7ebe01",
+    "task": {
+      "question": "The planned data of Aegis-Prime-01 in the PJ area was accidentally deleted, and the UP link connections of this node need to be restored. The link status of interfaces can be queried through several methods: 1. Query link neighbor status; 2. Query interface descriptions (which contain the remote node and remote port), and then confirm the link status through the port and IP information contained in the ARP tables of the local node and the remote node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Link neighbor status query is the preferred query method. When this status cannot be queried, use the second method to confirm the port connection status. Format requirement: LocalNodeName(LocalPortNumber)->RemoteNodeName(RemotePortNumber).Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or within each line.",
+      "id": 32
+    }
+  },
+  {
+    "scenario_id": "212e5d0c-4377-45da-b3f5-3d0725db8f1e",
+    "task": {
+      "question": "The planned data of Janus-Node-02 in the PJGFA area was accidentally deleted, and the UP link connections of this node need to be restored. The link status of interfaces can be queried through several methods: 1. Query link neighbor status; 2. Query interface descriptions (which contain the remote node and remote port), and then confirm the link status through the port and IP information contained in the ARP tables of the local node and remote node. If the interface description and the ARP table port information are different, the ARP table port information shall prevail. Link neighbor status query is the preferred query method. When this status cannot be queried, use the second method to confirm port connection status. Format requirement: LocalNodeName(LocalPortNumber)->RemoteNodeName(RemotePortNumber).Each line represents one link, with no extra blank lines in the middle or at the end, and no extra whitespace characters before, after, or in the middle of each line.",
+      "id": 33
+    }
+  },
+  {
+    "scenario_id": "b1db0a53-17fe-4adc-8547-f1612b560def",
+    "task": {
+      "question": "PJ area, Hermes-Prime-01 addressing 10.1.1.20 path\nFormat requirement: Use the -> symbol to connect node names, output in one line, with no extra whitespace in the middle or at the beginning and end.",
+      "id": 34
+    }
+  },
+  {
+    "scenario_id": "7e7e51e6-fcae-43f4-a3c7-567897f6eb19",
+    "task": {
+      "question": "PJ area, Hermes-Prime-01 addressing 20.1.1.10 path\nFormat requirement: Use the -> symbol to connect node names, output in one line, with no extra whitespace characters in the middle, at the beginning, or at the end.",
+      "id": 35
+    }
+  },
+  {
+    "scenario_id": "7027305f-721e-4647-a386-1d40c90629c7",
+    "task": {
+      "question": "PJGFA area, the path from Hermes-Node-01 to address 10.1.1.10\nFormat requirement: Connect node names using the -> symbol, output in one line, with no extra whitespace characters in the middle, at the beginning, or at the end.",
+      "id": 36
+    }
+  },
+  {
+    "scenario_id": "66a84648-2cde-4026-be8f-29a1b52cd70f",
+    "task": {
+      "question": "PJGFA area, the path from Hermes-Node-01 to address 20.1.1.20\nFormat requirement: Connect node names using the -> symbol, output in one line, with no extra whitespace characters in the middle, at the beginning, or at the end.",
+      "id": 37
+    }
+  },
+  {
+    "scenario_id": "19740344-6fd7-4294-9f14-73ec053fc2cf",
+    "task": {
+      "question": "PJ area, Hermes-Prime-01 addressing 20.1.4.20 path\nFormat requirement: Connect node names using the -> symbol, output in one line, with no extra whitespace characters in the middle, at the beginning, or at the end.",
+      "id": 38
+    }
+  },
+  {
+    "scenario_id": "96636d0e-1c71-4c58-b661-d853acf155db",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, ping 20.1.1.10 from Hermes-Prime-01 is unreachable",
+      "id": 39
+    }
+  },
+  {
+    "scenario_id": "de1443a9-026a-4820-89fd-f1ecc55de414",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, ping 10.1.6.3 from Hermes-Prime-01 is unreachable",
+      "id": 40
+    }
+  },
+  {
+    "scenario_id": "2039bb7b-3cd9-4453-8686-89090a8e66e7",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, ping 10.1.6.3 from Hermes-Prime-01 is unreachable",
+      "id": 41
+    }
+  },
+  {
+    "scenario_id": "7f9d4a00-9e4a-40c6-becb-c2c770972aba",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, a Demeter-Prime-02 received a MAC address conflict alarm",
+      "id": 42
+    }
+  },
+  {
+    "scenario_id": "a499f356-3c51-4926-aeca-3bdc8b383dc7",
+    "task": {
+      "question": "The questions involve two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nThe output format for routing faults is: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nThe output format for port faults is: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, ping 20.1.1.10 from Hermes-Prime-01 is unreachable",
+      "id": 43
+    }
+  },
+  {
+    "scenario_id": "71c700c5-3cef-4a0c-a1b3-9f9c724c5db3",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, Hermes-Prime-02 pings an external address and finds it unreachable, ping 10.60.1.2",
+      "id": 44
+    }
+  },
+  {
+    "scenario_id": "b20f9906-9180-4ba0-a97a-75256abc0206",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, Hermes-Prime-01 pings an external address and finds it unreachable, ping 10.60.1.2",
+      "id": 45
+    }
+  },
+  {
+    "scenario_id": "f90c328d-67c1-4725-9b2c-a823d3b81062",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, ping 20.1.1.10 from Hermes-Prime-01 is unreachable",
+      "id": 46
+    }
+  },
+  {
+    "scenario_id": "29afe162-7cea-483e-bc2c-a4a82e54b665",
+    "task": {
+      "question": "The questions involve two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nThe output format for routing faults is: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nThe output format for port faults is: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, ping 20.1.1.20 from Hermes-Prime-02 is unreachable",
+      "id": 47
+    }
+  },
+  {
+    "scenario_id": "558b0d56-9b59-47d8-a9be-5eb03c8a77b3",
+    "task": {
+      "question": "The questions involve two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line separated by a line break.\nPort fault output format: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line separated by a line break.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, ping 20.1.1.20 from Hermes-Prime-02 is unreachable",
+      "id": 48
+    }
+  },
+  {
+    "scenario_id": "3536d71e-be41-4dfc-8cbd-dc22feedf2fb",
+    "task": {
+      "question": "The exam involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nRouting fault output format: fault-node;destination-IP;fault-reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nPort fault output format: fault-node;fault-port;fault-reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nIn the PJ area, pinging 20.1.4.10 from Hermes-Prime-01 is unsuccessful (no connectivity).",
+      "id": 49
+    }
+  },
+  {
+    "scenario_id": "463bbeb7-c99a-4d73-b066-87589503875e",
+    "task": {
+      "question": "The question involves two major categories of faults: routing faults and port faults. Output format requirements: each line represents one fault, no blank lines between lines, no extra whitespace characters before, after, or within each line, all symbols use English characters.\nThe output format for routing faults is: fault node;destination IP;fault reason. Fault reasons include: (1) blackhole route; (2) missing static route; (3) static route error; (4) ARP configuration error; (5) routing loop; (6) BGP configuration error; (7) OSPF configuration error; (8) loopback IP configuration conflict; (9) VXLAN configuration error; (10) L3VPN configuration error; (11) L2VPN configuration error; (12) IS-IS configuration error; (13) SRV6-Policy tunnel planning error; if there are multiple fault reasons, output each on a new line.\nThe output format for port faults is: fault node;fault port;fault reason. Fault reasons include: (1) shutdown; (2) interface IP error; (3) traffic congestion on port bandwidth; (4) MAC address configuration error; (5) VPN configuration missing; (6) OSPF configuration error; (7) MTU value configuration error; (8) host information collection function missing; if there are multiple fault reasons, output each on a new line.\nRouting fault examples:\nBeta-Axis-01;192.168.1.1;blackhole route\nAlpha-Center-02;192.168.1.2;missing static route\nAlpha-Center-02;192.168.1.2;ARP configuration error\nPort fault examples:\nBeta-Portal-01;GE1/0/1;shutdown\nBeta-Node-01;GE1/0/2;traffic congestion on port bandwidth\nBeta-Node-01;GE1/0/2;interface IP error\nPJ area, ping 10.1.1.20 from Hermes-Prime-01 is unreachable",
+      "id": 50
+    }
+  }
+]
