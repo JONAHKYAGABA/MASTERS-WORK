@@ -163,13 +163,23 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
 
     # Detect CUDA version reported by the driver (not the toolkit). This is
     # what bitsandbytes and torch wheels need to match.
+    #
+    # NOTE: the trailing `|| true` is deliberate. With `set -euo pipefail`,
+    # a SIGPIPE from `head -n1` (which closes its input early) propagates
+    # back to nvidia-smi as a non-zero exit, the pipeline fails, and the
+    # script silently exits. `|| true` makes the substitution always succeed.
+    DRV_CUDA=""
     if command -v nvidia-smi >/dev/null 2>&1; then
-        DRV_CUDA="$(nvidia-smi --query-gpu=driver_version,cuda_version --format=csv,noheader 2>/dev/null \
-                    | head -n1 | awk -F',' '{gsub(/ /,"",$2); print $2}')"
+        DRV_CUDA="$(
+            nvidia-smi --query-gpu=driver_version,cuda_version \
+                       --format=csv,noheader 2>/dev/null \
+            | head -n1 \
+            | awk -F',' '{gsub(/ /,"",$2); print $2}' \
+            || true
+        )"
         log "driver-reported CUDA: ${DRV_CUDA:-unknown}"
     else
         warn "nvidia-smi not found — installing CPU PyTorch (you can override later)"
-        DRV_CUDA=""
     fi
 
     # Pick a torch wheel index. bnb-0.43+ supports cu118 and cu121 wheels.
@@ -181,13 +191,14 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
     esac
     log "torch wheel index: $TORCH_INDEX"
 
+    log "  → upgrading pip / wheel / setuptools"
     python -m pip install --upgrade pip wheel setuptools
 
-    # PyTorch first (so transformers picks the right ABI)
+    log "  → installing PyTorch"
     python -m pip install --index-url "$TORCH_INDEX" \
         "torch>=2.3,<2.6" "torchvision" "torchaudio"
 
-    # v2 stack
+    log "  → installing transformers + peft + bitsandbytes + accelerate + deepspeed"
     python -m pip install \
         "transformers>=4.45,<5" \
         "peft>=0.11" \
@@ -198,19 +209,18 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
         "sentencepiece>=0.1.99" \
         "tokenizers>=0.20"
 
-    # Project-side libs (whatever requirements.txt has). Prefer it if present.
     if [[ -f requirements.txt ]]; then
-        log "installing requirements.txt"
+        log "  → installing requirements.txt (non-fatal if any package fails)"
         python -m pip install -r requirements.txt || warn "requirements.txt had failures (non-fatal)"
     else
-        # Minimum set needed by the dataset / metrics modules
+        log "  → installing minimum project libs (pillow / numpy / pandas / nltk / ...)"
         python -m pip install \
             "pillow>=10" "numpy>=1.24,<2" "pandas>=2" \
             "scikit-learn>=1.3" "scipy>=1.10" \
             "nltk>=3.8" "tqdm>=4.65" "pyyaml>=6"
     fi
 
-    # NLTK data
+    log "  → downloading NLTK data"
     python - <<'PY' || warn "NLTK download had issues"
 import nltk
 for pkg in ("punkt", "punkt_tab", "wordnet"):
