@@ -220,12 +220,32 @@ class SceneGraphEncoderV2(nn.Module):
         d_node: int = 128,
         num_gat_layers: int = 2,
         dropout: float = 0.1,
+        num_shared_heads: Optional[int] = None,
     ):
         super().__init__()
         self.num_regions = num_regions
         self.num_entities = num_entities
         self.num_relations = num_relations
         self.d_node = d_node
+
+        # Auto-pick num_shared_heads so total_heads = num_relations +
+        # num_shared_heads divides d_node. Without this, the default combo
+        # (num_relations=10 + num_shared_heads=2 = 12) fails for d_node=128
+        # because 128 % 12 != 0. We pick the smallest valid total_heads that
+        # gives at least one shared head.
+        if num_shared_heads is None:
+            valid = [
+                t for t in range(num_relations + 1, d_node + 1)
+                if d_node % t == 0
+            ]
+            if not valid:
+                raise ValueError(
+                    f"Cannot find total_heads >= {num_relations + 1} that "
+                    f"divides d_node={d_node}. Increase d_node or pass "
+                    "num_shared_heads explicitly."
+                )
+            num_shared_heads = valid[0] - num_relations
+        self.num_shared_heads = num_shared_heads
 
         # Embeddings
         self.region_embed = nn.Embedding(num_regions + 1, d_node // 3, padding_idx=num_regions)
@@ -250,7 +270,12 @@ class SceneGraphEncoderV2(nn.Module):
 
         # Relation-aware GAT stack
         self.gat_layers = nn.ModuleList([
-            RelationAwareGAT(d_node=d_node, num_relations=num_relations, dropout=dropout)
+            RelationAwareGAT(
+                d_node=d_node,
+                num_relations=num_relations,
+                num_shared_heads=num_shared_heads,
+                dropout=dropout,
+            )
             for _ in range(num_gat_layers)
         ])
 
