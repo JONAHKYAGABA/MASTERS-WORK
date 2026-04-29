@@ -26,6 +26,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import random
 import re
 import time
 import traceback
@@ -34,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+import numpy as np
 import pandas as pd
 import requests
 from openai import OpenAI, RateLimitError, APIConnectionError, APITimeoutError, APIError
@@ -52,6 +54,23 @@ from utils import (
 os.environ.setdefault("AGENT_API_KEY", "sk-XXXXXXXXXXXXX")
 os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
 API_KEY = os.environ.get("AGENT_API_KEY", "dummy")
+
+
+def set_seeds(seed: int = 42) -> None:
+    """Required for Zindi code-review reproducibility (rules: 'Always set the seed')."""
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import torch  # type: ignore
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        pass
+
+
+set_seeds(int(os.environ.get("SEED", "42")))
 
 ALLOWED_TOOLS = {
     "judge_mainlobe_or_not",
@@ -424,30 +443,54 @@ class AgentsRunner:
 
         # Final-answer constraint pass (free_mode): if the last message has no
         # \boxed{...}, force one more turn with the explicit option list.
+        # Also: if the task is multi-answer but the model emitted a single
+        # answer, force expansion (recall bias — better IoU).
         if free_mode:
             current_answer = (getattr(last_msg, "content", "") or "") if last_msg else ""
             current_traces = (getattr(last_msg, "reasoning_content", "") or "") if last_msg else ""
             agent_answer = extract_answer(current_answer) or extract_answer(current_traces)
-            if agent_answer == "":
+            is_multi_task = "Select the most appropriate" not in (task.get("description") or "")
+            single_for_multi = (
+                is_multi_task
+                and agent_answer
+                and "|" not in agent_answer
+                and os.environ.get("ENFORCE_MULTI", "1") == "1"
+            )
+            if agent_answer == "" or single_for_multi:
                 if self.verbose:
                     self.logger.info(f"[Scenario: {scenario_id}] Forcing final-answer turn")
                 if "Select the most appropriate" in (task.get("description") or ""):
                     messages.append({
                         "role": "user",
                         "content": (
-                            "This is a single-answer question. Select the most appropriate "
+                            "This is a SINGLE-answer question. Select the most appropriate "
                             "optimization solution and enclose its number in \\boxed{} "
                             f"in the final answer. For example, \\boxed{{C3}}\nOptions:\n{root_causes}"
                         ),
                     })
                 else:
+                    # Multi-answer recall bias: scoring is IoU, so predicting
+                    # 2-3 likely options beats predicting 1 confident one. Tell
+                    # the model explicitly. If single_for_multi, mention the
+                    # current answer and ask for additions, not a replacement.
+                    extra = ""
+                    if single_for_multi and agent_answer:
+                        extra = (
+                            f"\nYour previous answer ({agent_answer}) was a single option, "
+                            "but this task requires 2 to 4. Keep that option AND add the "
+                            "next most plausible options from your analysis."
+                        )
                     messages.append({
                         "role": "user",
                         "content": (
-                            "This is a multiple-answer question. Select 2 to 4 optimization "
+                            "This is a MULTIPLE-answer question. Select 2 to 4 optimization "
                             "solutions and enclose their numbers in \\boxed{} in ascending "
-                            "order separated by | in the final answer. For example, "
-                            f"\\boxed{{C3|C5}}\nOptions:\n{root_causes}"
+                            "order separated by | in the final answer. Scoring is "
+                            "intersection-over-union, so missing a correct option costs you "
+                            "as much as adding a wrong one — pick the 2-3 most likely "
+                            "options, not just the single most confident."
+                            f"{extra}\n"
+                            f"For example, \\boxed{{C3|C5}}\nOptions:\n{root_causes}"
                         ),
                     })
                 msg2 = self._call_model(messages, functions=[])

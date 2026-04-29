@@ -241,8 +241,31 @@ def gpu_mem_summary() -> str:
     return "  ".join(parts)
 
 
-def load_model(model_id: str) -> None:
+def _report_hf_cache(model_id: str) -> None:
+    """Print whether the model is already on disk so the user can SEE no redownload."""
+    hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    hub_dir = os.path.join(hf_home, "hub")
+    safe = "models--" + model_id.replace("/", "--")
+    cache_dir = os.path.join(hub_dir, safe)
+    if os.path.isdir(cache_dir):
+        try:
+            total = 0
+            for root, _, files in os.walk(cache_dir):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    if os.path.isfile(fp) and not os.path.islink(fp):
+                        total += os.path.getsize(fp)
+            log.info(f"HF cache HIT: {cache_dir} ({total / 1024**3:.1f} GB)")
+        except Exception:
+            log.info(f"HF cache present at {cache_dir}")
+    else:
+        log.info(f"HF cache MISS: {cache_dir} does not exist; first-time download.")
+    log.info(f"HF_HOME={hf_home}  HF_HUB_OFFLINE={os.environ.get('HF_HUB_OFFLINE', '0')}")
+
+
+def load_model(model_id: str, lora_path: Optional[str] = None) -> None:
     global _MODEL, _TOKENIZER, _MODEL_ID
+    _report_hf_cache(model_id)
     log.info(f"Loading tokenizer: {model_id}")
     _TOKENIZER = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if _TOKENIZER.pad_token_id is None and _TOKENIZER.eos_token_id is not None:
@@ -257,26 +280,35 @@ def load_model(model_id: str) -> None:
         bnb_4bit_use_double_quant=True,
     )
     t0 = time.time()
-    _MODEL = AutoModelForCausalLM.from_pretrained(
+    base = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb,
         device_map="auto",
         trust_remote_code=True,
         low_cpu_mem_usage=True,
     )
+    if lora_path:
+        from peft import PeftModel  # imported lazily
+        log.info(f"Attaching LoRA adapter from {lora_path}")
+        _MODEL = PeftModel.from_pretrained(base, lora_path)
+        _MODEL_ID = f"{model_id}+lora"
+    else:
+        _MODEL = base
+        _MODEL_ID = model_id
     _MODEL.eval()
-    _MODEL_ID = model_id
-    log.info(f"Model loaded in {time.time() - t0:.1f}s")
+    log.info(f"Model loaded in {time.time() - t0:.1f}s as id={_MODEL_ID}")
     log.info(f"AFTER LOAD:  {gpu_mem_summary()}")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=os.environ.get("MODEL_NAME", "Qwen/Qwen3.5-35B-A3B"))
+    ap.add_argument("--lora", default=os.environ.get("LORA_PATH"),
+                    help="Optional path to a LoRA adapter to attach on top of the base model.")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=int(os.environ.get("LLM_PORT", "8001")))
     args = ap.parse_args()
-    load_model(args.model)
+    load_model(args.model, lora_path=args.lora or None)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

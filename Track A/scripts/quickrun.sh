@@ -21,6 +21,18 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
+# ---- HuggingFace cache pinning ----
+# Reuse the same cache across runs so the model is downloaded ONCE.
+# Override HF_HOME if you want the cache somewhere else (e.g. on a bigger disk).
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
+export HF_HUB_DISABLE_TELEMETRY=1
+export HF_HUB_DISABLE_PROGRESS_BARS="${HF_HUB_DISABLE_PROGRESS_BARS:-0}"
+# Set HF_HUB_OFFLINE=1 in your shell to forbid any HF Hub network call after
+# the model is cached. Useful as a paranoid "no redownload" guarantee.
+export TOKENIZERS_PARALLELISM=false
+mkdir -p "$HF_HOME/hub"
+
 step() { printf "\n=== %s ===\n" "$*"; }
 fail() { printf "ERROR: %s\n" "$*" >&2; exit 1; }
 
