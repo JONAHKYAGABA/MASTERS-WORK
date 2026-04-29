@@ -102,11 +102,33 @@ restart_server_test() {
 # ============================================================
 STAGE="precheck"
 step "[0] Precheck"
-wait_llm_ready 60 || {
-    echo "llm_server is not running on port $LLM_PORT." >&2
-    echo "Start it first:  bash scripts/quickrun.sh" >&2
-    exit 1
-}
+
+# Auto-start the LLM server if it isn't already up.
+if ! curl -sf "http://localhost:$LLM_PORT/health" 2>/dev/null | grep -q '"status":"ok"'; then
+    echo "  llm_server not running on port $LLM_PORT — starting it now."
+    # Detect existing LoRA so we resume with it on second runs of the pipeline.
+    extra_args=()
+    if [ -d "$LORA_DIR" ] && [ -f "$LORA_DIR/adapter_config.json" ]; then
+        echo "  found existing LoRA at $LORA_DIR — attaching it"
+        extra_args+=(--lora "$LORA_DIR")
+    fi
+    mkdir -p eval/logs
+    LLM_PORT="$LLM_PORT" MODEL_NAME="$MODEL_NAME" \
+        nohup python scripts/llm_server.py \
+            --model "$MODEL_NAME" \
+            --port "$LLM_PORT" \
+            "${extra_args[@]}" \
+            > "$LLM_LOG" 2>&1 &
+    echo "  llm_server pid=$!  log=$LLM_LOG"
+    echo "  first model load takes ~10-20 min (after that the HF cache is hot)"
+    wait_llm_ready 1800 || {
+        echo "FATAL: llm_server failed to come up. Last 80 lines of $LLM_LOG:" >&2
+        tail -n 80 "$LLM_LOG" >&2 || true
+        exit 1
+    }
+else
+    echo "  llm_server already up at port $LLM_PORT"
+fi
 restart_server_test
 
 # ============================================================
