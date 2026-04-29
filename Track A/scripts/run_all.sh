@@ -188,7 +188,7 @@ else
     pip install -q "torch>=2.4.0" "transformers>=4.45.0" "accelerate>=1.0.0" \
         "bitsandbytes>=0.44.0" "peft>=0.13.0" \
         "datasets>=3.0.0" safetensors sentencepiece protobuf \
-        "huggingface_hub[cli]>=0.25" hf_transfer
+        "huggingface_hub>=0.25" hf_transfer
     step_done
 fi
 
@@ -228,17 +228,20 @@ if [ -d "$CACHE_DIR" ]; then
     du -sh "$CACHE_DIR" || true
 fi
 echo "  hf_transfer enabled: $HF_HUB_ENABLE_HF_TRANSFER"
-echo "  starting download (with resume) — progress bars will appear..."
-if huggingface-cli download "$MODEL_NAME" \
-        --cache-dir "$HF_HOME/hub" \
-        --resume-download 2>&1 | tail -n +1
-then
-    echo
-    echo "  $(c_green "downloaded:") $(du -sh "$CACHE_DIR" | cut -f1)  total at $CACHE_DIR"
+echo "  starting download via huggingface_hub.snapshot_download (with resume + retries)..."
+# Use Python API directly — sidesteps huggingface-cli vs hf binary churn.
+if MODEL_NAME="$MODEL_NAME" python scripts/prefetch_model.py; then
+    AFTER_SIZE=$(du -sb "$CACHE_DIR" 2>/dev/null | cut -f1 || echo 0)
+    AFTER_HUMAN=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1 || echo 0)
     NUM_BLOBS=$(ls "$CACHE_DIR/blobs" 2>/dev/null | wc -l || echo 0)
-    echo "  shards/blobs in cache: $NUM_BLOBS"
+    echo "  $(c_green "cache size:") $AFTER_HUMAN  ($NUM_BLOBS blobs)"
+    # Sanity: 35B / 30B-A3B in fp16 should be in the 60-75 GB range.
+    if [ "$AFTER_SIZE" -lt $((40 * 1024 * 1024 * 1024)) ]; then
+        echo "  $(c_yellow "WARNING: cache is only $AFTER_HUMAN, expected 60-75 GB.")"
+        echo "  $(c_yellow "         Re-run scripts/prefetch_model.py until size stabilizes near full.")"
+    fi
 else
-    fail "huggingface-cli download failed. Try MODEL_NAME=Qwen/Qwen3-30B-A3B or check network."
+    fail "model prefetch failed. Try a different MODEL_NAME (e.g. Qwen/Qwen3-30B-A3B), check network, or rerun."
 fi
 # After successful download we can safely run offline.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
