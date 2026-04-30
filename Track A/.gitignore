@@ -1,0 +1,23 @@
+# Secrets — NEVER commit
+.env
+*.token
+*.secret
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Pipeline outputs (regenerable)
+eval/results/
+eval/logs/
+traces/
+training/checkpoints/
+*.log
+*.pid
+pipeline.log
+run_all.log
+server.log
+nohup.out
+.locked_hashes

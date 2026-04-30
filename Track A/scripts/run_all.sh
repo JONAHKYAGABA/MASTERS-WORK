@@ -40,6 +40,23 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
+# Load .env if present (HF_TOKEN, HF_PUSH_REPO, AGENT_API_KEY, etc.).
+# .env is gitignored — never commit it.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+    echo "[env] loaded .env"
+fi
+# Standardize on HF_TOKEN (HF Hub respects this natively).
+export HF_TOKEN="${HF_TOKEN:-${HF_API_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}}"
+if [ -n "$HF_TOKEN" ]; then
+    echo "[env] HF_TOKEN set (length ${#HF_TOKEN})"
+else
+    echo "[env] HF_TOKEN not set (public-only HF access)"
+fi
+
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 export HF_HUB_DISABLE_TELEMETRY=1
@@ -73,7 +90,7 @@ TAIL_PID=""
 # ============================================================
 #                       UI HELPERS
 # ============================================================
-TOTAL_STEPS=10
+TOTAL_STEPS=11
 STEP_NUM=0
 PIPELINE_START=$(date +%s)
 STEP_START=0
@@ -407,6 +424,22 @@ python scripts/build_phase2_submissions.py \
     --test_file "$TEST_JSON" \
     --out_dir "$PHASE2_DIR" || echo "  WARN: variant build failed; raw result.csv is still valid."
 step_done
+
+# ============================================================
+#  STEP 11 ─  push LoRA to HF Hub (if HF_PUSH_REPO is set)
+# ============================================================
+step "Push LoRA adapter to HuggingFace Hub"
+if [ -z "${HF_PUSH_REPO:-}" ]; then
+    step_skip "HF_PUSH_REPO not set in .env — leaving adapter local-only"
+elif [ ! -d "$LORA_DIR" ] || [ ! -f "$LORA_DIR/adapter_config.json" ]; then
+    step_skip "no LoRA adapter at $LORA_DIR (training was skipped)"
+else
+    HF_TOKEN="$HF_TOKEN" HF_PUSH_REPO="$HF_PUSH_REPO" \
+        HF_PUSH_PRIVATE="${HF_PUSH_PRIVATE:-true}" \
+        python scripts/push_lora.py --lora_dir "$LORA_DIR" \
+        || echo "  WARN: push failed; adapter still saved locally at $LORA_DIR"
+    step_done
+fi
 
 # ============================================================
 #                   FINAL REPORT

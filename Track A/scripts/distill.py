@@ -53,8 +53,9 @@ Constraints:
    collapse, classify the failure mode (coverage / interference /
    scheduler) by comparing RSRP, SINR, BLER, MCS, RB count, then map the
    mode to the candidate action targeting the right cell.
-5. End the trace with exactly one \\boxed{...} on the last line. The
-   boxed value MUST equal the correct answer below.
+5. End the trace with exactly one \\boxed{{...}} on the last line. The
+   boxed value MUST equal the correct answer below (e.g. \\boxed{{C7}}
+   for single-answer, \\boxed{{C3|C7|C11}} for multi-answer).
 
 Correct answer: {gt}
 Question type: {qtype}
