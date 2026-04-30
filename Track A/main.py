@@ -294,7 +294,7 @@ class AgentsRunner:
         model_url: str,
         model_name: str,
         model_provider: Optional[str] = None,
-        max_tokens: int = 16000,
+        max_tokens: int = 1024,
         max_retries: int = 3,
         max_iterations: int = 2,
         verbose: bool = False,
@@ -689,7 +689,9 @@ def main() -> None:
     parser.add_argument("--num_attempts", type=int, default=1)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--save_freq", type=int, default=10)
-    parser.add_argument("--max_tokens", type=int, default=16000)
+    parser.add_argument("--max_tokens", type=int, default=1024,
+                        help="Max generation tokens per call. 1024 is enough for "
+                             "<800 tok reasoning + boxed answer; higher values blow timeout on Turing.")
     parser.add_argument("--max_iterations", type=int, default=2)
     parser.add_argument("--save_dir", type=str, default="./eval/results/run")
     parser.add_argument("--log_file", type=str, default="./run.log")

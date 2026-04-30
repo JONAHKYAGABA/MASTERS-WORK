@@ -154,13 +154,23 @@ async def chat_completions(req: ChatRequest) -> Dict[str, Any]:
 
     # apply_chat_template with tools=... handles tool descriptors for Qwen.
     # In newer transformers it can return a BatchEncoding dict instead of a Tensor.
+    # enable_thinking=False suppresses Qwen3's <think>...</think> reasoning blocks
+    # which can blow through token budgets and cause per-scenario timeouts.
+    enable_thinking = os.environ.get("QWEN_ENABLE_THINKING", "0") == "1"
+
     def _render(msgs_arg, tools_arg):
-        out = _TOKENIZER.apply_chat_template(
-            msgs_arg,
+        kwargs = dict(
             tools=tools_arg,
             add_generation_prompt=True,
             return_tensors="pt",
         )
+        # Try Qwen3's enable_thinking kwarg; harmless on other models if unsupported.
+        try:
+            out = _TOKENIZER.apply_chat_template(
+                msgs_arg, enable_thinking=enable_thinking, **kwargs
+            )
+        except TypeError:
+            out = _TOKENIZER.apply_chat_template(msgs_arg, **kwargs)
         # Normalize: extract the input_ids tensor regardless of return shape.
         if isinstance(out, torch.Tensor):
             ids = out
