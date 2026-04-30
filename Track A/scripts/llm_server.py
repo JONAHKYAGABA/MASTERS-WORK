@@ -153,20 +153,49 @@ async def chat_completions(req: ChatRequest) -> Dict[str, Any]:
     msgs = msgs_to_dicts(req.messages)
 
     # apply_chat_template with tools=... handles tool descriptors for Qwen.
+    # In newer transformers it can return a BatchEncoding dict instead of a Tensor.
+    def _render(msgs_arg, tools_arg):
+        out = _TOKENIZER.apply_chat_template(
+            msgs_arg,
+            tools=tools_arg,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+        # Normalize: extract the input_ids tensor regardless of return shape.
+        if isinstance(out, torch.Tensor):
+            ids = out
+        elif hasattr(out, "input_ids"):
+            ids = out["input_ids"]
+        elif isinstance(out, dict) and "input_ids" in out:
+            ids = out["input_ids"]
+        elif isinstance(out, (list, tuple)):
+            ids = torch.tensor(out, dtype=torch.long)
+            if ids.dim() == 1:
+                ids = ids.unsqueeze(0)
+        else:
+            raise TypeError(f"Unexpected apply_chat_template return: {type(out)}")
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        return ids
+
     try:
-        prompt_ids = _TOKENIZER.apply_chat_template(
-            msgs,
-            tools=req.tools,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        )
+        prompt_ids = _render(msgs, req.tools)
     except Exception as exc:
-        log.warning(f"apply_chat_template with tools failed: {exc}; falling back without tools")
-        prompt_ids = _TOKENIZER.apply_chat_template(
-            msgs,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        )
+        log.warning(f"apply_chat_template with tools failed: {exc}; retrying without tools")
+        try:
+            prompt_ids = _render(msgs, None)
+        except Exception as exc2:
+            # Final fallback: render the messages as plain text and tokenize.
+            log.error(f"apply_chat_template still failed: {exc2}; using fallback prompt")
+            text_parts = []
+            for m in msgs:
+                role = m.get("role", "user")
+                content = m.get("content", "") or ""
+                text_parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+            text_parts.append("<|im_start|>assistant\n")
+            text = "\n".join(text_parts)
+            prompt_ids = _TOKENIZER(text, return_tensors="pt").input_ids
+
     prompt_ids = prompt_ids.to(_MODEL.device)
     prompt_len = int(prompt_ids.shape[-1])
 
