@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*-coding:utf-8 -*-
-
 
 from typing import Optional, Dict, Any, List
 from _types import Scenario
@@ -10,7 +7,9 @@ import re
 from datetime import datetime, timezone
 from dateutil import parser
 import os
+
 import pandas as pd
+
 
 
 def load_scenarios(config, default_scenario="random", split="test"):
@@ -30,6 +29,7 @@ def load_scenarios(config, default_scenario="random", split="test"):
         default_scenario_id = validated_scenarios[0].scenario_id
 
     return validated_scenarios, default_scenario_id
+
 
 
 def df_first_or_none(df: pd.DataFrame) -> Optional[Dict[str, Any]]:

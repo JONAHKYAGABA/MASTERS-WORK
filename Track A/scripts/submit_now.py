@@ -43,6 +43,71 @@ from scripts.build_baseline_submission import pick_answer as heuristic_pick  # n
 from scripts.build_baseline_submission import is_multi as task_is_multi  # noqa: E402
 
 
+# ---------------------------------------------------------------- RAG (optional)
+
+_RAG_MODEL = None
+_RAG_CHUNKS: Optional[List[Dict[str, Any]]] = None
+_RAG_EMBS = None  # numpy array
+
+
+def _init_rag(kb_dir: Path) -> bool:
+    """Lazy-load the embedding model + chunks + embeddings. Return False if unavailable."""
+    global _RAG_MODEL, _RAG_CHUNKS, _RAG_EMBS
+    if _RAG_MODEL is not None:
+        return True
+    chunks_path = kb_dir / "chunks.json"
+    embs_path = kb_dir / "embeddings.npy"
+    if not chunks_path.exists() or not embs_path.exists():
+        print(f"[rag] index not found at {kb_dir}; run scripts/build_kb_index.py first",
+              file=sys.stderr)
+        return False
+    try:
+        import numpy as np  # noqa
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        print("[rag] sentence-transformers / numpy not installed; pip install them",
+              file=sys.stderr)
+        return False
+    # HF_HUB_OFFLINE may be set from earlier run_all.sh — clear it for the embed model.
+    os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
+    model_id = os.environ.get("RAG_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    print(f"[rag] loading {model_id} (one-time, ~80MB)")
+    _RAG_MODEL = SentenceTransformer(model_id)
+    _RAG_CHUNKS = json.loads(chunks_path.read_text(encoding="utf-8"))
+    _RAG_EMBS = np.load(embs_path)
+    print(f"[rag] indexed {len(_RAG_CHUNKS)} chunks (dim={_RAG_EMBS.shape[1]})")
+    return True
+
+
+def _retrieve(query_text: str, k: int = 3, max_chars_per_chunk: int = 800) -> str:
+    """Top-k cosine search over the KB. Return a markdown-formatted Reference Knowledge block."""
+    import numpy as np
+    if _RAG_MODEL is None or _RAG_CHUNKS is None or _RAG_EMBS is None:
+        return ""
+    q = _RAG_MODEL.encode([query_text], convert_to_numpy=True)[0].astype("float32")
+    norms = np.linalg.norm(_RAG_EMBS, axis=1) * (np.linalg.norm(q) + 1e-8)
+    sims = (_RAG_EMBS @ q) / (norms + 1e-8)
+    top_idx = np.argsort(-sims)[:k]
+    parts = []
+    for i in top_idx:
+        c = _RAG_CHUNKS[int(i)]
+        text = c["text"][:max_chars_per_chunk]
+        parts.append(f"From {c['source']}:\n{text}")
+    return "## Reference Knowledge (top-{} retrieved)\n\n".format(k) + "\n\n---\n\n".join(parts)
+
+
+def _rag_query_for(scenario: Dict[str, Any]) -> str:
+    """Build a short retrieval query from the scenario's task + options.
+    Avoid putting the bulk of the data into the query (it dilutes the signal)."""
+    task_desc = ((scenario.get("task") or {}).get("description") or "")
+    opts = " ".join(
+        (o.get("label") or "")
+        for o in ((scenario.get("task") or {}).get("options") or [])
+    )
+    return f"5G RAN drive test throughput drop diagnosis. {task_desc[:300]} Actions: {opts[:600]}"
+
+
 # ---------------------------------------------------------------- LLM call
 
 def _scenario_block(scenario: Dict[str, Any]) -> str:
@@ -128,20 +193,21 @@ def _ask_llm(
     model_name: str,
     timeout_s: float,
     max_tokens: int,
+    rag_block: str = "",
 ) -> str:
     options = (scenario.get("task") or {}).get("options", []) or []
     options_block = "\n".join(f"  {o['id']}: {o['label']}" for o in options if "id" in o)
     is_multi = task_is_multi(scenario)
     system = SYSTEM_PROMPT_MULTI if is_multi else SYSTEM_PROMPT_SINGLE
 
-    user_prompt = (
-        _scenario_block(scenario)
-        + "\n\n## Task\n"
-        + ((scenario.get("task") or {}).get("description") or "")
-        + "\n\n## Options\n"
-        + options_block
-        + "\n\nAnswer:"
-    )
+    user_prompt_parts = []
+    if rag_block:
+        user_prompt_parts.append(rag_block)
+    user_prompt_parts.append(_scenario_block(scenario))
+    user_prompt_parts.append("## Task\n" + ((scenario.get("task") or {}).get("description") or ""))
+    user_prompt_parts.append("## Options\n" + options_block)
+    user_prompt_parts.append("Answer:")
+    user_prompt = "\n\n".join(user_prompt_parts)
 
     payload = {
         "model": model_name,
@@ -201,6 +267,13 @@ def main() -> int:
     ap.add_argument("--max_samples", type=int, default=None)
     ap.add_argument("--no_llm", action="store_true",
                     help="Skip LLM entirely; use heuristic for all scenarios.")
+    ap.add_argument("--use_rag", action="store_true",
+                    help="Prepend retrieved 5G KB chunks to each LLM prompt. "
+                         "Requires knowledge/processed/{chunks.json,embeddings.npy} from build_kb_index.py.")
+    ap.add_argument("--rag_k", type=int, default=3,
+                    help="Number of KB chunks to retrieve per scenario (default 3).")
+    ap.add_argument("--rag_dir", default="knowledge/processed",
+                    help="Directory containing chunks.json + embeddings.npy.")
     args = ap.parse_args()
 
     test_path = (PROJECT_DIR / args.test_file).resolve()
@@ -225,6 +298,13 @@ def main() -> int:
             print(f"[llm] not reachable at {args.llm_url}: {exc}", file=sys.stderr)
             print(f"[llm] falling back to --no_llm mode", file=sys.stderr)
             args.no_llm = True
+
+    # Initialize RAG once (lazy-loads embedding model + chunks).
+    rag_ready = False
+    if args.use_rag and not args.no_llm:
+        rag_ready = _init_rag((PROJECT_DIR / args.rag_dir).resolve())
+        if not rag_ready:
+            print("[rag] disabled — continuing without retrieved context", file=sys.stderr)
 
     with test_path.open("r", encoding="utf-8") as f:
         scenarios = json.load(f)
@@ -257,12 +337,16 @@ def main() -> int:
             answer = ""
             t0 = time.time()
             if not args.no_llm:
+                rag_block = ""
+                if rag_ready:
+                    rag_block = _retrieve(_rag_query_for(scenario), k=args.rag_k)
                 llm_text = _ask_llm(
                     scenario,
                     args.llm_url,
                     args.model_name,
                     args.llm_timeout_s,
                     args.max_tokens,
+                    rag_block=rag_block,
                 )
                 answer = _extract_boxed(llm_text, valid_ids)
 
@@ -316,6 +400,50 @@ def main() -> int:
     print(f"    {out_dir / 'result_v1_raw.csv'}")
     print(f"    {out_dir / 'result_v2_multi_recall.csv'}")
     print(f"    {out_dir / 'result_v3_insurance.csv'}")
+
+    # Optional: score against ground truth if scenarios in the test file are labeled.
+    # Mirrors Zindi's IoU scoring: union/intersection on multi-answer, exact on single.
+    labeled = [s for s in scenarios if s.get("answer") and s.get("answer") != "To be determined"]
+    if labeled:
+        ans_by_id = {r["scenario_id"]: r["answers"] for r in rows}
+        n_scored = 0
+        score_total = 0.0
+        n_multi_correct = n_multi_total = 0
+        n_single_correct = n_single_total = 0
+        n_empty = n_malformed = 0
+        cx_re = re.compile(r"^C\d+(\|C\d+)*$")
+        for s in labeled:
+            sid = s.get("scenario_id")
+            pred = ans_by_id.get(sid, "")
+            gt = s.get("answer", "")
+            if not pred:
+                n_empty += 1
+            elif not cx_re.match(pred):
+                n_malformed += 1
+            if "|" in gt:
+                n_multi_total += 1
+                p_set = set(pred.split("|")) if pred else set()
+                g_set = set(gt.split("|"))
+                iou = len(p_set & g_set) / max(len(p_set | g_set), 1)
+                score_total += iou
+                if iou == 1.0:
+                    n_multi_correct += 1
+            else:
+                n_single_total += 1
+                ok = pred == gt
+                score_total += 1.0 if ok else 0.0
+                if ok:
+                    n_single_correct += 1
+            n_scored += 1
+        print()
+        print(f"=== HOLDOUT SCORE (vs ground truth) ===")
+        print(f"  scored {n_scored} labeled scenarios")
+        print(f"  mean   : {score_total/max(n_scored,1):.4f}  (Zindi-equivalent IoU/exact mix)")
+        print(f"  single : {n_single_correct}/{n_single_total} exact "
+              f"({100*n_single_correct/max(n_single_total,1):.1f}%)")
+        print(f"  multi  : {n_multi_correct}/{n_multi_total} full IoU=1.0 "
+              f"({100*n_multi_correct/max(n_multi_total,1):.1f}%)")
+        print(f"  empty  : {n_empty}    malformed: {n_malformed}")
     return 0
 
 
