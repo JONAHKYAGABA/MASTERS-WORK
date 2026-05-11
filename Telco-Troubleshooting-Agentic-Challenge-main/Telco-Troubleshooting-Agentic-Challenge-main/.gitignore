@@ -1,0 +1,41 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build, packaging, and test artifacts
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment and local config
+.env
+.env.*
+
+# Editors and OS metadata
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Challenge outputs
+# submission/Phase_1/result.csv
+# Track A/results/
+# Track B/agent/eval_results/
+
+# Legacy local artifact
+*/gt.csv
