@@ -298,26 +298,41 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
         print(f"[cols] qi_meta: qid={qi_qid!r}  iid={qi_iid!r}")
         print(f"[cols] img_meta: iid={im_iid!r}  w={im_w_col!r}  h={im_h_col!r}\n")
 
-    # IMPORTANT: qi_meta has 70M rows — indexing the whole thing takes
-    # minutes and several GB of RAM. Instead, take a small head of q_meta
-    # first, then `isin`-filter qi_meta down to just those question_ids.
-    # We oversample (n * 50) to leave headroom for skips due to missing
-    # images / scene graphs.
+    # qi_meta has 70M rows — indexing the whole thing takes minutes and GBs
+    # of RAM. Instead, take a small head of q_meta first, then merge with
+    # qi_meta on question_id. We oversample to leave headroom for skips.
     head_size = max(n * 50, 50)
     q_head = q_meta.head(head_size).reset_index(drop=True)
     if verbose:
         print(f"[trim] candidate questions: {len(q_head)} "
               f"(oversampling {head_size} to find {n} valid)")
 
-    # Vectorised filter: keep only qi rows matching our candidate question_ids
-    print(f"[trim] filtering qi_meta (70M rows) — ~10-30s ...")
-    candidate_qids = set(q_head[q_qid].tolist())
-    t = time.time()
-    qi_small = qi_meta[qi_meta[qi_qid].isin(candidate_qids)].copy()
-    print(f"[trim] qi_meta filtered to {len(qi_small):,} rows in {time.time()-t:.1f}s")
+    # Diagnostic: confirm the join key actually looks sane on both sides
+    qh_uniq = q_head[q_qid].nunique()
+    print(f"[diag] q_head[{q_qid}] dtype={q_head[q_qid].dtype}  "
+          f"unique={qh_uniq}/{len(q_head)}  sample={q_head[q_qid].iloc[0]!r}")
+    print(f"[diag] qi_meta[{qi_qid}] dtype={qi_meta[qi_qid].dtype}  "
+          f"sample={qi_meta[qi_qid].iloc[0]!r}")
 
-    # Now index the small filtered subset
-    qi_by_qid = qi_small.set_index(qi_qid, drop=False)
+    # Force-align dtypes via string conversion before merging. If the parquet
+    # types disagreed (int64 vs object) isin / merge silently produced
+    # cartesian-product-sized results.
+    print(f"[trim] merging q_head ({len(q_head):,} rows) with qi_meta "
+          f"({len(qi_meta):,} rows) on {qi_qid} ...")
+    t = time.time()
+    q_head["_join_qid"] = q_head[q_qid].astype(str)
+    qi_keys = qi_meta[qi_qid].astype(str)
+    qi_small = qi_meta[qi_keys.isin(set(q_head["_join_qid"]))].copy()
+    qi_small["_join_qid"] = qi_small[qi_qid].astype(str)
+    print(f"[trim] qi_small: {len(qi_small):,} rows in {time.time()-t:.1f}s")
+
+    # Sanity: each candidate question should map to ~1-3 images, not millions
+    if len(qi_small) > len(q_head) * 20:
+        print(f"⚠ qi_small has {len(qi_small)/len(q_head):.0f}× more rows than "
+              f"candidates — join key may still be off; results may be wrong")
+
+    # Build small in-memory indexes
+    qi_by_qid = qi_small.set_index("_join_qid", drop=False)
     im_by_iid = img_meta.set_index(im_iid, drop=False)
 
     samples: List[Dict[str, Any]] = []
@@ -329,9 +344,9 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
         study = _study_prefix(q_row[q_stud])
         question_id = q_row[q_qid]
 
-        # Find an image for this question (fast lookup via the small index)
+        # Find an image for this question — use the string-cast join key
         try:
-            qi_match = qi_by_qid.loc[[question_id]]
+            qi_match = qi_by_qid.loc[[str(question_id)]]
         except (KeyError, TypeError):
             continue
         if len(qi_match) == 0:
