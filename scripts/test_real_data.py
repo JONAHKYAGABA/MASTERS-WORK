@@ -102,14 +102,65 @@ def _study_prefix(study_id: int | str) -> str:
     return s
 
 
-def load_scene_graph(qba_root: Path, subject: str, study: str) -> Optional[Dict[str, Any]]:
-    """Load a single per-study scene graph JSON."""
-    p1x = subject[:3]  # 'p1' + first digit → 'p10', 'p11', etc.
-    sg_path = qba_root / "scene_data" / p1x / subject / f"{study}.scene_graph.json"
-    if not sg_path.exists():
+_SG_PATH_CACHE: Dict[str, Optional[Path]] = {}
+_SG_ROOT_HINT: Optional[Path] = None
+
+
+def _discover_sg_root(qba_root: Path) -> Optional[Path]:
+    """Find the directory under qba_root/scene_data that contains the p10..p19
+    subdirs. Handles three layouts:
+      (a) scene_data/p10/...                           (documented)
+      (b) scene_data/<wrapper>/p10/...                 (zip had a top-level dir)
+      (c) scene_data/scene_data/p10/...                (unzipped into self-named dir)
+    Cached after the first call."""
+    global _SG_ROOT_HINT
+    if _SG_ROOT_HINT is not None:
+        return _SG_ROOT_HINT
+
+    base = qba_root / "scene_data"
+    if not base.exists():
         return None
-    with open(sg_path) as f:
-        return json.load(f)
+    # Layout (a): p* subdirs directly under base
+    if any((base / f"p1{d}").is_dir() for d in "0123456789"):
+        _SG_ROOT_HINT = base
+        return base
+    # Layouts (b), (c): exactly one subdir, recurse into it (up to 2 levels)
+    for depth in range(1, 3):
+        for cand in base.glob("/".join(["*"] * depth)):
+            if cand.is_dir() and any((cand / f"p1{d}").is_dir() for d in "0123456789"):
+                _SG_ROOT_HINT = cand
+                return cand
+    return None
+
+
+def load_scene_graph(qba_root: Path, subject: str, study: str) -> Optional[Dict[str, Any]]:
+    """Load a single per-study scene graph JSON, auto-discovering layout."""
+    key = f"{subject}/{study}"
+    if key in _SG_PATH_CACHE:
+        cached = _SG_PATH_CACHE[key]
+        if cached is None:
+            return None
+        with open(cached) as f:
+            return json.load(f)
+
+    sg_root = _discover_sg_root(qba_root)
+    if sg_root is None:
+        return None
+
+    p1x = subject[:3]
+    candidates = [
+        sg_root / p1x / subject / f"{study}.scene_graph.json",
+        sg_root / subject / f"{study}.scene_graph.json",   # no p1x layer
+        sg_root / p1x / subject / f"{study}.json",          # short extension
+    ]
+    for path in candidates:
+        if path.exists():
+            _SG_PATH_CACHE[key] = path
+            with open(path) as f:
+                return json.load(f)
+
+    _SG_PATH_CACHE[key] = None
+    return None
 
 
 def load_qa(qba_root: Path, subject: str, study: str, question_id: str) -> Optional[Dict[str, Any]]:
