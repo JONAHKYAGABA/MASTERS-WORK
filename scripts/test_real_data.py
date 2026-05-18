@@ -298,12 +298,30 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
         print(f"[cols] qi_meta: qid={qi_qid!r}  iid={qi_iid!r}")
         print(f"[cols] img_meta: iid={im_iid!r}  w={im_w_col!r}  h={im_h_col!r}\n")
 
-    # Pre-index qi_meta and img_meta for fast lookup (70M rows otherwise hurts)
-    qi_by_qid = qi_meta.set_index(qi_qid, drop=False)
+    # IMPORTANT: qi_meta has 70M rows — indexing the whole thing takes
+    # minutes and several GB of RAM. Instead, take a small head of q_meta
+    # first, then `isin`-filter qi_meta down to just those question_ids.
+    # We oversample (n * 50) to leave headroom for skips due to missing
+    # images / scene graphs.
+    head_size = max(n * 50, 50)
+    q_head = q_meta.head(head_size).reset_index(drop=True)
+    if verbose:
+        print(f"[trim] candidate questions: {len(q_head)} "
+              f"(oversampling {head_size} to find {n} valid)")
+
+    # Vectorised filter: keep only qi rows matching our candidate question_ids
+    print(f"[trim] filtering qi_meta (70M rows) — ~10-30s ...")
+    candidate_qids = set(q_head[q_qid].tolist())
+    t = time.time()
+    qi_small = qi_meta[qi_meta[qi_qid].isin(candidate_qids)].copy()
+    print(f"[trim] qi_meta filtered to {len(qi_small):,} rows in {time.time()-t:.1f}s")
+
+    # Now index the small filtered subset
+    qi_by_qid = qi_small.set_index(qi_qid, drop=False)
     im_by_iid = img_meta.set_index(im_iid, drop=False)
 
     samples: List[Dict[str, Any]] = []
-    for idx, q_row in q_meta.iterrows():
+    for idx, q_row in q_head.iterrows():
         if len(samples) >= n:
             break
 
@@ -311,12 +329,12 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
         study = _study_prefix(q_row[q_stud])
         question_id = q_row[q_qid]
 
-        # Find an image for this question (fast lookup via pre-built index)
+        # Find an image for this question (fast lookup via the small index)
         try:
             qi_match = qi_by_qid.loc[[question_id]]
         except (KeyError, TypeError):
             continue
-        if isinstance(qi_match, type(q_meta)) is False or len(qi_match) == 0:
+        if len(qi_match) == 0:
             continue
         image_id = qi_match.iloc[0][qi_iid]
 
