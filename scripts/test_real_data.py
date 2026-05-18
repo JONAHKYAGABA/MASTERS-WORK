@@ -342,6 +342,13 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
     qi_by_qid = qi_small.set_index("_key", drop=False)
     im_by_iid = img_meta.set_index(im_iid, drop=False)
 
+    # Per-step skip counters + first-failure printouts for diagnosis
+    skip_reasons: Dict[str, int] = {
+        "qi_lookup": 0, "img_meta": 0, "img_file": 0,
+        "scene_graph": 0, "qa": 0, "no_objects": 0,
+    }
+    first_examples: Dict[str, str] = {}
+
     samples: List[Dict[str, Any]] = []
     for idx, q_row in q_head.iterrows():
         if len(samples) >= n:
@@ -350,50 +357,60 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
         subject = _prefix(q_row[q_pat])
         study = _study_prefix(q_row[q_stud])
         question_id = q_row[q_qid]
-
-        # Look up by composite key — question_id alone isn't unique
         composite = q_row["_key"]
+
         try:
             qi_match = qi_by_qid.loc[[composite]]
         except (KeyError, TypeError):
+            skip_reasons["qi_lookup"] += 1
+            first_examples.setdefault("qi_lookup", f"key={composite!r}")
             continue
         if len(qi_match) == 0:
+            skip_reasons["qi_lookup"] += 1
             continue
         image_id = qi_match.iloc[0][qi_iid]
 
-        # Image metadata for dims
         try:
             ir_row = im_by_iid.loc[image_id]
             if hasattr(ir_row, "iloc"):
                 ir_row = ir_row.iloc[0]
         except (KeyError, TypeError):
+            skip_reasons["img_meta"] += 1
+            first_examples.setdefault("img_meta", f"image_id={image_id!r}")
             continue
 
         iw = int(ir_row[im_w_col]) if im_w_col else 0
         ih = int(ir_row[im_h_col]) if im_h_col else 0
         image_id = str(image_id)
 
-        # Resolve image path on disk
         p1x = subject[:3]
         img_path = jpg_root / p1x / subject / study / f"{image_id}.jpg"
         if not img_path.exists():
+            skip_reasons["img_file"] += 1
+            first_examples.setdefault("img_file", str(img_path))
             continue
 
-        # If we don't have dims from metadata, read them off the file
         if iw == 0 or ih == 0:
             with Image.open(img_path) as im:
                 iw, ih = im.size
 
         sg = load_scene_graph(qba_root, subject, study)
         if sg is None:
+            skip_reasons["scene_graph"] += 1
+            sg_path = qba_root / "scene_data" / p1x / subject / f"{study}.scene_graph.json"
+            first_examples.setdefault("scene_graph", str(sg_path))
             continue
+
         qa = load_qa(qba_root, subject, study, question_id)
         if qa is None:
+            skip_reasons["qa"] += 1
+            first_examples.setdefault("qa", f"qid={question_id!r} study={study}")
             continue
 
         sg_dict = sg_to_model_dict(sg, image_id, iw, ih)
         if sg_dict["num_objects"] == 0:
-            # Need at least one object for the encoder
+            skip_reasons["no_objects"] += 1
+            first_examples.setdefault("no_objects", f"image_id={image_id} (no bboxes for this image)")
             continue
 
         ans_text = format_answer(qa, image_id, iw, ih)
@@ -418,6 +435,11 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
 
     if len(samples) < n:
         print(f"\n⚠ only found {len(samples)}/{n} samples with full metadata + image + scene graph")
+        print(f"[skips] candidates iterated: {len(q_head)}")
+        for reason, count in skip_reasons.items():
+            if count > 0:
+                ex = first_examples.get(reason, "")
+                print(f"  - {reason:14s}: {count:>4d}   first ex: {ex}")
     return samples
 
 
