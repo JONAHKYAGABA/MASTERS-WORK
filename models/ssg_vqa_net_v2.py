@@ -1281,6 +1281,7 @@ class SSGVQANetV2(nn.Module):
             )
             lm_loss = outputs.loss
             last_hidden = outputs.hidden_states[-1]  # (B, L, D)
+            last_hidden_mask = proc_inputs.get("attention_mask")  # matches prompt length
             generated_ids = proc_inputs["input_ids"]
             generated_text = None
 
@@ -1354,13 +1355,22 @@ class SSGVQANetV2(nn.Module):
                     return_dict=True,
                 )
             last_hidden = fwd.hidden_states[-1]
+            # Use the mask we built for generated_ids — NOT proc_inputs'
+            # attention_mask, which describes the original prompt length and
+            # would broadcast-mismatch against last_hidden.
+            last_hidden_mask = attn_mask
             lm_loss = None
 
         # ---- 6. Pool hidden states for aux heads & grounding -----------------
+        # Each branch above set `last_hidden_mask` to the mask that matches
+        # `last_hidden`'s sequence dimension. Don't fall back to
+        # proc_inputs.attention_mask here — that's only correct in the
+        # training branch, and using it in inference (where last_hidden
+        # corresponds to generated_ids, not the prompt) crashes with a
+        # broadcast mismatch.
         if last_hidden is not None:
-            attn_mask = proc_inputs.get("attention_mask")
-            if attn_mask is not None:
-                mask = attn_mask.unsqueeze(-1).to(last_hidden.dtype)
+            if last_hidden_mask is not None and last_hidden_mask.shape[1] == last_hidden.shape[1]:
+                mask = last_hidden_mask.unsqueeze(-1).to(last_hidden.dtype)
                 pooled = (last_hidden * mask).sum(1) / mask.sum(1).clamp(min=1)
             else:
                 pooled = last_hidden.mean(1)
