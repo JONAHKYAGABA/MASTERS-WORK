@@ -295,13 +295,23 @@ class SceneGraphEncoderV2(nn.Module):
         n_max = max(n_max, 1)
         B = len(scene_graphs)
 
-        # Allocate with padding indices
+        # Pick a float dtype that matches this encoder's own parameters so
+        # subsequent F.linear / F.matmul calls don't hit "Float vs Half"
+        # mismatches. When the trainer casts the SG encoder to fp16 (Turing)
+        # or bf16 (Ampere+), bbox_feats must follow.
+        try:
+            pdtype = next(self.bbox_proj.parameters()).dtype
+        except StopIteration:
+            pdtype = torch.float32
+
+        # Allocate with padding indices (longs stay long for embedding lookup,
+        # floats use pdtype so they survive the linear projections).
         region_ids = torch.full((B, n_max), self.num_regions, dtype=torch.long, device=device)
         entity_ids = torch.full((B, n_max), self.num_entities, dtype=torch.long, device=device)
         pos_ids = torch.full((B, n_max), 2, dtype=torch.long, device=device)
-        bbox_feats = torch.zeros(B, n_max, 8, device=device)
-        node_mask = torch.zeros(B, n_max, device=device)
-        relations = torch.zeros(B, n_max, n_max, self.num_relations, device=device)
+        bbox_feats = torch.zeros(B, n_max, 8, device=device, dtype=pdtype)
+        node_mask = torch.zeros(B, n_max, device=device, dtype=pdtype)
+        relations = torch.zeros(B, n_max, n_max, self.num_relations, device=device, dtype=pdtype)
 
         for b, sg in enumerate(scene_graphs):
             n = int(sg.get("num_objects", 0))
@@ -309,7 +319,9 @@ class SceneGraphEncoderV2(nn.Module):
                 continue
             n = min(n, n_max)
 
-            bboxes = torch.as_tensor(sg["bboxes"][:n], dtype=torch.float, device=device)
+            # Build bboxes in pdtype so the downstream stack/store matches
+            # bbox_feats' dtype without an implicit copy at assignment time.
+            bboxes = torch.as_tensor(sg["bboxes"][:n], dtype=pdtype, device=device)
             x1, y1, x2, y2 = bboxes[:, 0], bboxes[:, 1], bboxes[:, 2], bboxes[:, 3]
             w = (x2 - x1).clamp(min=1e-6)
             h = (y2 - y1).clamp(min=1e-6)
@@ -327,7 +339,7 @@ class SceneGraphEncoderV2(nn.Module):
                 pos_ids[b, :n] = p.clamp(max=2)
 
             if "relations" in sg and sg["relations"] is not None:
-                rel = torch.as_tensor(sg["relations"], dtype=torch.float, device=device)
+                rel = torch.as_tensor(sg["relations"], dtype=pdtype, device=device)
                 # rel might be (N, N, R) — crop to n
                 relations[b, :n, :n, :] = rel[:n, :n, : self.num_relations]
 
