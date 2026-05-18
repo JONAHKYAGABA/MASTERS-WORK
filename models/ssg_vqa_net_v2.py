@@ -1475,52 +1475,61 @@ class SSGVQANetV2(nn.Module):
 
     def _mask_prompt_labels(self, labels: torch.Tensor) -> torch.Tensor:
         """
-        Mask everything up to and including the LAST occurrence of the
-        '<|im_start|>assistant\\n' delimiter so LM loss is computed only on
-        the assistant turn. Uses the cached, multi-token delimiter sequence
-        (``self._assistant_delim_ids``) — the previous single-token compare
-        was broken because Qwen's BPE tokenizer splits 'assistant' into
-        multiple subtokens.
+        Mask everything up to (and including) the LAST '<|im_start|>' token,
+        leaving the assistant-role tokens + answer content as the only
+        supervised positions. Format-agnostic — doesn't depend on the exact
+        post-prefix sequence (whitespace, role spelling, BPE quirks).
 
-        Edge cases:
-          * No delimiter found in a row → mask the entire row (loss=0 for
-            that sample). Safer than training on the user prompt.
-          * Sequence shorter than delimiter → row is masked entirely.
+        Why this version: the earlier multi-token-subsequence approach
+        required '<|im_start|>assistant\\n' to tokenize identically inside
+        the chat template's rendered text vs. when tokenized in isolation.
+        When Qwen's processor disagreed by even one byte (extra space,
+        different newline), NO match was found, the row was masked
+        entirely, and CrossEntropyLoss with all -100 returned NaN.
+
+        Safety net: any row that ends up fully masked still gets its
+        last 16 tokens unmasked so the LM has something to fit and we
+        never silently NaN.
         """
-        delim = torch.as_tensor(self._assistant_delim_ids, device=labels.device)
-        K = int(delim.numel())
+        tokenizer = self.processor.tokenizer
+        im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+
         B, L = labels.shape
+        device = labels.device
 
-        if K == 0 or L < K:
-            return torch.full_like(labels, -100)
+        # Position of every <|im_start|> token per row.
+        is_marker = labels == im_start_id  # (B, L)
+        has_marker = is_marker.any(dim=-1)
 
-        # Sliding K-token window over labels, vectorised:
-        # windows: (B, L - K + 1, K) — each window is one possible match.
-        windows = labels.unfold(dimension=1, size=K, step=1)
-        # matches[b, w] = True iff windows[b, w] == delim
-        matches = (windows == delim.view(1, 1, K)).all(dim=-1)
-        # matches: (B, W) where W = L - K + 1
+        # Last True per row via reverse-argmax.
+        reversed_pos = is_marker.flip(-1).long().argmax(dim=-1)
+        last_pos = (L - 1) - reversed_pos  # (B,)
 
-        has_match = matches.any(dim=-1)  # (B,)
-
-        # Last True position per row via reverse-argmax trick
-        reversed_matches = matches.flip(-1)
-        last_match_pos = (matches.size(1) - 1) - reversed_matches.long().argmax(dim=-1)
-
-        # cut = first token AFTER the matched delimiter sequence; everything
-        # at index < cut is part of the user/system prompt → mask.
-        # Where no match, cut = L (mask the whole row).
+        # Mask everything up to AND INCLUDING the last <|im_start|> (so the
+        # role tag itself isn't a label) — then add 1 more to skip the role
+        # token that immediately follows ('assistant').
+        # Result: labels from (last_pos + 2) onward are kept as targets.
         cut = torch.where(
-            has_match,
-            last_match_pos + K,
-            torch.full_like(last_match_pos, L),
+            has_marker,
+            (last_pos + 2).clamp(max=L),
+            torch.full_like(last_pos, L),
         )
 
-        pos_idx = torch.arange(L, device=labels.device).unsqueeze(0).expand(B, -1)
+        pos_idx = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
         prompt_mask = pos_idx < cut.unsqueeze(1)
 
         masked = labels.clone()
         masked[prompt_mask] = -100
+
+        # Safety net: if a row got fully masked (e.g., no <|im_start|>
+        # found at all), restore the last 16 labels so loss isn't NaN.
+        fully_masked = (masked == -100).all(dim=-1)
+        if bool(fully_masked.any().item()):
+            for b in range(B):
+                if bool(fully_masked[b].item()):
+                    keep_n = min(16, L)
+                    masked[b, -keep_n:] = labels[b, -keep_n:]
+
         return masked
 
     # ----------------------------------------------------------------------
