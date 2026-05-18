@@ -104,7 +104,8 @@ print(f"torch={torch.__version__} cuda_build={torch.version.cuda} avail={torch.c
         "safetensors>=0.4" \
         "sentencepiece>=0.1.99" \
         "tokenizers>=0.20" \
-        "pillow>=10" "pyyaml>=6"
+        "pillow>=10" "pyyaml>=6" \
+        "jinja2>=3.1.0"   # transformers' apply_chat_template needs 3.1+
     ok "deps installed"
 else
     warn "[2/4] Skipping pip install (SKIP_DEPS=1)"
