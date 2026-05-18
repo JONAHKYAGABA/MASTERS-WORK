@@ -1112,19 +1112,28 @@ class SSGVQANetV2(nn.Module):
         """
         Extract Qwen ViT features and run the SG generator.
 
-        Returns ``(raw_outputs, sg_dicts)`` — the raw outputs (RPN logits +
-        bbox preds + entity/region logits + relationship logits) are required
-        by ``MultiTaskLoss._compute_scene_graph_loss`` in ``sg_only`` mode;
-        the dicts are what ``SceneGraphEncoderV2`` consumes for the soft
-        token path.
+        Returns ``(raw_outputs, sg_dicts)`` — raw outputs are required by
+        ``MultiTaskLoss._compute_scene_graph_loss`` in ``sg_only`` mode;
+        the dicts feed ``SceneGraphEncoderV2``.
 
-        ``ctx`` follows ``self.freeze_sg_generator`` so this method can also
-        be used in Stage 1 with grads enabled.
+        IMPORTANT: when the SG generator is frozen we force it into eval()
+        for the forward, regardless of whether model.train() was called on
+        the outer module. The generator contains BatchNorm2d layers which
+        produce NaN in fp16 with batch_size=1 (0 variance → div by ~sqrt(eps)
+        → blow-up → NaN propagates through SG tokens into Qwen → lm_loss
+        nan). Eval mode uses the running stats (initially mean=0/var=1) and
+        sidesteps the batch-stat path entirely.
         """
         feature_maps = self._extract_qwen_vit_feature_maps(pixel_values, image_grid_thw)
         ctx = torch.no_grad() if self.freeze_sg_generator else torch.enable_grad()
-        with ctx:
-            sg_raw = self.sg_generator(feature_maps)
+        prev_mode = self.sg_generator.training
+        if self.freeze_sg_generator:
+            self.sg_generator.eval()
+        try:
+            with ctx:
+                sg_raw = self.sg_generator(feature_maps)
+        finally:
+            self.sg_generator.train(prev_mode)
         return sg_raw, self._sg_outputs_to_dicts(sg_raw)
 
     # ----------------------------------------------------------------------
@@ -1168,6 +1177,17 @@ class SSGVQANetV2(nn.Module):
 
         # First occurrence index per (b, k); argmax returns first True
         positions = matches.long().argmax(dim=-1)             # (B, K)
+
+        # NaN guard: if upstream (SG encoder/projector/mHC) produced NaN
+        # in any soft token, replace with zeros. Otherwise the NaN poisons
+        # Qwen's inputs_embeds and lm_loss returns nan with no diagnosis.
+        if torch.isnan(sg_tokens).any() or torch.isinf(sg_tokens).any():
+            warnings.warn(
+                "_inject_sg_tokens: NaN/Inf detected in sg_tokens; "
+                "replacing with zeros. Inspect SG encoder/projector init.",
+                RuntimeWarning,
+            )
+            sg_tokens = torch.nan_to_num(sg_tokens, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Scatter SG tokens into the matched positions (advanced indexing)
         out = inputs_embeds.clone()
