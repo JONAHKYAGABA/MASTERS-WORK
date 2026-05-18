@@ -50,16 +50,40 @@ def load_paths() -> Dict[str, str]:
 
 
 def _read_metadata_table(path_no_ext: Path):
-    """Read either .parquet or .csv.gz, whichever exists."""
+    """Read either .parquet or .csv.gz, whichever exists. Always reset_index
+    so index columns (patient_id, study_id, ...) become regular columns."""
     import pandas as pd
     parquet = path_no_ext.with_suffix(".parquet")
     if parquet.exists():
-        return pd.read_parquet(parquet)
-    csv = path_no_ext.with_suffix(".csv.gz")
-    if csv.exists():
-        return pd.read_csv(csv)
-    raise FileNotFoundError(
-        f"Neither {parquet} nor {csv} found. Did the QBA download finish?"
+        df = pd.read_parquet(parquet)
+    else:
+        csv = path_no_ext.with_suffix(".csv.gz")
+        if not csv.exists():
+            raise FileNotFoundError(
+                f"Neither {parquet} nor {csv} found. Did the QBA download finish?"
+            )
+        df = pd.read_csv(csv)
+    # Promote any index columns to regular columns so our column lookups work
+    if df.index.name is not None or isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index()
+    return df
+
+
+def _find_col(df, *candidates: str) -> str:
+    """Return the first column name from `candidates` that exists in df.
+    Handles QBA's mixed naming: bare ('patient_id'), prefixed
+    ('question.patient_id'), or aliases ('subject_id')."""
+    cols = set(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+        # Also try with common prefixes
+        for prefix in ("question.", "image.", "answer.", "study."):
+            if (prefix + c) in cols:
+                return prefix + c
+    raise KeyError(
+        f"None of {candidates} (or prefixed variants) found in columns. "
+        f"Available: {sorted(cols)[:20]}..."
     )
 
 
@@ -249,37 +273,64 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
 
     if verbose:
         print(f"q_meta rows : {len(q_meta):>10,}  cols: {list(q_meta.columns)[:6]}...")
-        print(f"qi_meta rows: {len(qi_meta):>10,}")
-        print(f"img_meta rows: {len(img_meta):>10,}")
+        print(f"qi_meta rows: {len(qi_meta):>10,}  cols: {list(qi_meta.columns)[:6]}...")
+        print(f"img_meta rows: {len(img_meta):>10,}  cols: {list(img_meta.columns)[:6]}...")
+
+    # Resolve column names once (QBA uses patient_id, sometimes prefixed)
+    q_pat  = _find_col(q_meta,  "patient_id", "subject_id")
+    q_stud = _find_col(q_meta,  "study_id")
+    q_qid  = _find_col(q_meta,  "question_id")
+    qi_qid = _find_col(qi_meta, "question_id")
+    qi_iid = _find_col(qi_meta, "image_id", "dicom_id")
+    im_iid = _find_col(img_meta, "image_id", "dicom_id")
+    # Optional image-dim columns (different QBA versions name them differently)
+    try:
+        im_w_col = _find_col(img_meta, "image_width", "size_x", "Columns", "cols")
+    except KeyError:
+        im_w_col = None
+    try:
+        im_h_col = _find_col(img_meta, "image_height", "size_y", "Rows", "rows")
+    except KeyError:
+        im_h_col = None
+
+    if verbose:
+        print(f"\n[cols] q_meta: pat={q_pat!r}  stud={q_stud!r}  qid={q_qid!r}")
+        print(f"[cols] qi_meta: qid={qi_qid!r}  iid={qi_iid!r}")
+        print(f"[cols] img_meta: iid={im_iid!r}  w={im_w_col!r}  h={im_h_col!r}\n")
+
+    # Pre-index qi_meta and img_meta for fast lookup (70M rows otherwise hurts)
+    qi_by_qid = qi_meta.set_index(qi_qid, drop=False)
+    im_by_iid = img_meta.set_index(im_iid, drop=False)
 
     samples: List[Dict[str, Any]] = []
     for idx, q_row in q_meta.iterrows():
         if len(samples) >= n:
             break
 
-        subject = _prefix(q_row["subject_id"])
-        study = _study_prefix(q_row["study_id"])
-        question_id = q_row["question_id"]
+        subject = _prefix(q_row[q_pat])
+        study = _study_prefix(q_row[q_stud])
+        question_id = q_row[q_qid]
 
-        # Find an image for this question
-        qi = qi_meta[qi_meta["question_id"] == question_id]
-        if len(qi) == 0:
-            continue
-        image_id = str(qi.iloc[0]["image_id"])
-
-        ir = img_meta[img_meta["image_id"] == int(image_id) if str(image_id).isdigit() else image_id]
-        # Fallback: try string match
-        if len(ir) == 0:
-            ir = img_meta[img_meta["image_id"].astype(str) == image_id]
-        if len(ir) == 0:
-            continue
-
-        # Image dims
+        # Find an image for this question (fast lookup via pre-built index)
         try:
-            iw = int(ir.iloc[0].get("image_width", 0)) or int(ir.iloc[0].get("size_x", 0))
-            ih = int(ir.iloc[0].get("image_height", 0)) or int(ir.iloc[0].get("size_y", 0))
-        except Exception:
-            iw, ih = 0, 0
+            qi_match = qi_by_qid.loc[[question_id]]
+        except (KeyError, TypeError):
+            continue
+        if isinstance(qi_match, type(q_meta)) is False or len(qi_match) == 0:
+            continue
+        image_id = qi_match.iloc[0][qi_iid]
+
+        # Image metadata for dims
+        try:
+            ir_row = im_by_iid.loc[image_id]
+            if hasattr(ir_row, "iloc"):
+                ir_row = ir_row.iloc[0]
+        except (KeyError, TypeError):
+            continue
+
+        iw = int(ir_row[im_w_col]) if im_w_col else 0
+        ih = int(ir_row[im_h_col]) if im_h_col else 0
+        image_id = str(image_id)
 
         # Resolve image path on disk
         p1x = subject[:3]
