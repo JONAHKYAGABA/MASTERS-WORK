@@ -298,41 +298,48 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
         print(f"[cols] qi_meta: qid={qi_qid!r}  iid={qi_iid!r}")
         print(f"[cols] img_meta: iid={im_iid!r}  w={im_w_col!r}  h={im_h_col!r}\n")
 
-    # qi_meta has 70M rows — indexing the whole thing takes minutes and GBs
-    # of RAM. Instead, take a small head of q_meta first, then merge with
-    # qi_meta on question_id. We oversample to leave headroom for skips.
+    # ------------------------------------------------------------------
+    # IMPORTANT: QBA's `question_id` is NOT unique — it's a template name
+    # like 'B09_describe_abnormal_subcat_007' reused across every study.
+    # The unique key for a question is the TRIPLE (patient_id, study_id,
+    # question_id). Joining on question_id alone produced a 28M-row
+    # cross-product. Build a composite key instead.
+    # ------------------------------------------------------------------
     head_size = max(n * 50, 50)
     q_head = q_meta.head(head_size).reset_index(drop=True)
-    if verbose:
-        print(f"[trim] candidate questions: {len(q_head)} "
-              f"(oversampling {head_size} to find {n} valid)")
+    print(f"[trim] candidate questions: {len(q_head)} "
+          f"(oversampling {head_size} to find {n} valid)")
 
-    # Diagnostic: confirm the join key actually looks sane on both sides
-    qh_uniq = q_head[q_qid].nunique()
-    print(f"[diag] q_head[{q_qid}] dtype={q_head[q_qid].dtype}  "
-          f"unique={qh_uniq}/{len(q_head)}  sample={q_head[q_qid].iloc[0]!r}")
-    print(f"[diag] qi_meta[{qi_qid}] dtype={qi_meta[qi_qid].dtype}  "
-          f"sample={qi_meta[qi_qid].iloc[0]!r}")
+    qi_pat = _find_col(qi_meta, "patient_id", "subject_id")
+    qi_stud = _find_col(qi_meta, "study_id")
 
-    # Force-align dtypes via string conversion before merging. If the parquet
-    # types disagreed (int64 vs object) isin / merge silently produced
-    # cartesian-product-sized results.
-    print(f"[trim] merging q_head ({len(q_head):,} rows) with qi_meta "
-          f"({len(qi_meta):,} rows) on {qi_qid} ...")
+    # Step 1: filter qi_meta by study_id only (cheap, removes ~99.9% of rows)
+    study_ids = set(q_head[q_stud].astype(str).tolist())
+    print(f"[trim] filtering qi_meta (70M rows) to {len(study_ids)} candidate studies ...")
     t = time.time()
-    q_head["_join_qid"] = q_head[q_qid].astype(str)
-    qi_keys = qi_meta[qi_qid].astype(str)
-    qi_small = qi_meta[qi_keys.isin(set(q_head["_join_qid"]))].copy()
-    qi_small["_join_qid"] = qi_small[qi_qid].astype(str)
-    print(f"[trim] qi_small: {len(qi_small):,} rows in {time.time()-t:.1f}s")
+    qi_by_study_mask = qi_meta[qi_stud].astype(str).isin(study_ids)
+    qi_subset = qi_meta[qi_by_study_mask].copy()
+    print(f"[trim] after study filter: {len(qi_subset):,} rows in {time.time()-t:.1f}s")
 
-    # Sanity: each candidate question should map to ~1-3 images, not millions
+    # Step 2: build the unique (patient|study|question) composite key on both sides
+    def _make_key(df, pat_col, stud_col, qid_col):
+        return (df[pat_col].astype(str) + "|"
+                + df[stud_col].astype(str) + "|"
+                + df[qid_col].astype(str))
+
+    q_head["_key"] = _make_key(q_head, q_pat, q_stud, q_qid)
+    qi_subset["_key"] = _make_key(qi_subset, qi_pat, qi_stud, qi_qid)
+
+    # Step 3: filter again on the composite key — now precise
+    qi_small = qi_subset[qi_subset["_key"].isin(set(q_head["_key"]))].copy()
+    print(f"[trim] after composite-key filter: {len(qi_small):,} rows")
+    if len(qi_small) == 0:
+        print("✗ no qi_meta rows matched the composite key — verify column names match across files")
+        return []
     if len(qi_small) > len(q_head) * 20:
-        print(f"⚠ qi_small has {len(qi_small)/len(q_head):.0f}× more rows than "
-              f"candidates — join key may still be off; results may be wrong")
+        print(f"⚠ {len(qi_small)/len(q_head):.0f}× qi rows per question — still suspect")
 
-    # Build small in-memory indexes
-    qi_by_qid = qi_small.set_index("_join_qid", drop=False)
+    qi_by_qid = qi_small.set_index("_key", drop=False)
     im_by_iid = img_meta.set_index(im_iid, drop=False)
 
     samples: List[Dict[str, Any]] = []
@@ -344,9 +351,10 @@ def pick_real_samples(paths: Dict[str, str], n: int, verbose: bool = True) -> Li
         study = _study_prefix(q_row[q_stud])
         question_id = q_row[q_qid]
 
-        # Find an image for this question — use the string-cast join key
+        # Look up by composite key — question_id alone isn't unique
+        composite = q_row["_key"]
         try:
-            qi_match = qi_by_qid.loc[[str(question_id)]]
+            qi_match = qi_by_qid.loc[[composite]]
         except (KeyError, TypeError):
             continue
         if len(qi_match) == 0:
