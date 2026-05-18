@@ -1631,13 +1631,25 @@ class SSGVQANetV2(nn.Module):
 
 
 def sinkhorn_knopp(x: torch.Tensor, t_max: int = 20, eps: float = 1e-8) -> torch.Tensor:
-    """Sinkhorn-Knopp projection onto the Birkhoff polytope (mHC paper Eq. 8-9)."""
+    """
+    Sinkhorn-Knopp projection onto the Birkhoff polytope (mHC paper Eq. 8-9).
+
+    NumericaI safety: the iteration uses `torch.exp` followed by
+    repeated divisions, both of which underflow/overflow easily in fp16 —
+    one of the smoke-test GPUs hit `nan` loss because `exp()` returned 0
+    everywhere and the subsequent division produced inf. We compute the
+    whole projection in fp32 and cast the result back to the caller's
+    dtype. The cost is a few KB of intermediate fp32 storage; the gain is
+    fp16/bf16 training stability.
+    """
+    orig_dtype = x.dtype
+    x = x.float()
     x_pos = torch.exp(x - x.max(dim=-1, keepdim=True)[0])
     for _ in range(t_max):
         x_pos = x_pos / (x_pos.sum(dim=-1, keepdim=True) + eps)
         if x_pos.dim() >= 2:
             x_pos = x_pos / (x_pos.sum(dim=-2, keepdim=True) + eps)
-    return x_pos
+    return x_pos.to(dtype=orig_dtype)
 
 
 class RMSNorm(nn.Module):
