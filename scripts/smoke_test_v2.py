@@ -98,6 +98,13 @@ def _run_one_gpu(
         return False
 
     # ---- 1. Build model -------------------------------------------------
+    # Deterministic init across GPUs and reruns. Random init is the difference
+    # between "this GPU passed" and "this GPU NaN'd" when modules are fp16-
+    # fragile — seeding makes results reproducible and bugs falsifiable.
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     t0 = time.time()
     try:
         model = SSGVQANetV2(

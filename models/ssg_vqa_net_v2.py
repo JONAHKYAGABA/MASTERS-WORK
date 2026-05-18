@@ -854,10 +854,32 @@ class SSGVQANetV2(nn.Module):
         )
 
         # ---- 5. Grounding refinement head -----------------------------------
+        # mHC (Manifold-Constrained Hyper-Connections) does its math in
+        # fp16/bf16, but the Birkhoff/Sinkhorn path + RMSNorm divisions
+        # are numerically fragile in fp16 (exp/division underflow → nan).
+        # On Turing-class GPUs (cc<8.0, no native bf16) we force-disable
+        # mHC to keep training stable. This costs the manifold-constrained
+        # fusion property but is the right tradeoff: a working baseline
+        # beats a "richer" model that NaNs in step 1.
+        _effective_use_mhc = use_mhc_in_grounding
+        if use_mhc_in_grounding and torch_dtype == torch.float16:
+            try:
+                _major, _ = torch.cuda.get_device_capability()
+            except Exception:
+                _major = 0
+            if _major < 8:
+                warnings.warn(
+                    "mHC disabled on Turing GPU (cc<8.0) — Birkhoff/Sinkhorn "
+                    "is unstable in fp16. Re-enable with use_mhc_in_grounding"
+                    "=True only on Ampere+ (bf16-capable).",
+                    RuntimeWarning,
+                )
+                _effective_use_mhc = False
+
         self.grounding_head = GroundingRefinementHead(
             d_llm=self.d_llm,
             d_sg=sg_node_dim,
-            use_mhc=use_mhc_in_grounding,
+            use_mhc=_effective_use_mhc,
             mhc_manifold=mhc_manifold,
         )
 
