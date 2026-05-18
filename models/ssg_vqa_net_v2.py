@@ -497,6 +497,19 @@ class GroundingRefinementHead(nn.Module):
         B = llm_hidden.size(0)
         device = llm_hidden.device
 
+        # Defensive dtype alignment: callers (the main forward + the SG
+        # encoder) may hand us tensors in fp32 even when this head's
+        # weights got cast to fp16/bf16 by the trainer. Without this, the
+        # first F.linear errors with "Float vs Half".
+        try:
+            pdtype = next(self.llm_proj.parameters()).dtype
+        except StopIteration:
+            pdtype = llm_hidden.dtype
+        if llm_hidden.dtype != pdtype:
+            llm_hidden = llm_hidden.to(dtype=pdtype)
+        if sg_features.dtype != pdtype:
+            sg_features = sg_features.to(dtype=pdtype)
+
         q = self.llm_proj(llm_hidden).unsqueeze(1)   # (B, 1, d_hidden)
         kv = self.sg_proj(sg_features)                # (B, N, d_hidden)
 
@@ -566,6 +579,14 @@ class AuxiliaryHeads(nn.Module):
         self.severity = mlp(num_severity, d_mid=128)
 
     def forward(self, pooled: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        # Same defensive cast as GroundingRefinementHead: callers may hand us
+        # fp32 even when our weights are fp16/bf16.
+        try:
+            pdtype = next(self.chexpert.parameters()).dtype
+        except StopIteration:
+            pdtype = pooled.dtype
+        if pooled.dtype != pdtype:
+            pooled = pooled.to(dtype=pdtype)
         chexpert_logits = self.chexpert(pooled)
         vqa_logits = {
             "binary": self.binary(pooled),
