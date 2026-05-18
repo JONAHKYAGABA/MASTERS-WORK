@@ -776,20 +776,18 @@ class SSGVQANetV2(nn.Module):
 
         # ---- 4. Scene graph pipeline -----------------------------------------
         if scene_graph_generator is None:
-            # Discover Qwen ViT hidden size so the SG generator's RPN conv
-            # accepts ViT feature maps directly (1280 for Qwen2.5-VL-7B/3B).
-            base = (
-                self.qwen.get_base_model()
-                if hasattr(self.qwen, "get_base_model")
-                else self.qwen
-            )
-            vit_cfg = getattr(base.config, "vision_config", None)
-            vit_hidden = (
-                int(vit_cfg.hidden_size) if vit_cfg is not None and hasattr(vit_cfg, "hidden_size")
-                else 1280
-            )
+            # IMPORTANT: Qwen2.5-VL's `base.visual(...)` returns features
+            # AFTER the PatchMerger, which projects raw ViT hidden (1280) up
+            # to the LLM hidden dim (2048 for 3B, 3584 for 7B). The earlier
+            # version used vision_config.hidden_size (1280) here and crashed
+            # with "expected 1280 channels, got 2048" because the actual
+            # feature maps had been merged.
+            #
+            # Using self.d_llm matches what _extract_qwen_vit_feature_maps
+            # actually returns. If you ever change the extraction to bypass
+            # the merger (return raw ViT features), revert this to vit_hidden.
             self.sg_generator = SceneGraphGenerator(
-                visual_dim=vit_hidden,
+                visual_dim=self.d_llm,
                 hidden_size=768,
                 num_entity_classes=num_entities,
                 num_region_classes=num_regions,
