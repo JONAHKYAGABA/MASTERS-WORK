@@ -524,10 +524,16 @@ class GroundingRefinementHead(nn.Module):
         if self.mhc is not None:
             fused = self.mhc(fused.unsqueeze(1)).squeeze(1)
 
-        # Initial bbox: if not provided, use a learned center anchor
+        # Initial bbox: if not provided, use a learned center anchor.
+        # Must match this head's pdtype so torch.cat below doesn't upcast
+        # the whole concat to fp32 and then mismatch delta_head's fp16 weights.
         if init_bbox is None:
-            init_bbox = torch.tensor([0.25, 0.25, 0.75, 0.75], device=device)
+            init_bbox = torch.tensor(
+                [0.25, 0.25, 0.75, 0.75], device=device, dtype=pdtype,
+            )
             init_bbox = init_bbox.unsqueeze(0).expand(B, -1)
+        elif init_bbox.dtype != pdtype:
+            init_bbox = init_bbox.to(dtype=pdtype)
 
         delta = self.delta_head(torch.cat([fused, init_bbox], dim=-1))
         refined = torch.sigmoid(init_bbox + delta * 0.3)  # bounded delta
