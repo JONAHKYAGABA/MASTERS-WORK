@@ -45,6 +45,62 @@ def load_paths() -> Dict[str, str]:
         return yaml.safe_load(f)["data"]
 
 
+def load_metadata_csv(mimic_cxr_path: Path) -> Optional[Any]:
+    """Load mimic-cxr-2.0.0-metadata.csv.gz (dicom_id → ViewPosition).
+    Returns None if not on disk — script just falls back to no view encoding."""
+    import pandas as pd
+    for name in ("mimic-cxr-2.0.0-metadata.csv.gz", "mimic-cxr-2.0.0-metadata.csv"):
+        p = mimic_cxr_path / name
+        if p.exists():
+            df = pd.read_csv(
+                p,
+                compression="gzip" if name.endswith(".gz") else None,
+                usecols=["dicom_id", "ViewPosition"],
+            )
+            df["dicom_id"] = df["dicom_id"].astype(str)
+            return df.set_index("dicom_id")["ViewPosition"].to_dict()
+    return None
+
+
+def load_chexpert_csv(mimic_cxr_path: Path) -> Optional[Any]:
+    """Load mimic-cxr-2.0.0-chexpert.csv.gz (subject_id, study_id → 14 labels).
+    Returns dict keyed by (subject_id, study_id) → (labels, mask) tuples."""
+    import pandas as pd
+    import numpy as np
+    for name in ("mimic-cxr-2.0.0-chexpert.csv.gz", "mimic-cxr-2.0.0-chexpert.csv"):
+        p = mimic_cxr_path / name
+        if not p.exists():
+            continue
+        df = pd.read_csv(p, compression="gzip" if name.endswith(".gz") else None)
+        label_cols = [c for c in df.columns if c not in ("subject_id", "study_id")]
+        out: Dict[Tuple[int, int], Tuple[Any, Any]] = {}
+        for _, row in df.iterrows():
+            sid, stid = int(row["subject_id"]), int(row["study_id"])
+            raw = row[label_cols].values.astype(float)
+            # CheXpert: 1.0 positive, 0.0 negative, -1.0 uncertain, NaN missing
+            # For simplicity: treat uncertain + NaN as masked-out (mask=0)
+            labels = np.where(raw == 1.0, 1.0, 0.0).astype(np.float32)
+            mask = np.where((raw == 1.0) | (raw == 0.0), 1.0, 0.0).astype(np.float32)
+            out[(sid, stid)] = (labels, mask)
+        return out
+    return None
+
+
+VIEW_TO_ONEHOT = {
+    "PA": [1.0, 0.0, 0.0, 0.0],
+    "AP": [0.0, 1.0, 0.0, 0.0],
+    "LATERAL": [0.0, 0.0, 1.0, 0.0],
+    "LL": [0.0, 0.0, 1.0, 0.0],
+}
+DEFAULT_VIEW_ONEHOT = [0.0, 0.0, 0.0, 1.0]   # OTHER
+
+
+def view_to_onehot(view: Optional[str]) -> List[float]:
+    if view is None or not isinstance(view, str):
+        return DEFAULT_VIEW_ONEHOT[:]
+    return VIEW_TO_ONEHOT.get(view.upper(), DEFAULT_VIEW_ONEHOT[:])
+
+
 # ---------------------------------------------------------------------------
 # Sample loader — mirrors prebuild_cache.py:_map_qa_file
 # ---------------------------------------------------------------------------
@@ -285,7 +341,16 @@ def main(argv=None) -> int:
     mimic_cxr = Path(paths["mimic_cxr_jpg_path"])
     qa_root = Path(paths["mimic_ext_cxr_qba_path"])
     print(f"MIMIC-CXR-JPG : {mimic_cxr}")
-    print(f"QBA           : {qa_root}\n")
+    print(f"QBA           : {qa_root}")
+
+    # Load the optional CSVs — script still works if any are missing.
+    view_map = load_metadata_csv(mimic_cxr)
+    chexpert_map = load_chexpert_csv(mimic_cxr)
+    print(f"[csv] view (metadata)  : {'loaded' if view_map else 'MISSING'} "
+          f"({len(view_map) if view_map else 0} rows)")
+    print(f"[csv] chexpert         : {'loaded' if chexpert_map else 'MISSING'} "
+          f"({len(chexpert_map) if chexpert_map else 0} rows)")
+    print()
 
     samples = collect_samples(mimic_cxr, qa_root, args.n, max_visit=args.max_visit)
     if not samples:
@@ -303,8 +368,12 @@ def main(argv=None) -> int:
     # and what every reasonable training config uses. Bbox normalization
     # already happened against the original dims so the gt stays correct.
     from PIL import Image
+    import numpy as np
     MAX_SIDE = int(args.max_side)
     pil_images, questions, answer_texts, scene_graphs, gt_bboxes = [], [], [], [], []
+    view_onehots: List[List[float]] = []
+    chexpert_labels: List[List[float]] = []
+    chexpert_masks: List[List[float]] = []
     for s in samples:
         pil = Image.open(s["image_path"]).convert("RGB")
         iw, ih = pil.size
@@ -324,8 +393,25 @@ def main(argv=None) -> int:
         answer_texts.append(ans_text)
         scene_graphs.append(sg_dict)
         gt_bboxes.append(gt_bbox)
+
+        # View one-hot from the metadata CSV (if loaded). Falls back to OTHER.
+        view = view_map.get(s["dicom_id"]) if view_map else None
+        view_onehots.append(view_to_onehot(view))
+
+        # CheXpert labels keyed by (subject_id, study_id). Zeros if missing.
+        if chexpert_map and (s["subject_id"], s["study_id"]) in chexpert_map:
+            lbls, msk = chexpert_map[(s["subject_id"], s["study_id"])]
+            chexpert_labels.append(lbls.tolist())
+            chexpert_masks.append(msk.tolist())
+            chex_status = f"chex_pos={int(lbls.sum())}/14"
+        else:
+            chexpert_labels.append([0.0] * 14)
+            chexpert_masks.append([0.0] * 14)
+            chex_status = "chex=missing"
+
         print(f"  → orig={iw}x{ih} resized={pil_small.size[0]}x{pil_small.size[1]}  "
-              f"sg_objects={sg_dict['num_objects']}  bbox_gt={[round(b,3) for b in gt_bbox]}")
+              f"sg_objects={sg_dict['num_objects']}  view={view or 'UNK'}  {chex_status}  "
+              f"bbox_gt={[round(b,3) for b in gt_bbox]}")
 
     # ---- Model setup -------------------------------------------------------
     if torch.cuda.is_available():
@@ -358,6 +444,11 @@ def main(argv=None) -> int:
     print(f"[model] built in {time.time()-t0:.1f}s")
 
     gt_bbox_t = torch.tensor(gt_bboxes, dtype=torch.float, device=device)
+    view_t = torch.tensor(view_onehots, dtype=torch.float, device=device)
+    chex_labels_t = torch.tensor(chexpert_labels, dtype=torch.float, device=device)
+    chex_mask_t = torch.tensor(chexpert_masks, dtype=torch.float, device=device)
+    print(f"\n[batch] view_encodings={view_t.shape}  chexpert_labels={chex_labels_t.shape}  "
+          f"chex_mask_total_positive={int(chex_mask_t.sum().item())}")
 
     # ---- Training step -----------------------------------------------------
     print(f"\n[train] forward + backward + step")
@@ -369,6 +460,7 @@ def main(argv=None) -> int:
             images=None, pil_images=pil_images, questions=questions,
             answer_texts=answer_texts, scene_graphs=scene_graphs,
             gt_grounding_bboxes=gt_bbox_t,
+            view_encodings=view_t,           # NEW: dataset's PA/AP/LATERAL one-hot
         )
         loss = out["lm_loss"]
         if loss is None or not torch.isfinite(loss):
@@ -393,6 +485,22 @@ def main(argv=None) -> int:
         print(f"  {i+1} pred=[{pr[0]:.3f},{pr[1]:.3f},{pr[2]:.3f},{pr[3]:.3f}]"
               f"  gt=[{gt[0]:.3f},{gt[1]:.3f},{gt[2]:.3f},{gt[3]:.3f}]")
 
+    # Verify CheXpert aux head is producing per-class logits (not zeros)
+    chex_logits = out.get("chexpert_logits")
+    if chex_logits is not None:
+        import torch.nn.functional as F
+        probs = torch.sigmoid(chex_logits.float())
+        chex_names = ["Atelec", "Cardio", "Consol", "Edema", "EnlCard",
+                      "Fract", "LungLes", "LungOp", "NoFind", "PlEff",
+                      "PlOth", "Pneum", "Pnmtrx", "SuppDev"]
+        print(f"\n[chexpert head] per-sample top-3 predicted classes "
+              f"(untrained → effectively random):")
+        for i in range(len(samples)):
+            top3 = torch.topk(probs[i], k=3)
+            picks = ", ".join(f"{chex_names[j]}({probs[i,j].item():.2f})"
+                              for j in top3.indices.tolist())
+            print(f"  {i+1}  {picks}")
+
     # ---- Generation --------------------------------------------------------
     print(f"\n[infer] generation")
     model.eval()
@@ -402,6 +510,7 @@ def main(argv=None) -> int:
             gen = model(
                 images=None, pil_images=pil_images, questions=questions,
                 scene_graphs=scene_graphs,
+                view_encodings=view_t,
             )
         print(f"  ✓ generated in {time.time()-t3:.1f}s")
         for i, t in enumerate(gen.get("generated_answer_text") or []):
