@@ -273,6 +273,10 @@ def main(argv=None) -> int:
     p.add_argument("--model_id", default="Qwen/Qwen2.5-VL-3B-Instruct")
     p.add_argument("--max_visit", type=int, default=200,
                    help="Max qa.json files to scan before giving up")
+    p.add_argument("--max_side", type=int, default=448,
+                   help="Resize MIMIC images to this short-side (default 448, "
+                        "Qwen-recommended for medical). Bump to 896 if VRAM "
+                        "permits; lower to 336 if you OOM.")
     args = p.parse_args(argv)
 
     print(f"=== SSGVQANetV2 real-data test (n={args.n}) — cache-free ===\n")
@@ -292,21 +296,36 @@ def main(argv=None) -> int:
         return 1
 
     # ---- Build v2 inputs ---------------------------------------------------
+    # IMPORTANT: MIMIC-CXR-JPG is ~2048x2500. Qwen's dynamic-resolution ViT
+    # would emit ~8K patch tokens per image, blowing past 40+ GB VRAM on the
+    # cross_entropy(logits, labels) step (logits = seq × 152K vocab in fp16).
+    # Resize to 448 short-side — Qwen's recommended size for medical imaging
+    # and what every reasonable training config uses. Bbox normalization
+    # already happened against the original dims so the gt stays correct.
     from PIL import Image
+    MAX_SIDE = int(args.max_side)
     pil_images, questions, answer_texts, scene_graphs, gt_bboxes = [], [], [], [], []
     for s in samples:
         pil = Image.open(s["image_path"]).convert("RGB")
         iw, ih = pil.size
+        # Build SG/answer using ORIGINAL dims (bboxes are normalized so resize
+        # downstream doesn't break them)
         with open(s["scene_graph_path"]) as f:
             sg_json = json.load(f)
         sg_dict = sg_to_model_dict(sg_json, s["dicom_id"], iw, ih)
         ans_text, gt_bbox = format_answer_text(s["answers"], s["dicom_id"], iw, ih)
-        pil_images.append(pil)
+
+        # Now actually resize the PIL we hand to Qwen
+        pil_small = pil.copy()
+        pil_small.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
+
+        pil_images.append(pil_small)
         questions.append(s["question"])
         answer_texts.append(ans_text)
         scene_graphs.append(sg_dict)
         gt_bboxes.append(gt_bbox)
-        print(f"  → sg_objects={sg_dict['num_objects']}  bbox_gt={gt_bbox}")
+        print(f"  → orig={iw}x{ih} resized={pil_small.size[0]}x{pil_small.size[1]}  "
+              f"sg_objects={sg_dict['num_objects']}  bbox_gt={[round(b,3) for b in gt_bbox]}")
 
     # ---- Model setup -------------------------------------------------------
     if torch.cuda.is_available():
