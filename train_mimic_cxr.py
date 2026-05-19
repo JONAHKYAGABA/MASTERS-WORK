@@ -1714,7 +1714,12 @@ def main(args):
             if is_main_process(local_rank):
                 logger.info(f"Loading checkpoint from: {ckpt_file}")
             
-            checkpoint = torch.load(ckpt_file, map_location='cpu')
+            # weights_only=False required because our checkpoint dict embeds
+            # DeepSpeed objects (DynamicLossScaler) in the optimizer state.
+            # PyTorch 2.6+ defaults to weights_only=True for security but
+            # rejects these classes by default. Our checkpoints are written
+            # by this same trainer (trusted source), so opting out is safe.
+            checkpoint = torch.load(ckpt_file, map_location='cpu', weights_only=False)
             
             # Extract model state dict (handle different checkpoint formats)
             if 'model_state_dict' in checkpoint:
