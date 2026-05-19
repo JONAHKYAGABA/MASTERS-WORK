@@ -1803,7 +1803,11 @@ def main(args):
     # 'finetune' → vqa=1.0, generation=0.8, chexpert=0.1, SG=0.05, grounding=0.2
     # 'standard' → vqa=1.0, generation=0.5, chexpert=0.3, SG=0.1, grounding=0.1
     training_mode = getattr(config.training, 'phase', 'standard').lower()
-    if training_mode not in ('pretrain', 'finetune', 'standard'):
+    # MultiTaskLoss.MODE_WEIGHTS supports all 5 curriculum phases (per PDF
+    # spec). The earlier downgrade to 'standard' silently broke sg_only
+    # (sg_weight became 0.1 instead of 1.0) — RPN/entity/region/bbox losses
+    # got 10x weaker signal than the curriculum design intended.
+    if training_mode not in ('sg_only', 'alignment', 'pretrain', 'finetune', 'rl', 'standard'):
         training_mode = 'standard'
     
     criterion = MultiTaskLoss(
