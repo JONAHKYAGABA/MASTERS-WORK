@@ -1400,6 +1400,13 @@ def main(args):
         if not args.output_dir or args.output_dir == './checkpoints/mimic-cxr-vqa':
             config.training.output_dir = os.path.join(config.training.output_dir, 'finetune')
 
+    # CLI override wins — useful when your QBA dataset doesn't have the
+    # phase-default grade (e.g. user has only B_frontal, finetune wants A).
+    if args.quality_grade:
+        old = config.data.quality_grade
+        config.data.quality_grade = args.quality_grade
+        logger.info(f"quality_grade overridden via CLI: {old} → {args.quality_grade}")
+
     
     # Enable DeepSpeed if requested and available
     use_deepspeed = args.use_deepspeed and DEEPSPEED_AVAILABLE
@@ -2286,6 +2293,11 @@ if __name__ == "__main__":
                             'transitions (e.g. Stage 1 weights → fresh Stage 2 optimizer).')
     parser.add_argument('--save_steps', type=int, default=None,
                        help='Save mid-epoch checkpoint every N steps (overrides config). 0 disables mid-epoch save')
+    parser.add_argument('--quality_grade', type=str, default=None,
+                       choices=['A', 'B', 'all'],
+                       help='Override QBA quality grade filter (A=clean, B=noisy/broad, all=no filter). '
+                            'Default per phase: pretrain→B, finetune→A. Use "all" if your QBA dataset '
+                            'lacks the auto-selected grade.')
     parser.add_argument('--qwen_model_id', type=str, default=None,
                        help='Override Qwen model id (e.g. Qwen/Qwen2.5-VL-3B-Instruct for smoke). '
                             'Default: Qwen/Qwen2.5-VL-7B-Instruct')

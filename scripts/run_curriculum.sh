@@ -194,9 +194,13 @@ if [[ "$MODE" == "smoke" ]]; then
         "--qwen_model_id $QWEN_MODEL --max_samples 50 --epochs 1 --batch_size 1 --save_steps 10 --skip_data_check --disable_wandb"
         "--qwen_model_id $QWEN_MODEL --max_samples 50 --epochs 1 --batch_size 1 --save_steps 10 --skip_data_check --disable_wandb"
         "--qwen_model_id $QWEN_MODEL --max_samples 50 --epochs 1 --batch_size 1 --save_steps 10 --skip_data_check --disable_wandb"
-        "--qwen_model_id $QWEN_MODEL --max_samples 20 --epochs 1 --batch_size 1 --save_steps 5  --skip_data_check --disable_wandb"
+        "--qwen_model_id $QWEN_MODEL --max_samples 20 --epochs 1 --batch_size 1 --save_steps 5  --skip_data_check --disable_wandb --quality_grade all"
         # NOTE: finetune uses --max_samples 20 (not 10) because the trainer
         # auto-divides val by 10 — max_samples=10 → val=1 → metric crash.
+        # NOTE: --quality_grade all on smoke because the default 'A' filter
+        # rejects ~100% of QBA samples (your dataset may not have A-grade
+        # questions, or the filter is over-strict). Real finetune should
+        # use 'A' if you have A_frontal data, else 'B' or 'all'.
         # NOTE: --disable_wandb on smoke avoids cluttering wandb with 4 tiny
         # throwaway runs per pipeline test. Full mode logs to wandb.
     )
