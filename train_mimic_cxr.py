@@ -281,7 +281,7 @@ def init_wandb(config: MIMICCXRVQAConfig) -> Optional[Any]:
     wandb_api_key = os.environ.get('WANDB_API_KEY')
     wandb_entity = os.environ.get('WANDB_ENTITY') or config.wandb.entity
     wandb_project = os.environ.get('WANDB_PROJECT') or config.wandb.project
-    
+
     # Login if API key available
     if wandb_api_key:
         try:
@@ -289,9 +289,25 @@ def init_wandb(config: MIMICCXRVQAConfig) -> Optional[Any]:
             logger.info("Wandb authentication successful")
         except Exception as e:
             logger.warning(f"Wandb login failed: {e}")
-    
+
     run_name = config.wandb.name or f"ssg-vqa-{datetime.now().strftime('%Y%m%d_%H%M')}"
-    
+
+    # ------------------------------------------------------------------
+    # Run-ID persistence for power-loss continuity.
+    # If a previous run wrote wandb_run_id.txt under output_dir, reuse that
+    # run id with resume="allow" so charts continue on the same run instead
+    # of forking a new one. New run otherwise.
+    # ------------------------------------------------------------------
+    prior_run_id = None
+    try:
+        run_id_file = Path(config.training.output_dir) / "wandb_run_id.txt"
+        if run_id_file.exists():
+            prior_run_id = run_id_file.read_text().strip() or None
+            if prior_run_id:
+                logger.info(f"Resuming wandb run id={prior_run_id}")
+    except Exception as e:
+        logger.warning(f"Could not read wandb_run_id.txt: {e}")
+
     run = wandb.init(
         project=wandb_project,
         entity=wandb_entity or None,
@@ -300,9 +316,20 @@ def init_wandb(config: MIMICCXRVQAConfig) -> Optional[Any]:
         tags=config.wandb.tags,
         notes=config.wandb.notes,
         config=config.to_dict(),
+        id=prior_run_id,
         resume="allow",
         save_code=True,
     )
+
+    # Persist the (possibly newly-assigned) run id immediately so the next
+    # crash-recovery launch can pick it up before the first checkpoint save.
+    try:
+        Path(config.training.output_dir).mkdir(parents=True, exist_ok=True)
+        (Path(config.training.output_dir) / "wandb_run_id.txt").write_text(
+            run.id + "\n"
+        )
+    except Exception as e:
+        logger.warning(f"Could not write wandb_run_id.txt: {e}")
     
     logger.info(f"Wandb run started: {wandb_project}/{run_name}")
     
@@ -330,7 +357,27 @@ def save_checkpoint(
     """Save model checkpoint."""
     checkpoint_dir = Path(config.training.output_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # Capture RNG state so resumed runs reproduce the exact data order and
+    # dropout pattern that the original run would have produced from this point.
+    # Without this, a power-loss recovery shuffles data differently and
+    # invalidates loss-curve comparisons against pre-loss training.
+    import random as _random
+    try:
+        import numpy as _np
+        numpy_rng = _np.random.get_state()
+    except ImportError:
+        numpy_rng = None
+
+    rng_state = {
+        'python': _random.getstate(),
+        'numpy': numpy_rng,
+        'torch_cpu': torch.get_rng_state(),
+        'torch_cuda': (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+    }
+
     # Save checkpoint
     checkpoint = {
         'epoch': epoch,
@@ -340,6 +387,7 @@ def save_checkpoint(
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
         'metrics': metrics,
         'config': config.to_dict(),
+        'rng_state': rng_state,
     }
     
     # Save regular checkpoint
@@ -362,7 +410,34 @@ def save_checkpoint(
         json.dump(metadata, f, indent=2)
     
     logger.info(f"Saved checkpoint to {checkpoint_path}")
-    
+
+    # ------------------------------------------------------------------
+    # Power-loss recovery: write 'latest_checkpoint.txt' pointing at this
+    # save. --auto_resume reads this on next launch and skips manual
+    # --resume_from_checkpoint. We write the *step number* not a symlink
+    # (symlinks unreliable on some FUSE-mounted GCS/NFS volumes).
+    # ------------------------------------------------------------------
+    try:
+        latest_pointer = checkpoint_dir / "latest_checkpoint.txt"
+        latest_pointer.write_text(checkpoint_path.name + "\n")
+    except OSError as e:
+        logger.warning(f"Could not update latest_checkpoint.txt: {e}")
+
+    # ------------------------------------------------------------------
+    # Persist wandb run_id alongside the checkpoint so a resumed run can
+    # call wandb.init(id=..., resume="must") and continue plotting on the
+    # same chart rather than starting a fresh run.
+    # ------------------------------------------------------------------
+    try:
+        import wandb as _wandb  # noqa: WPS433
+        if _wandb.run is not None:
+            run_id_file = checkpoint_dir / "wandb_run_id.txt"
+            run_id_file.write_text(_wandb.run.id + "\n")
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"Could not persist wandb run_id: {e}")
+
     # Save best model
     if is_best:
         best_path = checkpoint_dir / "best_model"
@@ -371,7 +446,7 @@ def save_checkpoint(
         with open(best_path / "config.json", 'w') as f:
             json.dump(config.to_dict(), f, indent=2)
         logger.info(f"Saved best model to {best_path}")
-    
+
     # Clean up old checkpoints
     _cleanup_old_checkpoints(checkpoint_dir, config.training.save_total_limit)
 
@@ -406,14 +481,24 @@ def push_to_hub(
         return
     
     try:
-        api = HfApi()
-        
+        # Token resolution order: explicit env HF_TOKEN > HUGGING_FACE_HUB_TOKEN
+        # > token already cached by `huggingface-cli login`. Passing token
+        # explicitly avoids surprises in multi-user containers where the
+        # cached login may belong to a different user.
+        hub_token = (
+            os.environ.get('HF_TOKEN')
+            or os.environ.get('HUGGING_FACE_HUB_TOKEN')
+            or None
+        )
+        api = HfApi(token=hub_token) if hub_token else HfApi()
+
         # Create repo if it doesn't exist
         try:
             create_repo(
                 config.training.hub_model_id,
                 private=config.training.hub_private_repo,
-                exist_ok=True
+                exist_ok=True,
+                token=hub_token,
             )
         except Exception as e:
             logger.warning(f"Could not create repo: {e}")
@@ -437,6 +522,7 @@ def push_to_hub(
             folder_path=str(save_dir),
             repo_id=config.training.hub_model_id,
             commit_message=commit_message,
+            token=hub_token,
         )
         
         logger.info(f"Pushed model to {config.training.hub_model_id}")
@@ -906,7 +992,53 @@ def train_epoch(
                 log_dict[f'train/mhc_{k}'] = v
             
             wandb.log(log_dict)
-        
+
+        # ------------------------------------------------------------------
+        # MID-EPOCH SAVE — power-loss recovery point.
+        # Without this, a crash mid-epoch loses everything since the previous
+        # epoch boundary. Honored only on the main process and only when
+        # save_steps > 0. Saves to checkpoint-{global_step}/ which the
+        # --auto_resume flag picks up on next launch.
+        # ------------------------------------------------------------------
+        if (
+            is_main_process(local_rank)
+            and global_step > 0
+            and getattr(config.training, 'save_steps', 0) > 0
+            and global_step % config.training.save_steps == 0
+        ):
+            model_to_save = model
+            if use_deepspeed:
+                model_to_save = model.module
+            elif hasattr(model, 'module'):
+                model_to_save = model.module
+            try:
+                save_checkpoint(
+                    model=model_to_save,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    global_step=global_step,
+                    metrics={'train_loss_running': total_loss / max(num_batches, 1)},
+                    config=config,
+                    is_best=False,
+                )
+                logger.info(
+                    f"[mid-epoch] saved checkpoint at step {global_step} "
+                    f"(epoch {epoch}, save_steps={config.training.save_steps})"
+                )
+                # Mid-epoch HF push (optional). Push only when the user
+                # explicitly opted in — pushes are 30s-2min each and would
+                # slow training to a crawl on small save_steps intervals.
+                if getattr(config.training, 'push_every_save', False):
+                    push_to_hub(
+                        model=model_to_save,
+                        config=config,
+                        metrics={'global_step': global_step, 'epoch': epoch},
+                        commit_message=f"Mid-epoch checkpoint @ step {global_step}",
+                    )
+            except Exception as e:
+                logger.error(f"Mid-epoch save failed (continuing training): {e}")
+
         # ------------------------------------------------------------------
         # FREE large per-step objects to avoid holding references across
         # iterations.  Without this, Python's refcount collector may keep
@@ -1173,10 +1305,50 @@ def main(args):
         config.training.learning_rate = args.learning_rate
     if args.hub_model_id:
         config.training.hub_model_id = args.hub_model_id
+    if args.hub_token:
+        # Set in env so push_to_hub() picks it up via its env-fallback chain.
+        os.environ['HF_TOKEN'] = args.hub_token
+    if args.push_every_save:
+        config.training.push_every_save = True
+    if args.save_steps is not None:
+        config.training.save_steps = args.save_steps
+        logger.info(f"save_steps overridden to {args.save_steps} via CLI")
     if args.wandb_project:
         config.wandb.project = args.wandb_project
     if args.disable_wandb:
         config.wandb.enabled = False
+
+    # ------------------------------------------------------------------
+    # --auto_resume: if user didn't pass --resume_from_checkpoint and a
+    # latest_checkpoint.txt exists under output_dir, point the resume flag
+    # at the latest checkpoint dir. This is the "just rerun the script
+    # after power loss" UX.
+    # ------------------------------------------------------------------
+    if args.auto_resume and not args.resume_from_checkpoint:
+        out_dir = Path(
+            args.output_dir
+            or config.training.output_dir
+            or './checkpoints/mimic-cxr-vqa'
+        )
+        pointer = out_dir / 'latest_checkpoint.txt'
+        if pointer.exists():
+            ckpt_name = pointer.read_text().strip()
+            ckpt_dir = out_dir / ckpt_name
+            if ckpt_dir.is_dir():
+                args.resume_from_checkpoint = str(ckpt_dir)
+                logger.info(
+                    f"--auto_resume: resuming from latest checkpoint {ckpt_dir}"
+                )
+            else:
+                logger.warning(
+                    f"--auto_resume: latest_checkpoint.txt points at "
+                    f"{ckpt_dir} which doesn't exist. Starting fresh."
+                )
+        else:
+            logger.info(
+                f"--auto_resume: no latest_checkpoint.txt at {pointer}. "
+                "Starting fresh."
+            )
     
     # Force disable gradient checkpointing if flag is set
     if args.no_gradient_checkpointing:
@@ -1494,6 +1666,12 @@ def main(args):
     # ==================================================================
     resume_step = 0
     resume_epoch = 0
+    # Stashed state from a resumed checkpoint, restored AFTER optimizer +
+    # scheduler are constructed further below. Initialized here at function
+    # scope so they're always defined regardless of which branch fires.
+    resume_optimizer_state = None
+    resume_scheduler_state = None
+    resume_rng_state = None
     if args.resume_from_checkpoint:
         ckpt_path = Path(args.resume_from_checkpoint)
         ckpt_file = None
@@ -1540,17 +1718,28 @@ def main(args):
                     logger.warning(f"  Unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
                 logger.info(f"  Loaded {len(state_dict) - len(missing) - len(unexpected)}/{len(state_dict)} parameters")
             
-            # Optionally resume training step/epoch (only if NOT finetuning)
+            # Optionally resume training step/epoch (only if NOT finetuning).
+            # Stash optimizer/scheduler/RNG state so we can restore them AFTER
+            # those objects are constructed below. For finetuning we discard
+            # them on purpose — finetune wants a fresh optimizer.
             phase = getattr(config.training, 'phase', 'pretrain').lower()
             if phase != 'finetune' and 'global_step' in checkpoint:
                 resume_step = checkpoint.get('global_step', 0)
                 resume_epoch = checkpoint.get('epoch', 0)
+                resume_optimizer_state = checkpoint.get('optimizer_state_dict')
+                resume_scheduler_state = checkpoint.get('scheduler_state_dict')
+                resume_rng_state = checkpoint.get('rng_state')
                 if is_main_process(local_rank):
                     logger.info(f"  Resuming from step {resume_step}, epoch {resume_epoch}")
+                    logger.info(
+                        f"  Stashed: optimizer={resume_optimizer_state is not None}, "
+                        f"scheduler={resume_scheduler_state is not None}, "
+                        f"rng={resume_rng_state is not None}"
+                    )
             elif phase == 'finetune':
                 if is_main_process(local_rank):
                     logger.info("  Finetuning mode: starting fresh optimizer/scheduler (not resuming step)")
-            
+
             del checkpoint, state_dict  # Free memory
             _reclaim_cpu_memory()
         else:
@@ -1716,6 +1905,48 @@ def main(args):
         
         scaler = GradScaler('cuda') if config.training.fp16 else None
     
+    # ------------------------------------------------------------------
+    # Restore stashed optimizer/scheduler/RNG state from resumed checkpoint.
+    # Done HERE (not at model-load time) because optimizer/scheduler are
+    # built above this point but BELOW the model load. For DeepSpeed this
+    # is currently a no-op — deepspeed.initialize manages its own optimizer
+    # state and the user should pass the DS checkpoint via DS APIs. For
+    # plain DDP / single-GPU AdamW + OneCycleLR the restore is meaningful.
+    # ------------------------------------------------------------------
+    if not use_deepspeed:
+        if resume_optimizer_state is not None:
+            try:
+                optimizer.load_state_dict(resume_optimizer_state)
+                if is_main_process(local_rank):
+                    logger.info("Restored optimizer state from checkpoint")
+            except Exception as e:
+                logger.warning(f"Could not restore optimizer state: {e}")
+        if resume_scheduler_state is not None and scheduler is not None:
+            try:
+                scheduler.load_state_dict(resume_scheduler_state)
+                if is_main_process(local_rank):
+                    logger.info("Restored scheduler state from checkpoint")
+            except Exception as e:
+                logger.warning(f"Could not restore scheduler state: {e}")
+        if resume_rng_state is not None:
+            try:
+                import random as _random
+                _random.setstate(resume_rng_state.get('python'))
+                if resume_rng_state.get('numpy') is not None:
+                    import numpy as _np
+                    _np.random.set_state(resume_rng_state['numpy'])
+                if resume_rng_state.get('torch_cpu') is not None:
+                    torch.set_rng_state(resume_rng_state['torch_cpu'])
+                if (
+                    resume_rng_state.get('torch_cuda') is not None
+                    and torch.cuda.is_available()
+                ):
+                    torch.cuda.set_rng_state_all(resume_rng_state['torch_cuda'])
+                if is_main_process(local_rank):
+                    logger.info("Restored RNG state (python/numpy/torch/cuda)")
+            except Exception as e:
+                logger.warning(f"Could not restore RNG state: {e}")
+
     # Start epoch and global step (may be set by --resume_from_checkpoint above)
     # For finetuning: always start from epoch 1, step 0 (fresh optimizer/scheduler)
     # For resuming pretrain: pick up where we left off
@@ -1996,9 +2227,17 @@ if __name__ == "__main__":
     
     # Hub
     parser.add_argument('--hub_model_id', type=str, help='Hugging Face Hub model ID')
+    parser.add_argument('--hub_token', type=str, default=None,
+                       help='HF Hub token. If unset, falls back to env HF_TOKEN / HUGGING_FACE_HUB_TOKEN / cached login')
+    parser.add_argument('--push_every_save', action='store_true',
+                       help='Push to HF Hub on EVERY checkpoint save (not just best). Slower but safer for power loss')
     parser.add_argument('--resume_from_checkpoint', type=str, default=None,
                        help='Path to pretrained checkpoint dir/file to load weights from')
-    
+    parser.add_argument('--auto_resume', action='store_true',
+                       help='Auto-resume from latest checkpoint in --output_dir (reads latest_checkpoint.txt). Ignored if --resume_from_checkpoint is set')
+    parser.add_argument('--save_steps', type=int, default=None,
+                       help='Save mid-epoch checkpoint every N steps (overrides config). 0 disables mid-epoch save')
+
     # Wandb
     parser.add_argument('--wandb_project', type=str, default='mimic-cxr-vqa', help='W&B project name')
     parser.add_argument('--disable_wandb', action='store_true', help='Disable W&B logging')

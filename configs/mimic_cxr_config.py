@@ -143,6 +143,7 @@ class TrainingConfig:
     hub_model_id: str = ""
     hub_private_repo: bool = True
     push_to_hub_strategy: str = "best"  # best, checkpoint, end
+    push_every_save: bool = False  # If True, push to HF on every save (not just best)
     
     # Reproducibility
     seed: int = 42
