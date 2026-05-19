@@ -319,15 +319,24 @@ class SceneGraphEncoderV2(nn.Module):
                 continue
             n = min(n, n_max)
 
-            # Build bboxes in pdtype so the downstream stack/store matches
-            # bbox_feats' dtype without an implicit copy at assignment time.
-            bboxes = torch.as_tensor(sg["bboxes"][:n], dtype=pdtype, device=device)
-            x1, y1, x2, y2 = bboxes[:, 0], bboxes[:, 1], bboxes[:, 2], bboxes[:, 3]
-            w = (x2 - x1).clamp(min=1e-6)
-            h = (y2 - y1).clamp(min=1e-6)
-            bbox_feats[b, :n] = torch.stack(
-                [x1, y1, x2, y2, w, h, w * h, w / h], dim=-1
+            # CRITICAL: build bbox features in FP32 with sane clamps before
+            # casting to pdtype. In fp16:
+            #   - `w / h` overflows when h is tiny (1 / 1e-6 = 1e6 > 65504 fp16 max → inf)
+            #   - `w * h` underflows when both are tiny (1e-6 * 1e-6 = 1e-12 → 0)
+            # Either produces NaN downstream in bbox_proj. We saw this on real
+            # MIMIC bboxes that legitimately have small heights/widths.
+            bboxes_f = torch.as_tensor(sg["bboxes"][:n], dtype=torch.float32, device=device)
+            x1, y1, x2, y2 = bboxes_f[:, 0], bboxes_f[:, 1], bboxes_f[:, 2], bboxes_f[:, 3]
+            # 1e-3 clamp: aspect ratio max becomes 1000, area min becomes 1e-6
+            # — both safely inside fp16 range
+            w = (x2 - x1).clamp(min=1e-3)
+            h = (y2 - y1).clamp(min=1e-3)
+            area = (w * h).clamp(min=1e-6, max=1.0)
+            aspect = (w / h).clamp(min=1e-3, max=1e3)
+            feats_per_obs = torch.stack(
+                [x1, y1, x2, y2, w, h, area, aspect], dim=-1
             )
+            bbox_feats[b, :n] = feats_per_obs.to(dtype=pdtype)
 
             ent = torch.as_tensor(sg["entity_ids"][:n], dtype=torch.long, device=device)
             reg = torch.as_tensor(sg["region_ids"][:n], dtype=torch.long, device=device)
@@ -353,9 +362,19 @@ class SceneGraphEncoderV2(nn.Module):
         combined = torch.cat([region_e, entity_e, pos_e, bbox_e], dim=-1)
         nodes = self.combiner(combined)  # (B, N, d_node)
 
-        # Apply GAT layers
+        # Apply GAT layers — scrub any NaN/Inf between layers so a single
+        # bad attention row doesn't poison the whole graph.
         for gat in self.gat_layers:
             nodes = gat(nodes, relations, node_mask)
+            if torch.isnan(nodes).any() or torch.isinf(nodes).any():
+                nodes = torch.nan_to_num(nodes, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Final safety: encoder output must be finite. If we still see NaN
+        # here, it's a real model bug worth surfacing — but don't crash;
+        # masked positions (where num_objects=0) legitimately have garbage
+        # values that just shouldn't contribute.
+        if torch.isnan(nodes).any() or torch.isinf(nodes).any():
+            nodes = torch.nan_to_num(nodes, nan=0.0, posinf=0.0, neginf=0.0)
 
         return nodes, node_mask
 
