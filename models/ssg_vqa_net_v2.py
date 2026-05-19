@@ -384,6 +384,64 @@ class SceneGraphEncoderV2(nn.Module):
 # =============================================================================
 
 
+def _mha_fp32(
+    mha: nn.MultiheadAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Run an ``nn.MultiheadAttention`` module in fp32 by calling
+    ``F.multi_head_attention_forward`` with weights cast to fp32 on the fly.
+
+    Needed because the module's params may be fp16 (Turing) or bf16 (Ampere+),
+    and the softmax inside attention is fp16-unsafe when scores have large
+    magnitudes — which happens in the SG projector because the d_node→d_llm
+    out-projection downstream can be sensitive to small NaN seeds.
+
+    Returns the attended output (B, T_q, d) in fp32. Caller is responsible
+    for casting back to its desired output dtype.
+    """
+    # nn.MultiheadAttention.batch_first=True means inputs come in as (B, T, d).
+    # F.multi_head_attention_forward expects (T, B, d) when batch_first is
+    # not honored at the functional level — so transpose ourselves.
+    if mha.batch_first:
+        query = query.transpose(0, 1)
+        key = key.transpose(0, 1)
+        value = value.transpose(0, 1)
+
+    in_proj_weight = mha.in_proj_weight.float() if mha.in_proj_weight is not None else None
+    in_proj_bias = mha.in_proj_bias.float() if mha.in_proj_bias is not None else None
+    out_proj_weight = mha.out_proj.weight.float()
+    out_proj_bias = mha.out_proj.bias.float() if mha.out_proj.bias is not None else None
+
+    attn_out, _ = F.multi_head_attention_forward(
+        query=query.float(),
+        key=key.float(),
+        value=value.float(),
+        embed_dim_to_check=mha.embed_dim,
+        num_heads=mha.num_heads,
+        in_proj_weight=in_proj_weight,
+        in_proj_bias=in_proj_bias,
+        bias_k=mha.bias_k.float() if mha.bias_k is not None else None,
+        bias_v=mha.bias_v.float() if mha.bias_v is not None else None,
+        add_zero_attn=mha.add_zero_attn,
+        dropout_p=0.0,  # eval-style for stability; training dropout applied outside
+        out_proj_weight=out_proj_weight,
+        out_proj_bias=out_proj_bias,
+        training=mha.training,
+        key_padding_mask=key_padding_mask,
+        need_weights=False,
+        attn_mask=None,
+        use_separate_proj_weight=False,
+    )
+
+    if mha.batch_first:
+        attn_out = attn_out.transpose(0, 1)
+    return attn_out
+
+
 class SGTokenProjector(nn.Module):
     """
     Cross-attention pooling: K learned queries attend over scene-graph nodes,
@@ -424,18 +482,93 @@ class SGTokenProjector(nn.Module):
         node_features: torch.Tensor,  # (B, N, d_node)
         node_mask: torch.Tensor,      # (B, N)
     ) -> torch.Tensor:
-        B = node_features.size(0)
-        q = self.queries.unsqueeze(0).expand(B, -1, -1)  # (B, K, d_node)
+        # Output dtype = LLM dtype (matches what _inject_sg_tokens splices into).
+        try:
+            out_dtype = next(self.out_proj.parameters()).dtype
+        except StopIteration:
+            out_dtype = node_features.dtype
 
-        key_padding_mask = ~node_mask.bool() if node_mask is not None else None
-        attended, _ = self.cross_attn(
+        # Run the whole projector in fp32. On Turing (fp16 only, no bf16) the
+        # softmax in nn.MultiheadAttention + the d_node→d_llm=3584 linear can
+        # easily overflow fp16's 65504 ceiling when the SG encoder produces
+        # large-magnitude node features, producing NaN tokens that then poison
+        # the LLM input embedding. d_node=128 is tiny so fp32 internal cost
+        # is negligible. We cast params + activations to fp32 for this call
+        # using a functional path rather than mutating the module dtype.
+        node_features = node_features.float()
+        if node_mask is not None:
+            node_mask = node_mask.float()
+
+        B = node_features.size(0)
+        # Force queries to fp32 here so the matmul inside cross_attn is fp32.
+        q = self.queries.float().unsqueeze(0).expand(B, -1, -1)
+
+        # Guard against all-masked rows (sample with num_objects=0): replace
+        # with a single-True mask so softmax has at least one valid key and
+        # doesn't produce NaN. We zero those tokens after the fact.
+        all_masked = None
+        key_padding_mask = None
+        if node_mask is not None:
+            key_padding_mask = ~node_mask.bool()
+            all_masked = key_padding_mask.all(dim=-1)  # (B,)
+            if all_masked.any():
+                # Unmask the first key for those rows just to keep softmax sane
+                key_padding_mask = key_padding_mask.clone()
+                key_padding_mask[all_masked, 0] = False
+
+        # Temporarily run cross_attn in fp32 by casting its parameters' compute.
+        # MultiheadAttention is stateless in dtype; PyTorch picks dtype from
+        # inputs and parameters. We do it by calling functional F.multi_head_*.
+        # Simpler: use the module after upcasting its parameters in-place would
+        # break the module — instead, use F.scaled_dot_product_attention path.
+        # Easier and correct: clone weights to fp32 on the fly.
+        attended = _mha_fp32(
+            self.cross_attn,
             q, node_features, node_features,
             key_padding_mask=key_padding_mask,
         )
-        h = self.norm1(q + attended)
-        h = self.norm2(h + self.ffn(h))
-        tokens = self.out_norm(self.out_proj(h))   # (B, K, d_llm)
-        return tokens
+
+        # The rest of the projector — cast layer params to fp32 on call.
+        h = F.layer_norm(
+            q + attended,
+            self.norm1.normalized_shape,
+            weight=self.norm1.weight.float() if self.norm1.weight is not None else None,
+            bias=self.norm1.bias.float() if self.norm1.bias is not None else None,
+            eps=self.norm1.eps,
+        )
+
+        ffn_h = F.linear(h, self.ffn[0].weight.float(), self.ffn[0].bias.float())
+        ffn_h = F.gelu(ffn_h)
+        ffn_h = F.linear(ffn_h, self.ffn[3].weight.float(), self.ffn[3].bias.float())
+
+        h = F.layer_norm(
+            h + ffn_h,
+            self.norm2.normalized_shape,
+            weight=self.norm2.weight.float() if self.norm2.weight is not None else None,
+            bias=self.norm2.bias.float() if self.norm2.bias is not None else None,
+            eps=self.norm2.eps,
+        )
+
+        tokens = F.linear(h, self.out_proj.weight.float(), self.out_proj.bias.float())
+        tokens = F.layer_norm(
+            tokens,
+            self.out_norm.normalized_shape,
+            weight=self.out_norm.weight.float() if self.out_norm.weight is not None else None,
+            bias=self.out_norm.bias.float() if self.out_norm.bias is not None else None,
+            eps=self.out_norm.eps,
+        )
+
+        # Zero out tokens that came from all-masked rows (they fed off a fake
+        # unmasked key and are meaningless).
+        if all_masked is not None and all_masked.any():
+            tokens = tokens.clone()
+            tokens[all_masked] = 0.0
+
+        # Final NaN/Inf scrub — should be unreachable now, but cheap insurance.
+        if not torch.isfinite(tokens).all():
+            tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return tokens.to(dtype=out_dtype)
 
 
 # =============================================================================
@@ -450,9 +583,9 @@ class GroundingRefinementHead(nn.Module):
       - Scene-graph node features (for anatomical priors)
       - Optional initial bbox from the LLM's native <box> output
 
-    Optionally routes the fused signal through a single mHCBlock (Birkhoff
-    manifold, n=4 paths) — the v1 mHC contribution is relocated here, where
-    heterogeneous-source fusion actually benefits from manifold constraints.
+    Routes the fused signal through a single mHCBlock (Birkhoff manifold,
+    n=4 paths). mHC is mandatory — the v1 manifold-constrained fusion is the
+    architectural contribution that justifies this head over a vanilla MLP.
     """
 
     def __init__(
@@ -461,14 +594,24 @@ class GroundingRefinementHead(nn.Module):
         d_sg: int,
         d_hidden: int = 512,
         num_heads: int = 8,
-        use_mhc: bool = True,
         mhc_manifold: str = "birkhoff",
         num_mhc_paths: int = 4,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.d_hidden = d_hidden
-        self.use_mhc = use_mhc and _HAS_LEGACY
+
+        # mHC is mandatory. If the legacy mHCBlock isn't available, fail loudly
+        # at construction time rather than silently degrading to a vanilla
+        # residual — silent degradation invalidates the architectural claim
+        # and produces a different model than the config promises.
+        if not _HAS_LEGACY or mHCBlock is None:
+            raise RuntimeError(
+                "GroundingRefinementHead requires mHCBlock, but the inlined "
+                "legacy v1 components were not loaded. Check that the "
+                "'INLINED LEGACY V1 COMPONENTS' section at the bottom of "
+                "ssg_vqa_net_v2.py executed (mHCBlock must be defined)."
+            )
 
         self.llm_proj = nn.Linear(d_llm, d_hidden)
         self.sg_proj = nn.Linear(d_sg, d_hidden)
@@ -478,18 +621,15 @@ class GroundingRefinementHead(nn.Module):
         )
         self.cross_norm = nn.LayerNorm(d_hidden)
 
-        if self.use_mhc:
-            self.mhc = mHCBlock(
-                hidden_size=d_hidden,
-                num_heads=num_heads,
-                ff_dim=d_hidden * 4,
-                num_hc_paths=num_mhc_paths,
-                manifold_type=mhc_manifold,
-                dropout=dropout,
-                sinkhorn_iters=20,
-            )
-        else:
-            self.mhc = None
+        self.mhc = mHCBlock(
+            hidden_size=d_hidden,
+            num_heads=num_heads,
+            ff_dim=d_hidden * 4,
+            num_hc_paths=num_mhc_paths,
+            manifold_type=mhc_manifold,
+            dropout=dropout,
+            sinkhorn_iters=20,
+        )
 
         # Delta regression: input = [fused (d_hidden) | init_bbox (4)]
         self.delta_head = nn.Sequential(
@@ -540,8 +680,9 @@ class GroundingRefinementHead(nn.Module):
         )
         fused = self.cross_norm(q + attended).squeeze(1)  # (B, d_hidden)
 
-        if self.mhc is not None:
-            fused = self.mhc(fused.unsqueeze(1)).squeeze(1)
+        # mHC fusion is mandatory — manifold-constrained hyper-connection over
+        # the cross-attended bbox/SG signal.
+        fused = self.mhc(fused.unsqueeze(1)).squeeze(1)
 
         # Initial bbox: if not provided, use a learned center anchor.
         # Must match this head's pdtype so torch.cat below doesn't upcast
@@ -713,7 +854,6 @@ class SSGVQANetV2(nn.Module):
         num_category: int = 14,
         num_region_classes: int = 26,
         num_severity: int = 4,
-        use_mhc_in_grounding: bool = True,
         mhc_manifold: str = "birkhoff",
         scene_graph_generator: Optional[nn.Module] = None,
         freeze_sg_generator: bool = True,
@@ -880,7 +1020,6 @@ class SSGVQANetV2(nn.Module):
         self.grounding_head = GroundingRefinementHead(
             d_llm=self.d_llm,
             d_sg=sg_node_dim,
-            use_mhc=use_mhc_in_grounding,
             mhc_manifold=mhc_manifold,
         )
 
@@ -1540,12 +1679,9 @@ class SSGVQANetV2(nn.Module):
             "_gt_pointing_valid": gt_pointing_valid,
             # Grounding
             "grounding_outputs": grounding_out,
-            # mHC telemetry (path weights, gate values, amax_gain) — only
-            # populated when GroundingRefinementHead.use_mhc=True.
-            "mhc_metrics": (
-                self.grounding_head.mhc.get_metrics()
-                if self.grounding_head.mhc is not None else {}
-            ),
+            # mHC telemetry (path weights, gate values, amax_gain). mHC is
+            # mandatory, so this is always populated.
+            "mhc_metrics": self.grounding_head.mhc.get_metrics(),
         }
 
     def _mask_prompt_labels(self, labels: torch.Tensor) -> torch.Tensor:
