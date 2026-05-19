@@ -1,36 +1,30 @@
 #!/usr/bin/env python3
 """
-scripts/test_real_data.py — test SSGVQANetV2 on real cached samples.
+scripts/test_real_data.py — test SSGVQANetV2 on N real MIMIC+QBA samples.
 
-This script does NO data discovery. It expects a sample cache built by
-scripts/prebuild_cache.py — the project's canonical, validated builder that
-walks qa/*/*/*.qa.json, picks the best frontal image per study, and writes a
-pickled list of sample dicts.
+Walks qa/ directly using the same logic as scripts/prebuild_cache.py
+(_map_qa_file at lines 681-702) but skips the split.csv filter — that filter
+is for train/val/test separation during training, irrelevant for smoke tests.
 
-Workflow:
-    # one-time: build a 50-sample cache using the project's own builder
-    python scripts/prebuild_cache.py \\
-        --mimic_cxr_path data/mimic-cxr-jpg \\
-        --mimic_qa_path  data/mimic-ext-cxr-qba \\
-        --max_samples 50 --num_workers 4 --split train
+Required on disk (project's standard layout):
+    data/mimic-cxr-jpg/files/p10..p19/p<subject>/s<study>/<dicom>.jpg
+    data/mimic-ext-cxr-qba/qa/p10..p19/p<subject>/s<study>.qa.json   (qa.zip extracted)
+    data/mimic-ext-cxr-qba/scene_data/p10..p19/p<subject>/s<study>.scene_graph.json  (extracted)
 
-    # then: run the v2 model on N of those samples
-    python scripts/test_real_data.py --n 3 --gpu 0
-
-If the cache doesn't exist, this script prints the exact prebuild command
-to run and exits.
+Usage:
+    python scripts/test_real_data.py                  # 3 samples, GPU 0
+    python scripts/test_real_data.py --n 5 --gpu 1
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import pickle
 import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -41,33 +35,147 @@ if str(_ROOT) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# Cache discovery
+# Paths
 # ---------------------------------------------------------------------------
 
 
-def find_latest_cache(cache_dir: Path, split: str = "train") -> Path | None:
-    """Return the newest samples_<split>*.pkl in cache_dir, or None."""
-    if not cache_dir.exists():
+def load_paths() -> Dict[str, str]:
+    import yaml
+    with open(_ROOT / "configs" / "paths.yaml") as f:
+        return yaml.safe_load(f)["data"]
+
+
+# ---------------------------------------------------------------------------
+# Sample loader — mirrors prebuild_cache.py:_map_qa_file
+# ---------------------------------------------------------------------------
+
+
+def _walk_qa_files(qa_dir: Path, max_visit: int = 200) -> List[Path]:
+    """Yield up to max_visit qa.json paths from qa/p*/p*/s*.qa.json."""
+    out: List[Path] = []
+    if not qa_dir.exists():
+        return out
+    for p_group in sorted(qa_dir.iterdir()):
+        if not (p_group.is_dir() and p_group.name.startswith("p")):
+            continue
+        for patient_dir in sorted(p_group.iterdir()):
+            if not (patient_dir.is_dir() and patient_dir.name.startswith("p")):
+                continue
+            for qa_file in sorted(patient_dir.glob("s*.qa.json")):
+                out.append(qa_file)
+                if len(out) >= max_visit:
+                    return out
+    return out
+
+
+def _load_sample(
+    qa_file: Path, mimic_cxr_path: Path, sg_dir: Path
+) -> Optional[Dict[str, Any]]:
+    """
+    Build a sample dict from one qa.json. Returns None if the image or
+    scene graph aren't on disk. Mirrors prebuild_cache.py:_map_qa_file
+    but uses the first image (no view-position selection — fine for smoke).
+    """
+    try:
+        subject_id = int(qa_file.parent.name[1:])            # p10000032 → 10000032
+        study_id = int(qa_file.stem.split(".")[0][1:])       # s50414267.qa → 50414267
+    except (ValueError, IndexError):
         return None
-    candidates = sorted(
-        cache_dir.glob(f"samples_{split}*.pkl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return candidates[0] if candidates else None
+
+    p_prefix = f"p{str(subject_id)[:2]}"
+    study_dir = mimic_cxr_path / "files" / p_prefix / f"p{subject_id}" / f"s{study_id}"
+    if not study_dir.exists():
+        return None
+
+    jpg_files = sorted(study_dir.glob("*.jpg"))
+    if not jpg_files:
+        return None
+    img_path = jpg_files[0]
+    dicom_id = img_path.stem
+
+    sg_path = sg_dir / p_prefix / f"p{subject_id}" / f"s{study_id}.scene_graph.json"
+    if not sg_path.exists():
+        return None
+
+    try:
+        with open(qa_file) as f:
+            qa_data = json.load(f)
+    except Exception:
+        return None
+
+    questions = qa_data.get("questions", [])
+    if not questions:
+        return None
+
+    q = questions[0]   # first question per study is enough for a smoke
+    return {
+        "subject_id": subject_id,
+        "study_id": study_id,
+        "dicom_id": dicom_id,
+        "image_path": str(img_path),
+        "scene_graph_path": str(sg_path),
+        "question_id": q.get("question_id", ""),
+        "question_type": q.get("question_type", "unknown"),
+        "question": q.get("question", ""),
+        "answers": q.get("answers", []),
+    }
 
 
-def load_cache(cache_path: Path) -> List[Dict[str, Any]]:
-    with open(cache_path, "rb") as f:
-        return pickle.load(f)
+def collect_samples(
+    mimic_cxr_path: Path, qa_root: Path, n: int, max_visit: int = 200, verbose: bool = True
+) -> List[Dict[str, Any]]:
+    """Walk qa/ until we have n samples whose image+scene_graph both exist."""
+    qa_dir = qa_root / "qa"
+    sg_dir = qa_root / "scene_data"
+
+    qa_files = _walk_qa_files(qa_dir, max_visit=max_visit)
+    if verbose:
+        print(f"[walk] visited {len(qa_files)} candidate qa.json files")
+
+    samples: List[Dict[str, Any]] = []
+    skipped = {"no_image_dir": 0, "no_jpg": 0, "no_sg": 0, "no_questions": 0, "parse": 0}
+    for qa_file in qa_files:
+        s = _load_sample(qa_file, mimic_cxr_path, sg_dir)
+        if s is None:
+            # Coarse skip-reason inference (cheap)
+            try:
+                subject_id = int(qa_file.parent.name[1:])
+                study_id = int(qa_file.stem.split(".")[0][1:])
+                p_prefix = f"p{str(subject_id)[:2]}"
+                study_dir = mimic_cxr_path / "files" / p_prefix / f"p{subject_id}" / f"s{study_id}"
+                if not study_dir.exists():
+                    skipped["no_image_dir"] += 1
+                elif not list(study_dir.glob("*.jpg")):
+                    skipped["no_jpg"] += 1
+                else:
+                    sg_path = sg_dir / p_prefix / f"p{subject_id}" / f"s{study_id}.scene_graph.json"
+                    if not sg_path.exists():
+                        skipped["no_sg"] += 1
+                    else:
+                        skipped["no_questions"] += 1
+            except Exception:
+                skipped["parse"] += 1
+            continue
+
+        samples.append(s)
+        if verbose:
+            print(f"  ✓ sample {len(samples)}: study={s['study_id']} dicom={s['dicom_id'][:12]}...  "
+                  f"Q: {s['question'][:80]}")
+        if len(samples) >= n:
+            break
+
+    if verbose and len(samples) < n:
+        print(f"\n[walk] found {len(samples)}/{n}; skip reasons: {skipped}")
+
+    return samples
 
 
 # ---------------------------------------------------------------------------
-# Sample → v2 inputs
+# Scene graph + answer formatting
 # ---------------------------------------------------------------------------
 
 
-def sg_dict_from_scene_graph(
+def sg_to_model_dict(
     sg_json: Dict[str, Any],
     dicom_id: str,
     image_w: int,
@@ -75,36 +183,25 @@ def sg_dict_from_scene_graph(
     num_regions: int = 310,
     num_entities: int = 237,
 ) -> Dict[str, Any]:
-    """
-    Convert a QBA scene graph JSON into the dict format SceneGraphEncoderV2
-    expects: bboxes (normalized), entity_ids, region_ids, positiveness,
-    num_objects. Mirrors the project's SceneGraphProcessor logic.
-    """
+    """QBA scene graph → SceneGraphEncoderV2 dict. Stable name→id hash."""
     import numpy as np
 
-    # Stable per-process name → int id table (cached on the function)
-    if not hasattr(sg_dict_from_scene_graph, "_region_map"):
-        sg_dict_from_scene_graph._region_map = {}
-        sg_dict_from_scene_graph._entity_map = {}
-    region_map = sg_dict_from_scene_graph._region_map
-    entity_map = sg_dict_from_scene_graph._entity_map
+    if not hasattr(sg_to_model_dict, "_rmap"):
+        sg_to_model_dict._rmap, sg_to_model_dict._emap = {}, {}
+    rmap, emap = sg_to_model_dict._rmap, sg_to_model_dict._emap
 
     def _id(name: str, table: Dict[str, int], mod: int) -> int:
         if name not in table:
             table[name] = (hash(name) & 0x7FFFFFFF) % mod
         return table[name]
 
-    bboxes: List[List[float]] = []
-    entity_ids: List[int] = []
-    region_ids: List[int] = []
-    positiveness: List[int] = []
-
+    bboxes, ents, regs, pos = [], [], [], []
     for obs in (sg_json.get("observations") or {}).values():
         loc = obs.get("localization", {}).get(dicom_id, {})
-        obs_bboxes = loc.get("bboxes", []) if isinstance(loc, dict) else []
-        if not obs_bboxes:
+        bx = loc.get("bboxes", []) if isinstance(loc, dict) else []
+        if not bx:
             continue
-        x1, y1, x2, y2 = obs_bboxes[0]
+        x1, y1, x2, y2 = bx[0]
         bb = [
             max(0.0, min(1.0, float(x1) / max(image_w, 1))),
             max(0.0, min(1.0, float(y1) / max(image_h, 1))),
@@ -113,59 +210,55 @@ def sg_dict_from_scene_graph(
         ]
         if bb[2] <= bb[0] or bb[3] <= bb[1]:
             continue
-        regions = obs.get("regions", [])
-        region_name = (
-            regions[0]["region"] if regions and isinstance(regions[0], dict)
-            else (str(regions[0]) if regions else "unknown")
-        )
-        entities = obs.get("obs_entities", [])
-        entity_name = str(entities[0]) if entities else "unknown"
-        pos = obs.get("positiveness", "unknown")
-        pos_id = {"pos": 1, "neg": 0}.get(pos, 2)
-
+        rlist = obs.get("regions", [])
+        rname = (rlist[0]["region"] if rlist and isinstance(rlist[0], dict)
+                 else (str(rlist[0]) if rlist else "unknown"))
+        elist = obs.get("obs_entities", [])
+        ename = str(elist[0]) if elist else "unknown"
         bboxes.append(bb)
-        region_ids.append(_id(region_name, region_map, num_regions))
-        entity_ids.append(_id(entity_name, entity_map, num_entities))
-        positiveness.append(pos_id)
+        regs.append(_id(rname, rmap, num_regions))
+        ents.append(_id(ename, emap, num_entities))
+        pos.append({"pos": 1, "neg": 0}.get(obs.get("positiveness"), 2))
 
     return {
         "bboxes": np.asarray(bboxes, dtype=np.float32) if bboxes else np.zeros((0, 4), dtype=np.float32),
-        "entity_ids": np.asarray(entity_ids, dtype=np.int64),
-        "region_ids": np.asarray(region_ids, dtype=np.int64),
-        "positiveness": np.asarray(positiveness, dtype=np.int64),
+        "entity_ids": np.asarray(ents, dtype=np.int64),
+        "region_ids": np.asarray(regs, dtype=np.int64),
+        "positiveness": np.asarray(pos, dtype=np.int64),
         "num_objects": len(bboxes),
     }
 
 
-def format_answer_text(sample: Dict[str, Any], image_w: int, image_h: int) -> str:
-    """Format a sample's first main-answer as '<think>...</think><box>...</box><answer>...</answer>'."""
-    answers = sample.get("answers") or []
-    mains = [a for a in answers if a.get("answer_type") == "main_answer"]
-    a = mains[0] if mains else (answers[0] if answers else {})
-    text = a.get("text", "Unknown.") if isinstance(a, dict) else "Unknown."
+def format_answer_text(answers: List[Dict[str, Any]], dicom_id: str, w: int, h: int) -> Tuple[str, List[float]]:
+    """Format QBA answer dicts into '<think>...</think><box>...</box><answer>...</answer>' + parsed bbox."""
+    mains = [a for a in answers if isinstance(a, dict) and a.get("answer_type") == "main_answer"]
+    a = mains[0] if mains else (answers[0] if answers and isinstance(answers[0], dict) else {})
+    text = a.get("text", "Unknown.")
 
-    # Best bbox for the chosen image
-    bbox_str = "0.000,0.000,1.000,1.000"
-    loc = a.get("localization", {}).get(sample["dicom_id"], {}) if isinstance(a, dict) else {}
+    bx_list = [0.0, 0.0, 1.0, 1.0]
+    loc = a.get("localization", {}).get(dicom_id, {})
     if isinstance(loc, dict):
         bboxes = loc.get("bboxes", [])
         if bboxes:
             x1, y1, x2, y2 = bboxes[0]
-            bbox_str = (
-                f"{x1/max(image_w,1):.3f},{y1/max(image_h,1):.3f},"
-                f"{x2/max(image_w,1):.3f},{y2/max(image_h,1):.3f}"
-            )
+            bx_list = [
+                max(0.0, min(1.0, x1 / max(w, 1))),
+                max(0.0, min(1.0, y1 / max(h, 1))),
+                max(0.0, min(1.0, x2 / max(w, 1))),
+                max(0.0, min(1.0, y2 / max(h, 1))),
+            ]
 
-    regions = ", ".join(str(r) for r in a.get("regions", []) if r) if isinstance(a, dict) else ""
-    entities = ", ".join(str(e) for e in a.get("obs_entities", []) if e) if isinstance(a, dict) else ""
+    bbox_str = ",".join(f"{v:.3f}" for v in bx_list)
+    regions = ", ".join(str(r) for r in a.get("regions", []) if r)
+    entities = ", ".join(str(e) for e in a.get("obs_entities", []) if e)
     cot_parts = []
     if regions:
-        cot_parts.append(f"Region(s) of interest: {regions}.")
+        cot_parts.append(f"Region(s): {regions}.")
     if entities:
         cot_parts.append(f"Observed: {entities}.")
     cot = " ".join(cot_parts) if cot_parts else "Reviewing the chest radiograph."
 
-    return f"<think>{cot}</think><box>{bbox_str}</box><answer>{text}</answer>"
+    return f"<think>{cot}</think><box>{bbox_str}</box><answer>{text}</answer>", bx_list
 
 
 # ---------------------------------------------------------------------------
@@ -174,85 +267,48 @@ def format_answer_text(sample: Dict[str, Any], image_w: int, image_h: int) -> st
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Test SSGVQANetV2 on cached real samples")
-    p.add_argument("--cache_dir", default=".cache/dataset_samples",
-                   help="Where prebuild_cache.py wrote samples_<split>*.pkl")
-    p.add_argument("--cache_path", default=None,
-                   help="Specific cache .pkl (overrides --cache_dir auto-pick)")
-    p.add_argument("--split", default="train")
+    p = argparse.ArgumentParser(description="Test SSGVQANetV2 on real samples (cache-free)")
     p.add_argument("--n", type=int, default=3)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--model_id", default="Qwen/Qwen2.5-VL-3B-Instruct")
+    p.add_argument("--max_visit", type=int, default=200,
+                   help="Max qa.json files to scan before giving up")
     args = p.parse_args(argv)
 
-    print(f"=== SSGVQANetV2 cached-sample test (n={args.n}) ===\n")
+    print(f"=== SSGVQANetV2 real-data test (n={args.n}) — cache-free ===\n")
 
-    # ---- Find the cache ---------------------------------------------------
-    if args.cache_path:
-        cache_path = Path(args.cache_path)
-    else:
-        cache_path = find_latest_cache(Path(args.cache_dir), args.split)
+    paths = load_paths()
+    mimic_cxr = Path(paths["mimic_cxr_jpg_path"])
+    qa_root = Path(paths["mimic_ext_cxr_qba_path"])
+    print(f"MIMIC-CXR-JPG : {mimic_cxr}")
+    print(f"QBA           : {qa_root}\n")
 
-    if cache_path is None or not cache_path.exists():
-        print(f"✗ No cache found in {args.cache_dir} for split '{args.split}'.")
-        print("\nBuild a small one with the project's own canonical builder:")
-        print()
-        print("  python scripts/prebuild_cache.py \\")
-        print(f"      --mimic_cxr_path data/mimic-cxr-jpg \\")
-        print(f"      --mimic_qa_path  data/mimic-ext-cxr-qba \\")
-        print(f"      --max_samples 50 --num_workers 4 --split {args.split}")
-        print()
-        print("Then re-run this script.")
+    samples = collect_samples(mimic_cxr, qa_root, args.n, max_visit=args.max_visit)
+    if not samples:
+        print("\n✗ Found no usable samples. Check:")
+        print(f"   data/mimic-cxr-jpg/files/p*    (must contain p10..p19)")
+        print(f"   data/mimic-ext-cxr-qba/qa/p*   (qa.zip extracted)")
+        print(f"   data/mimic-ext-cxr-qba/scene_data/p*  (scene_data.zip extracted)")
         return 1
 
-    print(f"[cache] {cache_path}")
-    samples = load_cache(cache_path)
-    print(f"[cache] {len(samples)} samples available; using first {args.n}\n")
-    samples = samples[: args.n]
-
-    # ---- Build PIL images, scene_graph dicts, structured answers ----------
+    # ---- Build v2 inputs ---------------------------------------------------
     from PIL import Image
-    pil_images: List[Any] = []
-    questions: List[str] = []
-    answer_texts: List[str] = []
-    scene_graphs: List[Dict[str, Any]] = []
-    gt_bboxes: List[List[float]] = []
-
-    for i, s in enumerate(samples):
-        img_path = Path(s["image_path"])
-        if not img_path.exists():
-            print(f"  ✗ sample {i+1}: image missing at {img_path}")
-            return 1
-        pil = Image.open(img_path).convert("RGB")
+    pil_images, questions, answer_texts, scene_graphs, gt_bboxes = [], [], [], [], []
+    for s in samples:
+        pil = Image.open(s["image_path"]).convert("RGB")
         iw, ih = pil.size
-
-        sg_dict = {"bboxes": [], "entity_ids": [], "region_ids": [], "positiveness": [], "num_objects": 0}
-        sg_path = s.get("scene_graph_path")
-        if sg_path and Path(sg_path).exists():
-            with open(sg_path) as f:
-                sg_json = json.load(f)
-            sg_dict = sg_dict_from_scene_graph(sg_json, s["dicom_id"], iw, ih)
-
-        ans_text = format_answer_text(s, iw, ih)
-        # Parse bbox out of the structured answer for the model's training-time init
-        try:
-            bbox_str = ans_text.split("<box>")[1].split("</box>")[0]
-            bx = [float(x) for x in bbox_str.split(",")]
-        except Exception:
-            bx = [0.0, 0.0, 1.0, 1.0]
-
+        with open(s["scene_graph_path"]) as f:
+            sg_json = json.load(f)
+        sg_dict = sg_to_model_dict(sg_json, s["dicom_id"], iw, ih)
+        ans_text, gt_bbox = format_answer_text(s["answers"], s["dicom_id"], iw, ih)
         pil_images.append(pil)
-        questions.append(s.get("question", ""))
+        questions.append(s["question"])
         answer_texts.append(ans_text)
         scene_graphs.append(sg_dict)
-        gt_bboxes.append(bx)
+        gt_bboxes.append(gt_bbox)
+        print(f"  → sg_objects={sg_dict['num_objects']}  bbox_gt={gt_bbox}")
 
-        print(f"  ✓ sample {i+1}: study={s['study_id']} dicom={s['dicom_id']}  "
-              f"size={iw}x{ih}  sg_objects={sg_dict['num_objects']}")
-        print(f"      Q: {s.get('question', '')[:100]}")
-        print(f"      A: {ans_text.split('<answer>')[-1].split('</answer>')[0][:100]}")
-
-    # ---- Model + forward + backward + generate ----------------------------
+    # ---- Model setup -------------------------------------------------------
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
         cc = torch.cuda.get_device_capability(args.gpu)
@@ -260,11 +316,9 @@ def main(argv=None) -> int:
         device = torch.device(f"cuda:{args.gpu}")
         force_qlora = cc < (8, 0)
     else:
-        dtype = torch.float32
-        device = torch.device("cpu")
-        force_qlora = False
-
+        dtype, device, force_qlora = torch.float32, torch.device("cpu"), False
     print(f"\n[model] {args.model_id}  device={device}  dtype={dtype}  qlora={force_qlora}")
+
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
@@ -286,7 +340,8 @@ def main(argv=None) -> int:
 
     gt_bbox_t = torch.tensor(gt_bboxes, dtype=torch.float, device=device)
 
-    print(f"\n[train] forward + loss + backward + step")
+    # ---- Training step -----------------------------------------------------
+    print(f"\n[train] forward + backward + step")
     model.train()
     optim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=2e-4)
     try:
@@ -307,18 +362,19 @@ def main(argv=None) -> int:
         optim.zero_grad(set_to_none=True)
         print(f"  ✓ backward + step ({time.time()-t2:.1f}s)")
     except Exception as e:
-        print(f"  ✗ training step failed: {e}")
+        print(f"  ✗ training failed: {e}")
         traceback.print_exc()
         return 1
 
     bb = out["grounding_outputs"]["bbox_pred"]
-    print(f"\n[grounding] pred vs gt (normalized):")
-    for i in range(len(samples)):
+    print(f"\n[grounding] pred vs gt:")
+    for i, s in enumerate(samples):
         pr = bb[i].tolist()
         gt = gt_bboxes[i]
-        print(f"  {i+1}  pred=[{pr[0]:.3f},{pr[1]:.3f},{pr[2]:.3f},{pr[3]:.3f}]"
+        print(f"  {i+1} pred=[{pr[0]:.3f},{pr[1]:.3f},{pr[2]:.3f},{pr[3]:.3f}]"
               f"  gt=[{gt[0]:.3f},{gt[1]:.3f},{gt[2]:.3f},{gt[3]:.3f}]")
 
+    # ---- Generation --------------------------------------------------------
     print(f"\n[infer] generation")
     model.eval()
     try:
