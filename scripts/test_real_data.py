@@ -438,7 +438,7 @@ def main(argv=None) -> int:
         torch_dtype=dtype,
         max_answer_length=32,
     )
-    for name in ("sg_encoder", "sg_projector", "grounding_head", "aux_heads"):
+    for name in ("sg_encoder", "sg_projector", "grounding_head", "aux_heads", "view_proj"):
         getattr(model, name).to(device=device, dtype=dtype)
     model.sg_generator.to(device=device)
     print(f"[model] built in {time.time()-t0:.1f}s")
