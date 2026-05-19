@@ -1616,7 +1616,12 @@ def main(args):
     _force_qlora = _gpu0_cc < (8, 0)
     _qwen_dtype = torch.float16 if _force_qlora else torch.bfloat16
 
-    _qwen_id = getattr(config.model, 'qwen_model_id', 'Qwen/Qwen2.5-VL-7B-Instruct')
+    # CLI flag --qwen_model_id wins over config; config wins over default.
+    _qwen_id = (
+        getattr(args, 'qwen_model_id', None)
+        or getattr(config.model, 'qwen_model_id', None)
+        or 'Qwen/Qwen2.5-VL-7B-Instruct'
+    )
     _use_quant = bool(getattr(config.model, 'use_quantization', _force_qlora))
     _lora_rank = int(getattr(config.model, 'lora_rank', 16))
     _num_sg_tokens = int(getattr(config.model, 'num_sg_tokens', 8))
@@ -2272,6 +2277,9 @@ if __name__ == "__main__":
                             'transitions (e.g. Stage 1 weights → fresh Stage 2 optimizer).')
     parser.add_argument('--save_steps', type=int, default=None,
                        help='Save mid-epoch checkpoint every N steps (overrides config). 0 disables mid-epoch save')
+    parser.add_argument('--qwen_model_id', type=str, default=None,
+                       help='Override Qwen model id (e.g. Qwen/Qwen2.5-VL-3B-Instruct for smoke). '
+                            'Default: Qwen/Qwen2.5-VL-7B-Instruct')
 
     # Wandb
     parser.add_argument('--wandb_project', type=str, default='mimic-cxr-vqa', help='W&B project name')

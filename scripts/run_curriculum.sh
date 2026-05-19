@@ -42,6 +42,68 @@ case "$MODE" in
     *) echo "Unknown mode: $MODE (expected: smoke | full)"; exit 1 ;;
 esac
 
+# ============================================================================
+# SELF-DAEMONIZATION
+# ----------------------------------------------------------------------------
+# Default: run in BACKGROUND so SSH disconnect / terminal close does NOT kill
+# the curriculum. Re-execs this script under setsid + nohup, detaches from
+# the controlling terminal, redirects all output to a master log, writes a
+# PID file, prints control commands, and exits the parent.
+#
+# Override with FG=1 to run in foreground (useful if you want to watch the
+# smoke output live and Ctrl-C it).
+#
+# Stop the background curriculum:
+#   kill -- -$(cat logs/curriculum.pid)    # kills the whole process group
+# ============================================================================
+FG="${FG:-0}"
+if [[ "$FG" != "1" && "${CURRICULUM_DAEMON:-0}" != "1" ]]; then
+    mkdir -p logs
+    MASTER_LOG="logs/curriculum_${MODE}_$(date +%Y%m%d_%H%M%S).log"
+    PID_FILE="logs/curriculum.pid"
+
+    # Refuse to start if another curriculum is already running.
+    if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "[abort] curriculum already running (PID=$(cat "$PID_FILE"))"
+        echo "        Stop it first:   kill -- -\$(cat $PID_FILE)"
+        echo "        Or watch it:     tail -f \$(ls -t logs/curriculum_*.log | head -1)"
+        exit 1
+    fi
+
+    # Re-exec ourselves fully detached. setsid → new session (immune to
+    # controlling-terminal SIGHUP), nohup → belt-and-suspenders, </dev/null
+    # closes stdin so background reads don't error, > redirects all output.
+    CURRICULUM_DAEMON=1 \
+        setsid nohup "$BASH" "$0" "$@" </dev/null > "$MASTER_LOG" 2>&1 &
+    PID=$!
+    echo "$PID" > "$PID_FILE"
+
+    echo
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  ✓ Curriculum launched in background — survives SSH disconnect"
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  PID:    $PID"
+    echo "  log:    $MASTER_LOG"
+    echo
+    echo "  watch live:   tail -f $MASTER_LOG"
+    echo "  check alive:  ps -p $PID -o pid,etime,pcpu,pmem,cmd"
+    echo "  stop run:     kill -- -$PID         # kills entire process group"
+    echo "                # or: kill -- -\$(cat $PID_FILE)"
+    echo "  GPU usage:    watch -n 2 nvidia-smi"
+    echo
+    echo "  Re-run after crash: just run this command again (auto-resume)."
+    echo "════════════════════════════════════════════════════════════════════"
+    exit 0
+fi
+
+# We get here only inside the daemonized child OR when FG=1 was passed.
+if [[ "${CURRICULUM_DAEMON:-0}" == "1" ]]; then
+    # Print a header in the log file so tail -f users see what they're watching.
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  Curriculum daemon — mode=$MODE gpus=$GPUS pid=$$ started $(date)"
+    echo "════════════════════════════════════════════════════════════════════"
+fi
+
 # --- ANSI colors (foreground only — strip when piping to file via tee) ---
 if [[ -t 1 ]]; then
     C_BANNER='\033[1;36m'; C_OK='\033[1;32m'; C_FAIL='\033[1;31m'
@@ -76,13 +138,28 @@ if [[ -f "$PROJECT_DIR/.venv/bin/activate" ]]; then
 fi
 
 # --- Multi-GPU plumbing ---
-if [[ "$GPUS" -gt 1 ]]; then
+# DEEPSPEED=1 → use DeepSpeed launcher + --use_deepspeed (ZeRO-2 auto-config)
+# Otherwise → torchrun + --use_ddp (vanilla DDP). DeepSpeed gives lower memory
+# (ZeRO-2 shards optimizer state) but adds a build dependency. For smoke,
+# DDP is fine and avoids the deepspeed compile step.
+USE_DEEPSPEED="${DEEPSPEED:-0}"
+
+if [[ "$USE_DEEPSPEED" == "1" ]]; then
+    if ! python -c "import deepspeed" 2>/dev/null; then
+        fail "DEEPSPEED=1 but 'deepspeed' is not installed."
+        fail "  Install with: pip install deepspeed"
+        exit 1
+    fi
+    LAUNCHER=(deepspeed --num_gpus="$GPUS")
+    DIST_FLAGS=(--use_deepspeed)
+    info "GPUs: $GPUS via DeepSpeed (ZeRO)"
+elif [[ "$GPUS" -gt 1 ]]; then
     LAUNCHER=(torchrun --nproc_per_node="$GPUS")
-    DDP_FLAGS=(--use_ddp)
+    DIST_FLAGS=(--use_ddp)
     info "GPUs: $GPUS via torchrun + DDP"
 else
     LAUNCHER=(python -u)
-    DDP_FLAGS=()
+    DIST_FLAGS=()
     info "GPUs: 1 (single process)"
 fi
 
@@ -101,30 +178,47 @@ declare -a STAGE_OUTDIR=(
     "./checkpoints/stage3_pretrain"
     "./checkpoints/stage4_finetune"
 )
+# --- Pick Qwen model size: smoke=3B (fast download, fits easily),
+#     full=7B (production). Override with QWEN_MODEL=Qwen/...
+if [[ "$MODE" == "smoke" ]]; then
+    QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
+else
+    QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
+fi
+info "Qwen model: $QWEN_MODEL"
+
 if [[ "$MODE" == "smoke" ]]; then
     declare -a STAGE_EXTRA=(
-        "--max_samples 50 --epochs 1 --batch_size 1 --save_steps 10 --skip_data_check"
-        "--max_samples 50 --epochs 1 --batch_size 1 --save_steps 10 --skip_data_check"
-        "--max_samples 50 --epochs 1 --batch_size 1 --save_steps 10 --skip_data_check"
-        "--max_samples 20 --epochs 1 --batch_size 1 --save_steps 5  --skip_data_check"
+        "--qwen_model_id $QWEN_MODEL --max_samples 50 --epochs 1 --batch_size 1 --save_steps 10 --skip_data_check"
+        "--qwen_model_id $QWEN_MODEL --max_samples 50 --epochs 1 --batch_size 1 --save_steps 10 --skip_data_check"
+        "--qwen_model_id $QWEN_MODEL --max_samples 50 --epochs 1 --batch_size 1 --save_steps 10 --skip_data_check"
+        "--qwen_model_id $QWEN_MODEL --max_samples 20 --epochs 1 --batch_size 1 --save_steps 5  --skip_data_check"
         # NOTE: finetune uses --max_samples 20 (not 10) because the trainer
         # auto-divides val by 10 — max_samples=10 → val=1 → metric crash.
-        # Set this to your real finetune count; for "10 samples" of TRAIN
-        # use --max_samples 11 or override the val-split fraction in the
-        # trainer.
     )
 else
     declare -a STAGE_EXTRA=(
-        "--epochs 20 --save_steps 500 --push_every_save"
-        "--epochs 10 --save_steps 500 --push_every_save"
-        "--epochs 40 --save_steps 500 --push_every_save"
-        "--epochs 15 --save_steps 200 --push_every_save"
+        "--qwen_model_id $QWEN_MODEL --epochs 20 --save_steps 500 --push_every_save"
+        "--qwen_model_id $QWEN_MODEL --epochs 10 --save_steps 500 --push_every_save"
+        "--qwen_model_id $QWEN_MODEL --epochs 40 --save_steps 500 --push_every_save"
+        "--qwen_model_id $QWEN_MODEL --epochs 15 --save_steps 200 --push_every_save"
     )
 fi
 
 mkdir -p logs
 CURRICULUM_START=$(date +%s)
 banner "Curriculum: mode=$MODE  gpus=$GPUS  stages=4"
+
+# --- Pre-download all HF models BEFORE launching DDP ---
+# Without this, both DDP ranks call from_pretrained() at the same time and
+# tqdm bars interleave into unreadable garbage that looks like a hang.
+# Skip if SKIP_PREDOWNLOAD=1 is set (useful when re-running after a
+# completed download).
+if [[ "${SKIP_PREDOWNLOAD:-0}" != "1" ]]; then
+    banner "Pre-downloading HF models (clean single-process progress)"
+    python scripts/predownload_models.py --model "$QWEN_MODEL"
+    ok "Models cached locally — DDP ranks will load instantly from now on."
+fi
 
 # --- Find latest checkpoint dir for cross-stage handoff ---
 latest_ckpt_dir_for() {
@@ -217,7 +311,7 @@ run_stage() {
             --mimic_cxr_path data/mimic-cxr-jpg \
             --mimic_qa_path data/mimic-ext-cxr-qba \
             --output_dir "$outdir" \
-            "${DDP_FLAGS[@]}" \
+            "${DIST_FLAGS[@]}" \
             "${resume_flags[@]}" \
             $extra \
             2>&1 | tee "$log"

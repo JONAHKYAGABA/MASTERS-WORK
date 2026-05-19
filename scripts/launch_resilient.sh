@@ -122,15 +122,25 @@ case "$MODE" in
 esac
 
 # --- 4. Multi-GPU plumbing ---
-#   GPUS=1 → plain python (single process)
-#   GPUS=2 → torchrun --nproc_per_node=2 with --use_ddp
-if [[ "$GPUS" -gt 1 ]]; then
+#   DEEPSPEED=1            → deepspeed launcher + --use_deepspeed (ZeRO)
+#   GPUS=1 + DEEPSPEED!=1  → plain python (single process)
+#   GPUS=2 + DEEPSPEED!=1  → torchrun --nproc_per_node=2 with --use_ddp
+USE_DEEPSPEED="${DEEPSPEED:-0}"
+if [[ "$USE_DEEPSPEED" == "1" ]]; then
+    if ! python -c "import deepspeed" 2>/dev/null; then
+        echo "[abort] DEEPSPEED=1 but 'deepspeed' is not installed. Install with: pip install deepspeed"
+        exit 1
+    fi
+    LAUNCHER=(deepspeed --num_gpus="$GPUS")
+    DIST_FLAGS=(--use_deepspeed)
+    echo "[gpu] DeepSpeed mode: $GPUS GPUs via deepspeed launcher (ZeRO)"
+elif [[ "$GPUS" -gt 1 ]]; then
     LAUNCHER=(torchrun --nproc_per_node="$GPUS")
-    DDP_FLAGS=(--use_ddp)
+    DIST_FLAGS=(--use_ddp)
     echo "[gpu] multi-GPU mode: $GPUS GPUs via torchrun + DDP"
 else
     LAUNCHER=(python -u)
-    DDP_FLAGS=()
+    DIST_FLAGS=()
     echo "[gpu] single-GPU mode (GPUS=1)"
 fi
 
@@ -160,7 +170,7 @@ CMD=(
     --mimic_qa_path data/mimic-ext-cxr-qba
     --output_dir "$OUTPUT_DIR"
     --auto_resume
-    "${DDP_FLAGS[@]}"
+    "${DIST_FLAGS[@]}"
     "${EXTRA_ARGS[@]}"
 )
 
