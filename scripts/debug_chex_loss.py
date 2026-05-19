@@ -18,7 +18,7 @@ import torch
 
 sys.path.insert(0, '.')
 from configs.mimic_cxr_config import load_config_from_file
-from data.mimic_cxr_dataset import MIMICCXRVQADataset, mimic_cxr_collate_fn
+from data.mimic_cxr_dataset import MIMICCXRVQADataset, collate_fn
 from models.ssg_vqa_net_v2 import SSGVQANetV2
 from training.loss import MultiTaskLoss
 
@@ -51,7 +51,7 @@ def main():
     # Get one batch (4 samples, collated)
     print("\n[2] Fetching batch of 4 samples...")
     items = [ds[i] for i in range(min(4, len(ds)))]
-    batch = mimic_cxr_collate_fn(items)
+    batch = collate_fn(items)
     chex_lbl = batch['chexpert_labels']
     chex_msk = batch['chexpert_mask']
     print(f"  chexpert_labels.shape = {chex_lbl.shape}  dtype={chex_lbl.dtype}")
