@@ -854,32 +854,14 @@ class SSGVQANetV2(nn.Module):
         )
 
         # ---- 5. Grounding refinement head -----------------------------------
-        # mHC (Manifold-Constrained Hyper-Connections) does its math in
-        # fp16/bf16, but the Birkhoff/Sinkhorn path + RMSNorm divisions
-        # are numerically fragile in fp16 (exp/division underflow → nan).
-        # On Turing-class GPUs (cc<8.0, no native bf16) we force-disable
-        # mHC to keep training stable. This costs the manifold-constrained
-        # fusion property but is the right tradeoff: a working baseline
-        # beats a "richer" model that NaNs in step 1.
-        _effective_use_mhc = use_mhc_in_grounding
-        if use_mhc_in_grounding and torch_dtype == torch.float16:
-            try:
-                _major, _ = torch.cuda.get_device_capability()
-            except Exception:
-                _major = 0
-            if _major < 8:
-                warnings.warn(
-                    "mHC disabled on Turing GPU (cc<8.0) — Birkhoff/Sinkhorn "
-                    "is unstable in fp16. Re-enable with use_mhc_in_grounding"
-                    "=True only on Ampere+ (bf16-capable).",
-                    RuntimeWarning,
-                )
-                _effective_use_mhc = False
-
+        # mHC's RMSNorm, ManifoldProjection, and sinkhorn_knopp all now
+        # compute internally in fp32 (see classes at file bottom), so the
+        # earlier Turing/fp16 auto-disable is no longer necessary —
+        # Birkhoff/Sinkhorn is stable on every GPU.
         self.grounding_head = GroundingRefinementHead(
             d_llm=self.d_llm,
             d_sg=sg_node_dim,
-            use_mhc=_effective_use_mhc,
+            use_mhc=use_mhc_in_grounding,
             mhc_manifold=mhc_manifold,
         )
 
@@ -892,6 +874,18 @@ class SSGVQANetV2(nn.Module):
             num_region=num_region_classes,
             num_severity=num_severity,
         )
+
+        # ---- 7. View-position projector -------------------------------------
+        # Projects the (B, 4) one-hot view encoding [PA, AP, LATERAL, OTHER]
+        # from the dataset into LLM hidden space. Added to the pooled
+        # representation before aux heads + grounding so PA/AP/LATERAL is a
+        # first-class signal — without this, the view_encoding tensor is
+        # already in the batch dict but the model ignored it entirely.
+        # init_zero=True so an untrained projector contributes 0 at step 0
+        # (doesn't perturb the baseline).
+        self.view_proj = nn.Linear(4, self.d_llm)
+        nn.init.zeros_(self.view_proj.weight)
+        nn.init.zeros_(self.view_proj.bias)
 
         # Apply training-mode freezing
         self.set_training_mode(training_mode)
@@ -1203,19 +1197,36 @@ class SSGVQANetV2(nn.Module):
         self,
         questions: List[str],
         answers: Optional[List[str]] = None,
+        indications: Optional[List[str]] = None,
     ) -> List[str]:
         """
         Format each sample as a Qwen chat with image, scene-graph block, and
-        question. During training, answer text is appended to supervise LM loss.
+        question. During training, the answer text is appended to supervise LM
+        loss.
+
+        If `indications` is supplied (per-sample QBA clinical-indication
+        strings, e.g. "Female with HIV, chest pain and dyspnea; evaluate for
+        infiltrate and effusion."), it's prepended as a `Clinical context:`
+        prefix. This gives the LLM the "why was this X-ray ordered" framing
+        that QBA encodes in its scene graph's `indication` section — without
+        it the model has to infer intent from the question alone.
         """
         sg_block = self._sg_placeholder_block()
         texts: List[str] = []
         for i, q in enumerate(questions):
+            user_text_parts: List[str] = [f"[scene_graph]{sg_block}[/scene_graph]"]
+            if indications is not None and i < len(indications):
+                ind = (indications[i] or "").strip()
+                if ind:
+                    user_text_parts.append(f"Clinical context: {ind}")
+            user_text_parts.append(f"Question: {q}")
+            user_text = "\n\n".join(user_text_parts)
+
             messages = [{
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": f"[scene_graph]{sg_block}[/scene_graph]\n\n{q}"},
+                    {"type": "text", "text": user_text},
                 ],
             }]
             if answers is not None:
@@ -1249,6 +1260,9 @@ class SSGVQANetV2(nn.Module):
         # head sees an init_bbox distribution it has actually trained on.
         gt_grounding_bboxes: Optional[torch.Tensor] = None,  # (B, 4) in [0,1]
         gt_pointing_valid: Optional[torch.Tensor] = None,    # (B, 1) or (B,)
+        # NEW v2 signals from the dataset's collate_fn:
+        view_encodings: Optional[torch.Tensor] = None,       # (B, 4) one-hot [PA, AP, LATERAL, OTHER]
+        indications: Optional[List[str]] = None,             # QBA clinical-indication strings, one per sample (or None)
         # Legacy tensor inputs (ignored in v2; kept for signature compatibility)
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1272,7 +1286,11 @@ class SSGVQANetV2(nn.Module):
         # ---- 1. Build chat prompts and run Qwen processor --------------------
         # Tokenization runs first because the SG path (step 2) consumes the
         # processor's pixel_values + image_grid_thw outputs.
-        prompts = self._build_prompts(questions, answer_texts)
+        # If QBA indications are provided we prepend them as clinical context
+        # ("Clinical context: <indication>. Question: <q>") — this is QBA's
+        # `answer_for_indication` source sentence, which gives the LLM the
+        # "why was this X-ray ordered" framing it would otherwise miss.
+        prompts = self._build_prompts(questions, answer_texts, indications=indications)
         proc_inputs = self.processor(
             text=prompts,
             images=pil_images,
@@ -1418,6 +1436,24 @@ class SSGVQANetV2(nn.Module):
                 pooled = last_hidden.mean(1)
         else:
             pooled = torch.zeros(len(questions), self.d_llm, device=device)
+
+        # ---- 6a. Inject view-position encoding into the pooled rep ----------
+        # The dataset emits a (B, 4) one-hot encoding of view position
+        # [PA, AP, LATERAL, OTHER]. Project it into the LLM hidden space and
+        # ADD to pooled — a residual that an AP/LATERAL-relevant aux head can
+        # learn to use without dominating the LLM-derived signal. The
+        # projector is zero-initialised so day-1 training matches the
+        # pre-fix behaviour exactly.
+        if view_encodings is not None:
+            try:
+                pdtype = next(self.view_proj.parameters()).dtype
+            except StopIteration:
+                pdtype = pooled.dtype
+            ve = view_encodings.to(device=device, dtype=pdtype)
+            view_feat = self.view_proj(ve)
+            if view_feat.dtype != pooled.dtype:
+                view_feat = view_feat.to(dtype=pooled.dtype)
+            pooled = pooled + view_feat
 
         # ---- 7. Grounding refinement head ------------------------------------
         # Distribution-matched init_bbox to avoid a train/inference mismatch:
@@ -1704,7 +1740,14 @@ def sinkhorn_knopp(x: torch.Tensor, t_max: int = 20, eps: float = 1e-8) -> torch
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm as used in the mHC paper (Eq. 5)."""
+    """
+    RMSNorm as used in the mHC paper (Eq. 5).
+
+    Computes internally in fp32 — `x.pow(2)` overflows fp16 quickly and the
+    subsequent `1/rms` division underflows the other way. Both produce NaN.
+    The fp32 round-trip costs nothing for small tensors and keeps the
+    Birkhoff/Sinkhorn manifold stable on Turing-class GPUs.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-8):
         super().__init__()
@@ -1712,8 +1755,11 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
-        return x / rms * self.weight
+        orig_dtype = x.dtype
+        x_f = x.float()
+        rms = x_f.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        out = x_f / rms * self.weight.float()
+        return out.to(dtype=orig_dtype)
 
 
 class ManifoldProjection(nn.Module):
@@ -1741,22 +1787,29 @@ class ManifoldProjection(nn.Module):
             self.hres_weight = nn.Parameter(torch.randn(dim, dim) * 0.01)
 
     def forward(self, residual: torch.Tensor) -> torch.Tensor:
+        # Compute the projection in fp32 then cast back. The Birkhoff path
+        # (exp + repeated divisions) and norm-based projections (sphere /
+        # oblique) all underflow or overflow in fp16, which produced silent
+        # NaNs on Turing GPUs. Cost is a couple of cast ops on a (d, d)
+        # weight + (B, *, d) activations — negligible.
+        orig_dtype = residual.dtype
+        residual_f = residual.float()
         if self.manifold_type == "birkhoff":
-            ds_matrix = sinkhorn_knopp(self.hres_weight, self.sinkhorn_iters)
-            projected = F.linear(residual, ds_matrix)
+            ds_matrix = sinkhorn_knopp(self.hres_weight.float(), self.sinkhorn_iters)
+            projected = F.linear(residual_f, ds_matrix)
         elif self.manifold_type == "sphere":
-            norm = residual.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            projected = self.radius * residual / norm
+            norm = residual_f.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            projected = self.radius.float() * residual_f / norm
         elif self.manifold_type == "oblique":
-            norm = residual.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            projected = residual / norm
+            norm = residual_f.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            projected = residual_f / norm
         elif self.manifold_type == "grassmann":
-            projected = self._grassmann_project(residual)
+            projected = self._grassmann_project(residual_f)
         elif self.manifold_type == "stiefel":
-            projected = self._stiefel_project(residual)
+            projected = self._stiefel_project(residual_f)
         else:
-            projected = residual
-        return self.alpha * projected
+            projected = residual_f
+        return (self.alpha.float() * projected).to(dtype=orig_dtype)
 
     def _grassmann_project(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
