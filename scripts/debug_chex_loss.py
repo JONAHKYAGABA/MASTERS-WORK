@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, '.')
-from configs.mimic_cxr_config import get_config
+from configs.mimic_cxr_config import load_config_from_file
 from data.mimic_cxr_dataset import MIMICCXRVQADataset, mimic_cxr_collate_fn
 from models.ssg_vqa_net_v2 import SSGVQANetV2
 from training.loss import MultiTaskLoss
@@ -28,7 +28,7 @@ def main():
     print("ONE-BATCH CHEX LOSS DEBUG")
     print("=" * 70)
 
-    cfg = get_config('configs/pretrain_config.yaml')
+    cfg = load_config_from_file('configs/pretrain_config.yaml')
     cfg.data.quality_grade = 'all'
 
     print(f"\n[config] mimic_cxr_path = {cfg.data.mimic_cxr_path}")
@@ -36,16 +36,15 @@ def main():
     print(f"[config] chexpert_labels_path = {getattr(cfg.data, 'chexpert_labels_path', '(default)')}")
     print(f"[config] quality_grade = {cfg.data.quality_grade}")
 
-    # Use the cached samples directly to skip the 30-min scan
-    cache_path = '.cache/dataset_samples/samples_train_1e5fae7b112e6aeb.pkl'
-    print(f"\n[1] Building dataset from cache: {cache_path}")
+    # Build a tiny dataset directly — uses .cache/dataset_samples/*.pkl if present.
+    print(f"\n[1] Building dataset (4 samples)...")
     ds = MIMICCXRVQADataset(
         mimic_cxr_path=cfg.data.mimic_cxr_path or 'data/mimic-cxr-jpg',
         mimic_qa_path=cfg.data.mimic_qa_path or 'data/mimic-ext-cxr-qba',
         split='train',
         max_samples=4,
         quality_grade='all',
-        skip_data_check=True,
+        use_cache=True,
     )
     print(f"  → dataset built: {len(ds)} samples")
 
