@@ -42,6 +42,7 @@ Authors: migration spec 2026-04-24
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
@@ -892,6 +893,28 @@ class SSGVQANetV2(nn.Module):
         # ---- 1. Load Qwen (quantized) + processor -----------------------------
         self.processor = AutoProcessor.from_pretrained(qwen_model_id)
 
+        # CRITICAL: cap the image pixel budget. Qwen2.5-VL's default
+        # max_pixels = 12.8M lets full-resolution chest X-rays (2544×3056 ≈
+        # 7.8M pixels) generate ~40,000 visual tokens, blowing GPU memory at
+        # the first forward (5-6GB activation per sample). For radiology
+        # 448-512 px is plenty — anatomical structures remain clearly visible.
+        # min_pixels also prevents tiny inputs from degrading too far.
+        # Override by setting max_image_pixels env var if needed.
+        try:
+            _max_px = int(os.environ.get("QWEN_MAX_PIXELS", 448 * 448))
+            _min_px = int(os.environ.get("QWEN_MIN_PIXELS", 256 * 256))
+            if hasattr(self.processor, "image_processor"):
+                self.processor.image_processor.max_pixels = _max_px
+                self.processor.image_processor.min_pixels = _min_px
+                warnings.warn(
+                    f"Qwen image processor capped at min={_min_px} max={_max_px} pixels "
+                    "(default would be 12.8M, causing OOM on radiology images). "
+                    "Set QWEN_MAX_PIXELS / QWEN_MIN_PIXELS env vars to override.",
+                    stacklevel=2,
+                )
+        except Exception as _e:
+            warnings.warn(f"Could not cap Qwen image processor pixels: {_e}", stacklevel=2)
+
         quant_config = None
         if use_quantization:
             quant_config = BitsAndBytesConfig(
@@ -1510,6 +1533,16 @@ class SSGVQANetV2(nn.Module):
             # silently ignore pixel_values. A text-only training run would
             # converge to a usable language model and look fine on loss
             # curves — until eval IoU is at chance. Catch this once.
+            #
+            # NOTE: this runs ONE forward pass with image and ONE without,
+            # transiently DOUBLING memory at step 0. On tight-memory GPUs
+            # (Turing 48GB with QLoRA fp16) this can OOM on the first step
+            # before training really begins. Set SKIP_VISION_PATH_CHECK=1
+            # to bypass (you trade a one-time safety check for headroom).
+            _skip_vision_check = bool(int(os.environ.get("SKIP_VISION_PATH_CHECK", "0")))
+            if _skip_vision_check:
+                # Pretend we already verified — silences future iterations.
+                self._vision_path_verified = True
             if not self._vision_path_verified:
                 with torch.no_grad():
                     out_no_img = self.qwen(

@@ -304,6 +304,10 @@ run_stage() {
         WANDB_API_KEY="${WANDB_API_KEY:-}" \
         HF_TOKEN="${HF_TOKEN:-}" \
         WANDB_ENTITY="${WANDB_ENTITY:-}" \
+        QWEN_MAX_PIXELS="${QWEN_MAX_PIXELS:-200704}" \
+        QWEN_MIN_PIXELS="${QWEN_MIN_PIXELS:-65536}" \
+        SKIP_VISION_PATH_CHECK="${SKIP_VISION_PATH_CHECK:-1}" \
+        PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
         "${LAUNCHER[@]}" \
             train_mimic_cxr.py \
             --config "$cfg" \
