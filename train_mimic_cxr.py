@@ -1319,12 +1319,16 @@ def main(args):
         config.wandb.enabled = False
 
     # ------------------------------------------------------------------
-    # --auto_resume: if user didn't pass --resume_from_checkpoint and a
-    # latest_checkpoint.txt exists under output_dir, point the resume flag
-    # at the latest checkpoint dir. This is the "just rerun the script
-    # after power loss" UX.
+    # --auto_resume: if a latest_checkpoint.txt exists under output_dir,
+    # point the resume flag at the latest checkpoint dir. Takes precedence
+    # over --resume_from_checkpoint when both are set AND a latest exists —
+    # this is the right behavior for the curriculum: --resume_from_checkpoint
+    # supplies the previous stage's weights as the starting point, but if
+    # the current stage has already produced its own in-progress checkpoint
+    # (mid-stage crash + relaunch), we want to continue THAT, not restart
+    # from the previous stage's snapshot.
     # ------------------------------------------------------------------
-    if args.auto_resume and not args.resume_from_checkpoint:
+    if args.auto_resume:
         out_dir = Path(
             args.output_dir
             or config.training.output_dir
@@ -1335,6 +1339,16 @@ def main(args):
             ckpt_name = pointer.read_text().strip()
             ckpt_dir = out_dir / ckpt_name
             if ckpt_dir.is_dir():
+                if args.resume_from_checkpoint and str(ckpt_dir) != args.resume_from_checkpoint:
+                    logger.info(
+                        f"--auto_resume: in-progress checkpoint exists at "
+                        f"{ckpt_dir}, taking precedence over "
+                        f"--resume_from_checkpoint={args.resume_from_checkpoint}"
+                    )
+                    # In-progress recovery: discard --load_weights_only because
+                    # we want FULL state (optimizer/scheduler/step) restored
+                    # to truly continue mid-stage.
+                    args.load_weights_only = False
                 args.resume_from_checkpoint = str(ckpt_dir)
                 logger.info(
                     f"--auto_resume: resuming from latest checkpoint {ckpt_dir}"
@@ -1342,12 +1356,13 @@ def main(args):
             else:
                 logger.warning(
                     f"--auto_resume: latest_checkpoint.txt points at "
-                    f"{ckpt_dir} which doesn't exist. Starting fresh."
+                    f"{ckpt_dir} which doesn't exist. Falling back to "
+                    f"--resume_from_checkpoint={args.resume_from_checkpoint or 'None'}."
                 )
         else:
             logger.info(
                 f"--auto_resume: no latest_checkpoint.txt at {pointer}. "
-                "Starting fresh."
+                f"Falling back to --resume_from_checkpoint={args.resume_from_checkpoint or 'None'}."
             )
     
     # Force disable gradient checkpointing if flag is set
@@ -1718,12 +1733,21 @@ def main(args):
                     logger.warning(f"  Unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
                 logger.info(f"  Loaded {len(state_dict) - len(missing) - len(unexpected)}/{len(state_dict)} parameters")
             
-            # Optionally resume training step/epoch (only if NOT finetuning).
+            # Optionally resume training step/epoch (only if NOT finetuning
+            # and NOT --load_weights_only).
             # Stash optimizer/scheduler/RNG state so we can restore them AFTER
-            # those objects are constructed below. For finetuning we discard
-            # them on purpose — finetune wants a fresh optimizer.
+            # those objects are constructed below. For finetuning OR
+            # explicit --load_weights_only, we discard them on purpose — both
+            # cross-stage transfer (sg_only→alignment, etc.) and finetune
+            # want a fresh optimizer because the trainable parameter set is
+            # different from what produced the saved optimizer state.
             phase = getattr(config.training, 'phase', 'pretrain').lower()
-            if phase != 'finetune' and 'global_step' in checkpoint:
+            weights_only = getattr(args, 'load_weights_only', False)
+            if (
+                not weights_only
+                and phase != 'finetune'
+                and 'global_step' in checkpoint
+            ):
                 resume_step = checkpoint.get('global_step', 0)
                 resume_epoch = checkpoint.get('epoch', 0)
                 resume_optimizer_state = checkpoint.get('optimizer_state_dict')
@@ -1736,6 +1760,9 @@ def main(args):
                         f"scheduler={resume_scheduler_state is not None}, "
                         f"rng={resume_rng_state is not None}"
                     )
+            elif weights_only:
+                if is_main_process(local_rank):
+                    logger.info("  --load_weights_only: model weights restored, fresh optimizer/scheduler/step/RNG")
             elif phase == 'finetune':
                 if is_main_process(local_rank):
                     logger.info("  Finetuning mode: starting fresh optimizer/scheduler (not resuming step)")
@@ -2222,8 +2249,11 @@ if __name__ == "__main__":
                        help='Disable hardware auto-optimization')
     
     # Training phase
-    parser.add_argument('--phase', type=str, default=None, choices=['pretrain', 'finetune'],
-                       help='Training phase: pretrain or finetune (overrides config)')
+    parser.add_argument('--phase', type=str, default=None,
+                       choices=['sg_only', 'alignment', 'pretrain', 'finetune', 'rl'],
+                       help='Training phase: sg_only (Stage 1) | alignment (Stage 2) | '
+                            'pretrain (Stage 3) | finetune (Stage 4) | rl (Stage 5). '
+                            'Overrides config.')
     
     # Hub
     parser.add_argument('--hub_model_id', type=str, help='Hugging Face Hub model ID')
@@ -2234,7 +2264,12 @@ if __name__ == "__main__":
     parser.add_argument('--resume_from_checkpoint', type=str, default=None,
                        help='Path to pretrained checkpoint dir/file to load weights from')
     parser.add_argument('--auto_resume', action='store_true',
-                       help='Auto-resume from latest checkpoint in --output_dir (reads latest_checkpoint.txt). Ignored if --resume_from_checkpoint is set')
+                       help='Auto-resume from latest checkpoint in --output_dir (reads latest_checkpoint.txt). '
+                            'Takes precedence over --resume_from_checkpoint when both are set and a latest checkpoint exists.')
+    parser.add_argument('--load_weights_only', action='store_true',
+                       help='When loading --resume_from_checkpoint, restore model weights only — discard '
+                            'optimizer / scheduler / global_step / RNG state. Used for cross-stage curriculum '
+                            'transitions (e.g. Stage 1 weights → fresh Stage 2 optimizer).')
     parser.add_argument('--save_steps', type=int, default=None,
                        help='Save mid-epoch checkpoint every N steps (overrides config). 0 disables mid-epoch save')
 
