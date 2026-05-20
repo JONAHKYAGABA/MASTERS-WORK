@@ -166,20 +166,30 @@ fi
 # --- Phase-specific QA paths (QBA pre-built exports) ---
 # Pretrain stages use B_frontal (31M, grade B+, broader/noisier).
 # Finetune uses A_frontal (7.5M, grade A+, clean).
-# Falls back to the raw qa/ dir if exports aren't extracted.
+# Falls back to the raw qa/ dir if exports are missing OR incomplete
+# (count < 1000 files = treat as broken extraction, use raw with runtime filter).
 QA_ROOT="data/mimic-ext-cxr-qba"
 QA_PRETRAIN="$QA_ROOT/exports/B_frontal"
 QA_FINETUNE="$QA_ROOT/exports/A_frontal"
-if [[ ! -d "$QA_PRETRAIN/qa" ]]; then
-    info "B_frontal not extracted, falling back to raw QA path for pretrain stages"
+MIN_QA_FILES=1000
+
+count_qa() {
+    [[ -d "$1/qa" ]] || { echo 0; return; }
+    find "$1/qa" -name "*.qa.json" 2>/dev/null | head -$((MIN_QA_FILES + 1)) | wc -l
+}
+
+PRETRAIN_COUNT=$(count_qa "$QA_PRETRAIN")
+if [[ "$PRETRAIN_COUNT" -lt "$MIN_QA_FILES" ]]; then
+    info "B_frontal export incomplete ($PRETRAIN_COUNT qa files), using raw QA path for pretrain"
     QA_PRETRAIN="$QA_ROOT"
 fi
-if [[ ! -d "$QA_FINETUNE/qa" ]]; then
-    info "A_frontal not extracted, falling back to raw QA path for finetune stage"
+FINETUNE_COUNT=$(count_qa "$QA_FINETUNE")
+if [[ "$FINETUNE_COUNT" -lt "$MIN_QA_FILES" ]]; then
+    info "A_frontal export incomplete ($FINETUNE_COUNT qa files), using raw QA path for finetune"
     QA_FINETUNE="$QA_ROOT"
 fi
-info "Pretrain QA path: $QA_PRETRAIN"
-info "Finetune QA path: $QA_FINETUNE"
+info "Pretrain QA path: $QA_PRETRAIN  (qa files >= $MIN_QA_FILES check)"
+info "Finetune QA path: $QA_FINETUNE  (qa files >= $MIN_QA_FILES check)"
 
 # --- Stage config table ---
 # Format: PHASE | CONFIG | OUTPUT_DIR | QA_PATH | EXTRA_ARGS
