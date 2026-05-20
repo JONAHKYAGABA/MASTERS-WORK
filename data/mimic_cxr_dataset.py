@@ -899,16 +899,36 @@ class MIMICCXRVQADataset(Dataset):
                             logger.info(f"  Sample question keys: {first_q_keys[:10]}")
                         
                         for q in questions:
-                            # Quality filter (skip if quality_grade is empty/None/"all")
+                            # Quality filter (skip if quality_grade is empty/None/"all").
+                            # QBA stores quality at TWO independent keys:
+                            #   - extraction_quality: how reliably the question was
+                            #     extracted from the report (used for pretrain/finetune split)
+                            #   - question_img_localization_quality: bbox grounding quality
+                            #     (only meaningful for grounding-relevant questions)
+                            # Take the MIN of the two so 'A' = both are A or better.
+                            # Legacy 'question_quality' / 'quality' keys are kept as fallback
+                            # for older QBA dumps.
                             if self.quality_grade and self.quality_grade.lower() not in ('', 'all', 'none'):
-                                q_quality = q.get('question_quality', q.get('quality', {}))
-                                if isinstance(q_quality, dict):
-                                    quality_rating = q_quality.get('overall', q_quality.get('grade', 'B'))
-                                elif isinstance(q_quality, str):
-                                    quality_rating = q_quality
+                                ex_q = q.get('extraction_quality')
+                                loc_q = q.get('question_img_localization_quality')
+                                legacy = q.get('question_quality', q.get('quality'))
+                                # Coerce each to a string grade
+                                def _to_grade(v):
+                                    if isinstance(v, dict):
+                                        return v.get('overall', v.get('grade', 'B'))
+                                    if isinstance(v, str):
+                                        return v
+                                    return None
+                                grades = [g for g in (
+                                    _to_grade(ex_q), _to_grade(loc_q), _to_grade(legacy)
+                                ) if g]
+                                if not grades:
+                                    quality_rating = 'B'  # no quality info → assume B
                                 else:
-                                    quality_rating = 'B'  # Default to B if no quality info
-                                
+                                    # Worst grade across signals (most conservative)
+                                    grade_order = {'A++': 5, 'A+': 4, 'A': 3, 'B': 2, 'C': 1, 'U': 0}
+                                    quality_rating = min(grades, key=lambda g: grade_order.get(g, 0))
+
                                 if not self._meets_quality_grade(quality_rating, self.quality_grade):
                                     skipped_quality += 1
                                     continue
