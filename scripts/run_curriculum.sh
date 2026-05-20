@@ -38,8 +38,8 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 case "$MODE" in
-    smoke|full) ;;
-    *) echo "Unknown mode: $MODE (expected: smoke | full)"; exit 1 ;;
+    smoke|budget|full) ;;
+    *) echo "Unknown mode: $MODE (expected: smoke | budget | full)"; exit 1 ;;
 esac
 
 # ============================================================================
@@ -163,8 +163,26 @@ else
     info "GPUs: 1 (single process)"
 fi
 
+# --- Phase-specific QA paths (QBA pre-built exports) ---
+# Pretrain stages use B_frontal (31M, grade B+, broader/noisier).
+# Finetune uses A_frontal (7.5M, grade A+, clean).
+# Falls back to the raw qa/ dir if exports aren't extracted.
+QA_ROOT="data/mimic-ext-cxr-qba"
+QA_PRETRAIN="$QA_ROOT/exports/B_frontal"
+QA_FINETUNE="$QA_ROOT/exports/A_frontal"
+if [[ ! -d "$QA_PRETRAIN/qa" ]]; then
+    info "B_frontal not extracted, falling back to raw QA path for pretrain stages"
+    QA_PRETRAIN="$QA_ROOT"
+fi
+if [[ ! -d "$QA_FINETUNE/qa" ]]; then
+    info "A_frontal not extracted, falling back to raw QA path for finetune stage"
+    QA_FINETUNE="$QA_ROOT"
+fi
+info "Pretrain QA path: $QA_PRETRAIN"
+info "Finetune QA path: $QA_FINETUNE"
+
 # --- Stage config table ---
-# Format: PHASE | CONFIG | OUTPUT_DIR | EXTRA_ARGS
+# Format: PHASE | CONFIG | OUTPUT_DIR | QA_PATH | EXTRA_ARGS
 declare -a STAGE_PHASE=(sg_only alignment pretrain finetune)
 declare -a STAGE_CFG=(
     "configs/pretrain_config.yaml"
@@ -177,6 +195,12 @@ declare -a STAGE_OUTDIR=(
     "./checkpoints/stage2_alignment"
     "./checkpoints/stage3_pretrain"
     "./checkpoints/stage4_finetune"
+)
+declare -a STAGE_QA=(
+    "$QA_PRETRAIN"   # Stage 1: train SG generator — use broad data
+    "$QA_PRETRAIN"   # Stage 2: alignment on broad data
+    "$QA_PRETRAIN"   # Stage 3: pretrain on broad data
+    "$QA_FINETUNE"   # Stage 4: finetune on clean A-grade data
 )
 # --- Pick Qwen model size: smoke=3B (fast download, fits easily),
 #     full=7B (production). Override with QWEN_MODEL=Qwen/...
@@ -204,7 +228,18 @@ if [[ "$MODE" == "smoke" ]]; then
         # NOTE: --disable_wandb on smoke avoids cluttering wandb with 4 tiny
         # throwaway runs per pipeline test. Full mode logs to wandb.
     )
+elif [[ "$MODE" == "budget" ]]; then
+    # "good enough" model on 2× RTX 8000 in ~3 days using q1M subsets.
+    # batch=2 grad_accum=4 → effective batch 16, safe for Qwen 3B @ 448px.
+    declare -a STAGE_EXTRA=(
+        "--qwen_model_id $QWEN_MODEL --max_samples 200000 --epochs 3 --batch_size 2 --save_steps 500 --push_every_save"
+        "--qwen_model_id $QWEN_MODEL --max_samples 200000 --epochs 2 --batch_size 2 --save_steps 500 --push_every_save"
+        "--qwen_model_id $QWEN_MODEL --max_samples 1000000 --epochs 2 --batch_size 2 --save_steps 1000 --push_every_save"
+        "--qwen_model_id $QWEN_MODEL --max_samples 1000000 --epochs 3 --batch_size 2 --save_steps 1000 --push_every_save"
+    )
 else
+    # "full" = paper-spec curriculum. Takes ~80 days on 2× RTX 8000.
+    # If you actually have that time budget, use this. Otherwise prefer 'budget'.
     declare -a STAGE_EXTRA=(
         "--qwen_model_id $QWEN_MODEL --epochs 20 --save_steps 500 --push_every_save"
         "--qwen_model_id $QWEN_MODEL --epochs 10 --save_steps 500 --push_every_save"
@@ -321,7 +356,7 @@ run_stage() {
             --config "$cfg" \
             --phase "$phase" \
             --mimic_cxr_path data/mimic-cxr-jpg \
-            --mimic_qa_path data/mimic-ext-cxr-qba \
+            --mimic_qa_path "${STAGE_QA[$idx]}" \
             --output_dir "$outdir" \
             "${DIST_FLAGS[@]}" \
             "${resume_flags[@]}" \
