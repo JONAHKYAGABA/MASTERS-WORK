@@ -294,14 +294,37 @@ class MultiTaskLoss(nn.Module):
                 bbox_loss = bbox_loss + F.smooth_l1_loss(pred_box.float(), gt_box_matched.float())
             
             # Entity loss
+            # QBA scene graphs occasionally contain entity IDs >= num_entities
+            # (legacy/expanded vocab vs the trained head). Mask those out with
+            # ignore_index=-100 instead of clamping (clamping would teach the
+            # head to predict class 0 for unknown entities, which is worse).
             if gt_entities is not None and b < len(gt_entities) and gt_entities[b] is not None:
                 ent_target = gt_entities[b].to(device)[:K].long()
-                entity_loss = entity_loss + self.ce_loss(entity_logits[b, :K].float(), ent_target)
-            
-            # Region loss
+                num_ent = entity_logits.shape[-1]
+                ent_target = torch.where(
+                    (ent_target >= 0) & (ent_target < num_ent),
+                    ent_target,
+                    torch.full_like(ent_target, self.ignore_index),
+                )
+                if (ent_target != -100).any():
+                    entity_loss = entity_loss + self.ce_loss(
+                        entity_logits[b, :K].float(), ent_target,
+                    )
+
+            # Region loss — same clamp pattern (this was the failing site:
+            #   training/loss.py:304 → t >= n_classes assertion)
             if gt_regions is not None and b < len(gt_regions) and gt_regions[b] is not None:
                 reg_target = gt_regions[b].to(device)[:K].long()
-                region_loss = region_loss + self.ce_loss(region_logits[b, :K].float(), reg_target)
+                num_reg = region_logits.shape[-1]
+                reg_target = torch.where(
+                    (reg_target >= 0) & (reg_target < num_reg),
+                    reg_target,
+                    torch.full_like(reg_target, self.ignore_index),
+                )
+                if (reg_target != -100).any():
+                    region_loss = region_loss + self.ce_loss(
+                        region_logits[b, :K].float(), reg_target,
+                    )
             
             # Objectness loss (float32 — bce_with_logits can overflow in FP16)
             obj_target = torch.zeros(N, dtype=torch.float32, device=device)
