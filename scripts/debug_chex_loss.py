@@ -31,16 +31,20 @@ def main():
     cfg = load_config_from_file('configs/pretrain_config.yaml')
     cfg.data.quality_grade = 'all'
 
-    print(f"\n[config] mimic_cxr_path = {cfg.data.mimic_cxr_path}")
-    print(f"[config] mimic_qa_path = {cfg.data.mimic_qa_path}")
+    # Use the actual paths the trainer's launch uses, not the config defaults
+    # (which are /path/to/... placeholders).
+    mimic_cxr = 'data/mimic-cxr-jpg'
+    mimic_qa = 'data/mimic-ext-cxr-qba'
+    print(f"\n[config] mimic_cxr = {mimic_cxr}")
+    print(f"[config] mimic_qa  = {mimic_qa}")
     print(f"[config] chexpert_labels_path = {getattr(cfg.data, 'chexpert_labels_path', '(default)')}")
     print(f"[config] quality_grade = {cfg.data.quality_grade}")
 
     # Build a tiny dataset directly — uses .cache/dataset_samples/*.pkl if present.
     print(f"\n[1] Building dataset (4 samples)...")
     ds = MIMICCXRVQADataset(
-        mimic_cxr_path=cfg.data.mimic_cxr_path or 'data/mimic-cxr-jpg',
-        mimic_qa_path=cfg.data.mimic_qa_path or 'data/mimic-ext-cxr-qba',
+        mimic_cxr_path=mimic_cxr,
+        mimic_qa_path=mimic_qa,
         split='train',
         max_samples=4,
         quality_grade='all',
