@@ -202,12 +202,14 @@ declare -a STAGE_QA=(
     "$QA_PRETRAIN"   # Stage 3: pretrain on broad data
     "$QA_FINETUNE"   # Stage 4: finetune on clean A-grade data
 )
-# --- Pick Qwen model size: smoke=3B (fast download, fits easily),
-#     full=7B (production). Override with QWEN_MODEL=Qwen/...
-if [[ "$MODE" == "smoke" ]]; then
-    QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
-else
+# --- Pick Qwen model size:
+#   smoke / budget → 3B (fast, batch=2 fits comfortably on RTX 8000)
+#   full           → 7B (production target; needs batch=1)
+# Override with QWEN_MODEL=Qwen/... at the env-var level.
+if [[ "$MODE" == "full" ]]; then
     QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
+else
+    QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
 fi
 info "Qwen model: $QWEN_MODEL"
 
@@ -231,11 +233,14 @@ if [[ "$MODE" == "smoke" ]]; then
 elif [[ "$MODE" == "budget" ]]; then
     # "good enough" model on 2× RTX 8000 in ~3 days using q1M subsets.
     # batch=2 grad_accum=4 → effective batch 16, safe for Qwen 3B @ 448px.
+    # --skip_data_check: skip analyze_data.py prerequisite (we already verified
+    #   the data is present; the full dataset analysis takes 30+ min and isn't
+    #   needed for the budget run).
     declare -a STAGE_EXTRA=(
-        "--qwen_model_id $QWEN_MODEL --max_samples 200000 --epochs 3 --batch_size 2 --save_steps 500 --push_every_save"
-        "--qwen_model_id $QWEN_MODEL --max_samples 200000 --epochs 2 --batch_size 2 --save_steps 500 --push_every_save"
-        "--qwen_model_id $QWEN_MODEL --max_samples 1000000 --epochs 2 --batch_size 2 --save_steps 1000 --push_every_save"
-        "--qwen_model_id $QWEN_MODEL --max_samples 1000000 --epochs 3 --batch_size 2 --save_steps 1000 --push_every_save"
+        "--qwen_model_id $QWEN_MODEL --max_samples 200000 --epochs 3 --batch_size 2 --save_steps 500 --push_every_save --skip_data_check"
+        "--qwen_model_id $QWEN_MODEL --max_samples 200000 --epochs 2 --batch_size 2 --save_steps 500 --push_every_save --skip_data_check"
+        "--qwen_model_id $QWEN_MODEL --max_samples 1000000 --epochs 2 --batch_size 2 --save_steps 1000 --push_every_save --skip_data_check"
+        "--qwen_model_id $QWEN_MODEL --max_samples 1000000 --epochs 3 --batch_size 2 --save_steps 1000 --push_every_save --skip_data_check"
     )
 else
     # "full" = paper-spec curriculum. Takes ~80 days on 2× RTX 8000.
