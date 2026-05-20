@@ -416,13 +416,28 @@ class MIMICCXRVQADataset(Dataset):
         # Load metadata for view filtering
         self.metadata_df = self._load_metadata()
         
-        # Initialize CheXpert loader
-        if chexpert_labels_path:
-            self.chexpert_loader = CheXpertLabelLoader(chexpert_labels_path)
+        # Initialize CheXpert loader.
+        # Falls back to mimic_cxr_path/mimic-cxr-2.0.0-chexpert.csv.gz if the
+        # configured path is empty OR missing on this machine. Configs often
+        # carry stale absolute paths from another developer's box ("/home/X/...")
+        # and would otherwise silently leave chex_loss=0 for the whole run.
+        default_chexpert = self.mimic_cxr_path / 'mimic-cxr-2.0.0-chexpert.csv.gz'
+        chosen_path: Optional[str] = None
+        if chexpert_labels_path and os.path.exists(chexpert_labels_path):
+            chosen_path = chexpert_labels_path
+        elif default_chexpert.exists():
+            if chexpert_labels_path:
+                logger.warning(
+                    f"chexpert_labels_path={chexpert_labels_path} does not exist; "
+                    f"falling back to {default_chexpert}"
+                )
+            chosen_path = str(default_chexpert)
         else:
-            # Default to MIMIC-CXR-JPG chexpert labels
-            default_chexpert = self.mimic_cxr_path / 'mimic-cxr-2.0.0-chexpert.csv.gz'
-            self.chexpert_loader = CheXpertLabelLoader(str(default_chexpert) if default_chexpert.exists() else None)
+            logger.warning(
+                f"No CheXpert CSV found (tried {chexpert_labels_path or '(empty)'} "
+                f"and {default_chexpert}). chex_loss will stay at 0."
+            )
+        self.chexpert_loader = CheXpertLabelLoader(chosen_path)
         
         # Initialize scene graph processor
         self.sg_processor = SceneGraphProcessor()
