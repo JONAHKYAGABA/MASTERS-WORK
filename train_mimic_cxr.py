@@ -1995,10 +1995,36 @@ def main(args):
             except Exception as e:
                 logger.warning(f"Could not restore RNG state: {e}")
 
-    # Start epoch and global step (may be set by --resume_from_checkpoint above)
-    # For finetuning: always start from epoch 1, step 0 (fresh optimizer/scheduler)
-    # For resuming pretrain: pick up where we left off
-    start_epoch = resume_epoch + 1 if resume_epoch > 0 else 1
+    # Start epoch and global step (may be set by --resume_from_checkpoint above).
+    # For finetuning: always start from epoch 1, step 0 (fresh optimizer/scheduler).
+    # For resuming pretrain: pick up where we left off.
+    #
+    # Mid-epoch resume detection: the saved `epoch` field is the epoch that
+    # was IN PROGRESS when the checkpoint was written. If the saved global_step
+    # is not a clean multiple of steps_per_epoch, we were mid-epoch — continue
+    # from the SAME epoch. Otherwise the previous epoch finished cleanly and we
+    # advance to epoch+1.
+    #
+    # Without this, mid-epoch saves silently skip the rest of the epoch on
+    # resume (you lose up to (1 - save_step%steps_per_epoch)/steps_per_epoch
+    # of training for that epoch). Real bug discovered in Stage 2 of the
+    # budget curriculum — lost ~96% of epoch 1 after auto_resume from
+    # checkpoint-500 (12500 steps_per_epoch → 500/12500 = 4% complete).
+    if resume_epoch > 0:
+        steps_per_epoch = len(train_dataloader) // config.training.gradient_accumulation_steps
+        was_mid_epoch = steps_per_epoch > 0 and (resume_step % steps_per_epoch) != 0
+        if was_mid_epoch:
+            start_epoch = resume_epoch  # continue same epoch
+            if is_main_process(local_rank):
+                logger.info(
+                    f"Resume is MID-EPOCH (step {resume_step} % {steps_per_epoch} "
+                    f"steps_per_epoch != 0). Continuing epoch {resume_epoch} "
+                    f"rather than advancing to epoch {resume_epoch + 1}."
+                )
+        else:
+            start_epoch = resume_epoch + 1  # previous epoch finished cleanly
+    else:
+        start_epoch = 1
     global_step = resume_step
 
     # Print training info (main process only)
