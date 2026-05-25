@@ -146,19 +146,42 @@ class MultiTaskLoss(nn.Module):
         for head_name, indices in head_indices.items():
             if not indices or head_name not in vqa_logits:
                 continue
-            
+
             indices_tensor = torch.tensor(indices, device=device)
             head_logits = vqa_logits[head_name]
-            
+
             if head_name in vqa_targets:
                 head_targets = vqa_targets[head_name]
-                
+
                 if len(indices) < head_logits.shape[0]:
                     head_logits = head_logits[indices_tensor]
                     head_targets = head_targets[indices_tensor]
-                
-                head_loss = self.ce_loss(head_logits.float(), head_targets)
-                
+
+                # CRITICAL: aux_heads can produce NaN logits when their input
+                # (Qwen's pooled hidden state) is contaminated by NaN from
+                # upstream (e.g. SG token injection on fp16/Turing). The old
+                # code silently dropped NaN losses → vqa_loss stuck at 0.0
+                # for thousands of steps with zero gradient signal. Now we
+                # scrub NaN/Inf at the logit level so CE produces a real loss,
+                # AND emit a one-time-per-process warning so we know it's
+                # happening (instead of staring at vqa=0.0000 for hours).
+                head_logits = head_logits.float()
+                if not torch.isfinite(head_logits).all():
+                    if not getattr(self, '_warned_nan_vqa', False):
+                        import warnings as _w
+                        _w.warn(
+                            f"vqa_{head_name}_logits contains NaN/Inf — "
+                            f"scrubbing with nan_to_num. This usually means "
+                            f"the SG injection or pooled hidden state is "
+                            f"producing NaN upstream. Investigate the model "
+                            f"forward path.",
+                            stacklevel=2,
+                        )
+                        self._warned_nan_vqa = True
+                    head_logits = torch.nan_to_num(head_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+                head_loss = self.ce_loss(head_logits, head_targets)
+
                 if not torch.isnan(head_loss):
                     loss_dict[f'vqa_{head_name}_loss'] = head_loss
                     total_vqa_loss = total_vqa_loss + self.head_weights.get(head_name, 1.0) * head_loss
