@@ -370,13 +370,21 @@ class MultiTaskLoss(nn.Module):
         
         loss_dict['grounding_bbox_loss'] = bbox_loss
         
-        # Pointing loss (compute in float32 — BCE can produce -inf in FP16 for p≈0 or p≈1)
-        score = pointing_score.view(B, 1).float().clamp(1e-6, 1.0 - 1e-6)
+        # Pointing loss (compute in float32 — BCE can produce -inf in FP16 for p≈0 or p≈1).
+        # CRITICAL: .clamp() PROPAGATES NaN unchanged. Real crash hit at Stage 2
+        # step 10344: pointing_score became NaN upstream (mHC/sinkhorn instability),
+        # clamp kept it as NaN, BCE asserted `input_val >= 0 && <= 1` and SIGABRTed
+        # the rank. nan_to_num replaces NaN with 0.5 (neutral) before clamp so
+        # one bad batch can't take down the entire training run.
+        score = pointing_score.view(B, 1).float()
+        score = torch.nan_to_num(score, nan=0.5, posinf=1.0, neginf=0.0)
+        score = score.clamp(1e-6, 1.0 - 1e-6)
         if gt_pointing_valid is not None:
             pointing_target = gt_pointing_valid.float().view(B, 1)
+            pointing_target = torch.nan_to_num(pointing_target, nan=0.0)
         else:
             pointing_target = torch.ones(B, 1, dtype=torch.float32, device=device)
-        
+
         pointing_loss = F.binary_cross_entropy(score, pointing_target)
         loss_dict['grounding_pointing_loss'] = pointing_loss
         
