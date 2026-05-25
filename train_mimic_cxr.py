@@ -1678,8 +1678,12 @@ def main(args):
 
     # Mode-specific LR override (ADR-026 / migration notes):
     #   pretrain → 2e-4 (LoRA warmup), finetune → 5e-5 (refinement)
+    # The override is SKIPPED if the user explicitly passed --learning_rate on
+    # the CLI (args.learning_rate is set). Without this skip, --learning_rate
+    # 2e-5 silently became 2e-4 in pretrain mode → 10× higher than requested →
+    # fp16 loss-scaler floor crash within ~5 hours (Stage 2's failure mode).
     _MODE_LR = {'sg_only': 1e-4, 'alignment': 5e-5, 'pretrain': 2e-4, 'finetune': 5e-5, 'rl': 1e-5}
-    if _phase in _MODE_LR:
+    if _phase in _MODE_LR and not args.learning_rate:
         _new_lr = _MODE_LR[_phase]
         if is_main_process(local_rank):
             logger.info(
@@ -1687,6 +1691,11 @@ def main(args):
                 f"{config.training.learning_rate} -> {_new_lr}"
             )
         config.training.learning_rate = _new_lr
+    elif args.learning_rate and is_main_process(local_rank):
+        logger.info(
+            f"Mode-specific LR override SKIPPED for '{_phase}' — "
+            f"using user-specified --learning_rate {args.learning_rate}"
+        )
     
     # ==================================================================
     # LOAD PRETRAINED CHECKPOINT (for finetuning or resuming)
