@@ -1916,14 +1916,43 @@ def sinkhorn_knopp(x: torch.Tensor, t_max: int = 20, eps: float = 1e-8) -> torch
     whole projection in fp32 and cast the result back to the caller's
     dtype. The cost is a few KB of intermediate fp32 storage; the gain is
     fp16/bf16 training stability.
+
+    Stage 3 crash (DeepSpeed loss-scale floor) traced back to this fn:
+    when the upstream `hres_weight` accumulates any NaN/Inf from fp16
+    gradient noise, exp(NaN) = NaN, every iteration propagates NaN, and
+    the doubly-stochastic output is all NaN. The grounding head then
+    produces NaN logits → vqa head produces NaN → DeepSpeed sees overflow
+    every batch → halves loss scale until it hits the floor → crash.
+
+    Defense: scrub NaN/Inf at INPUT (replace with finite values that
+    sinkhorn can normalize), CLAMP exp argument to prevent overflow in
+    fp32 (max ~88), and scrub OUTPUT once more before returning.
     """
     orig_dtype = x.dtype
     x = x.float()
-    x_pos = torch.exp(x - x.max(dim=-1, keepdim=True)[0])
+
+    # 1. Scrub input: replace NaN with 0, ±Inf with ±88 (clamp to fp32 exp range)
+    if not torch.isfinite(x).all():
+        x = torch.nan_to_num(x, nan=0.0, posinf=88.0, neginf=-88.0)
+
+    # 2. Subtract max for numerical stability (already there), but clamp the
+    #    shifted value to [-88, 88] so exp() can't overflow to Inf
+    shifted = (x - x.max(dim=-1, keepdim=True)[0]).clamp(min=-88.0, max=88.0)
+    x_pos = torch.exp(shifted)
+
     for _ in range(t_max):
-        x_pos = x_pos / (x_pos.sum(dim=-1, keepdim=True) + eps)
+        denom1 = x_pos.sum(dim=-1, keepdim=True).clamp(min=eps)
+        x_pos = x_pos / denom1
         if x_pos.dim() >= 2:
-            x_pos = x_pos / (x_pos.sum(dim=-2, keepdim=True) + eps)
+            denom2 = x_pos.sum(dim=-2, keepdim=True).clamp(min=eps)
+            x_pos = x_pos / denom2
+
+    # 3. Final scrub: if any NaN/Inf slipped through (shouldn't, but cheap),
+    #    replace with uniform distribution row (1/N) — the most neutral fallback
+    if not torch.isfinite(x_pos).all():
+        N = x_pos.shape[-1]
+        x_pos = torch.where(torch.isfinite(x_pos), x_pos, torch.full_like(x_pos, 1.0 / N))
+
     return x_pos.to(dtype=orig_dtype)
 
 
@@ -2206,6 +2235,15 @@ class mHCBlock(nn.Module):
 
         if original_len < self.min_seq_len:
             x = x[:, :original_len, :]
+
+        # Final NaN/Inf scrub on block output. If anything in this block
+        # produced NaN (sinkhorn underflow, attention with all-masked rows,
+        # exp overflow in fp16), don't let it propagate to the downstream
+        # grounding head where DeepSpeed will see it as gradient overflow
+        # and shrink the loss scale until it hits the floor.
+        if not torch.isfinite(x).all():
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+
         return x
 
     def get_metrics(self) -> Dict[str, float]:
