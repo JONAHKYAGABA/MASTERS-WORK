@@ -1146,6 +1146,23 @@ class SSGVQANetV2(nn.Module):
         # Grounding head — active once we have a real signal
         set_grad(self.grounding_head, mode in {"pretrain", "finetune", "rl"})
 
+        # KEEP mHC FROZEN ACROSS ALL STAGES.
+        # Reason: on Turing GPUs (RTX 8000, compute capability 7.5) the
+        # Sinkhorn-Knopp projection in mHC produces gradient overflow under
+        # fp16 within ~4-10K training steps once unfrozen. DeepSpeed's
+        # dynamic loss scaler halves the scale on every overflow until it
+        # hits the floor (1.0), then aborts with
+        # "Current loss scale already at minimum". Stage 3 crashed 3× in
+        # a row at steps 4000, 4000, 5000 with this exact failure.
+        # The rest of grounding_head (llm_proj, sg_proj, cross_attn,
+        # delta_head, pointing_head) trains fine — they're vanilla linear
+        # layers. Freezing only the mHC sub-block preserves its forward
+        # behavior (computed from Stage 1's init weights) while removing
+        # the unstable gradient path. On Ampere+ (bf16-capable) hardware
+        # this restriction could be lifted.
+        if hasattr(self.grounding_head, "mhc") and self.grounding_head.mhc is not None:
+            set_grad(self.grounding_head.mhc, False)
+
         # Aux heads
         set_grad(self.aux_heads, mode in {"alignment", "pretrain", "finetune", "rl"})
 
