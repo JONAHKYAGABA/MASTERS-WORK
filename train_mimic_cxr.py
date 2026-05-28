@@ -1676,6 +1676,19 @@ def main(args):
     if is_main_process(local_rank):
         logger.info(f"Cast SG/grounding/aux modules to {_qwen_dtype} to match Qwen.")
 
+    # Re-cast mHC back to fp32 (Option C — mHC fp32 compute path).
+    # On Turing GPUs (RTX 8000, cc 7.5) without bf16, the Sinkhorn-Knopp
+    # projection in mHC produces gradient overflow under fp16 within
+    # ~4-10K training steps once grounding_head unfreezes. Keeping mHC's
+    # weights in fp32 (small block, ~256 KB) lets the manifold math run
+    # numerically stable. mHCBlock.forward casts input fp16→fp32 on entry
+    # and fp32→fp16 on exit, so the rest of grounding_head still runs in
+    # the dominant dtype.
+    if hasattr(model, "grounding_head") and getattr(model.grounding_head, "mhc", None) is not None:
+        model.grounding_head.mhc.to(dtype=torch.float32)
+        if is_main_process(local_rank):
+            logger.info(f"Re-cast mHC sub-block to fp32 (Option C — stability fix).")
+
     # Mode-specific LR override (ADR-026 / migration notes):
     #   pretrain → 2e-4 (LoRA warmup), finetune → 5e-5 (refinement)
     # The override is SKIPPED if the user explicitly passed --learning_rate on

@@ -1143,25 +1143,12 @@ class SSGVQANetV2(nn.Module):
         set_grad(self.sg_encoder, train_sg_path and mode != "sg_only")
         set_grad(self.sg_projector, train_sg_path and mode != "sg_only")
 
-        # Grounding head — active once we have a real signal
+        # Grounding head — active once we have a real signal.
+        # mHC sub-block runs in fp32 (re-cast by trainer after the bulk
+        # grounding_head→fp16 cast) so its Sinkhorn-Knopp gradients are
+        # numerically stable on Turing without bf16 support. The rest of
+        # grounding_head trains in fp16 like everything else.
         set_grad(self.grounding_head, mode in {"pretrain", "finetune", "rl"})
-
-        # KEEP mHC FROZEN ACROSS ALL STAGES.
-        # Reason: on Turing GPUs (RTX 8000, compute capability 7.5) the
-        # Sinkhorn-Knopp projection in mHC produces gradient overflow under
-        # fp16 within ~4-10K training steps once unfrozen. DeepSpeed's
-        # dynamic loss scaler halves the scale on every overflow until it
-        # hits the floor (1.0), then aborts with
-        # "Current loss scale already at minimum". Stage 3 crashed 3× in
-        # a row at steps 4000, 4000, 5000 with this exact failure.
-        # The rest of grounding_head (llm_proj, sg_proj, cross_attn,
-        # delta_head, pointing_head) trains fine — they're vanilla linear
-        # layers. Freezing only the mHC sub-block preserves its forward
-        # behavior (computed from Stage 1's init weights) while removing
-        # the unstable gradient path. On Ampere+ (bf16-capable) hardware
-        # this restriction could be lifted.
-        if hasattr(self.grounding_head, "mhc") and self.grounding_head.mhc is not None:
-            set_grad(self.grounding_head.mhc, False)
 
         # Aux heads
         set_grad(self.aux_heads, mode in {"alignment", "pretrain", "finetune", "rl"})
@@ -2225,12 +2212,21 @@ class mHCBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        # Option C dtype boundary: this block's params are fp32 (re-cast by
+        # the trainer for Sinkhorn stability on Turing). Cast input fp16→fp32
+        # on entry, do all math in fp32, cast output back to caller's dtype
+        # on exit. Cost: ~256KB transient fp32 storage per batch — negligible.
+        caller_dtype = x.dtype
+        param_dtype = self._get_param_dtype()
+        if x.dtype != param_dtype:
+            x = x.to(dtype=param_dtype)
+
         B, L, _ = x.shape
         original_len = L
         if L < self.min_seq_len:
             pad_len = self.min_seq_len - L
             x = F.pad(x, (0, 0, 0, pad_len), value=0)
-            x[:, original_len:, :] = x[:, original_len:, :] + self.pos_embed[:, :pad_len, :]
+            x[:, original_len:, :] = x[:, original_len:, :] + self.pos_embed[:, :pad_len, :].to(dtype=param_dtype)
             if key_padding_mask is not None:
                 key_padding_mask = F.pad(key_padding_mask, (0, pad_len), value=True)
             else:
@@ -2260,6 +2256,11 @@ class mHCBlock(nn.Module):
         # and shrink the loss scale until it hits the floor.
         if not torch.isfinite(x).all():
             x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # Cast back to caller's dtype (typically fp16) so the rest of
+        # grounding_head sees the expected dtype.
+        if x.dtype != caller_dtype:
+            x = x.to(dtype=caller_dtype)
 
         return x
 
