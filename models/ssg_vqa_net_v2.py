@@ -1192,6 +1192,110 @@ class SSGVQANetV2(nn.Module):
     # Scene graph pipeline
     # ----------------------------------------------------------------------
 
+    def _describe_vit_struct(self, x: Any, depth: int = 0, max_depth: int = 4) -> str:
+        """One-line dump of a possibly-nested ViT return value. Used for the
+        first-call diagnostic so we can SEE what Qwen3-VL handed us."""
+        indent = "  " * depth
+        if depth > max_depth:
+            return f"{indent}<...>"
+        if isinstance(x, torch.Tensor):
+            return f"{indent}Tensor{tuple(x.shape)} dtype={x.dtype}"
+        if isinstance(x, (list, tuple)):
+            head = f"{indent}{type(x).__name__}(len={len(x)})"
+            inner = "\n".join(self._describe_vit_struct(t, depth + 1, max_depth)
+                              for t in x[:6])
+            tail = f"\n{indent}  ...(+{len(x)-6} more)" if len(x) > 6 else ""
+            return f"{head}\n{inner}{tail}"
+        if isinstance(x, dict):
+            head = f"{indent}dict(keys={list(x.keys())})"
+            inner = "\n".join(
+                f"{indent}  [{k}]:\n{self._describe_vit_struct(v, depth + 2, max_depth)}"
+                for k, v in x.items()
+            )
+            return f"{head}\n{inner}"
+        if hasattr(x, "last_hidden_state"):
+            return (f"{indent}{type(x).__name__} ModelOutput\n"
+                    f"{self._describe_vit_struct(x.last_hidden_state, depth + 1, max_depth)}")
+        return f"{indent}{type(x).__name__}={x!r}"
+
+    def _unwrap_vit_features(self, vit_out: Any) -> torch.Tensor:
+        """Recursively find a 2D tensor of shape (*, d_llm) inside Qwen-VL's
+        ``base.visual(...)`` return value.
+
+        Qwen3-VL DeepStack returns nested structures whose exact shape varies
+        by transformers version: sometimes a plain tensor, sometimes a tuple
+        ``(merged, [level1, level2, ...])``, sometimes a dict. Rather than
+        guess the index, we walk the structure looking for a 2D tensor whose
+        last-dim matches self.d_llm — that uniquely identifies the
+        post-merger feature tensor in every shape we've seen.
+
+        On the first call we PRINT the structure (not log — print bypasses
+        the smoke-test's logger config) so a future version skew gives us a
+        legible structural dump instead of an AttributeError.
+        """
+        # First-call structural dump — visible in every smoke / training log.
+        if not getattr(self, "_logged_vit_return_shape", False):
+            dump = self._describe_vit_struct(vit_out)
+            print(
+                f"[Qwen-VL ViT] base.visual(...) returned:\n{dump}\n"
+                f"[Qwen-VL ViT] Searching for 2D tensor with last-dim == d_llm = {self.d_llm} ...",
+                flush=True,
+            )
+            self._logged_vit_return_shape = True
+
+        d_llm = self.d_llm
+
+        def _walk(x: Any, path: str = "$"):
+            """Yield (tensor, path) for every torch.Tensor reachable from x."""
+            if isinstance(x, torch.Tensor):
+                yield x, path
+                return
+            if hasattr(x, "last_hidden_state"):
+                yield from _walk(x.last_hidden_state, f"{path}.last_hidden_state")
+                return
+            if isinstance(x, dict):
+                for k in ("last_hidden_state", "hidden_states", "merged_features",
+                          "features", "image_embeds"):
+                    if k in x:
+                        yield from _walk(x[k], f"{path}[{k!r}]")
+                for k, v in x.items():
+                    yield from _walk(v, f"{path}[{k!r}]")
+                return
+            if isinstance(x, (list, tuple)):
+                for i, v in enumerate(x):
+                    yield from _walk(v, f"{path}[{i}]")
+                return
+
+        # Pass 1: exact match (2D, last-dim == d_llm). This is what we want.
+        for t, path in _walk(vit_out):
+            if t.dim() == 2 and t.size(-1) == d_llm:
+                if not getattr(self, "_logged_vit_match_path", False):
+                    print(f"[Qwen-VL ViT] Picked {path} with shape {tuple(t.shape)}",
+                          flush=True)
+                    self._logged_vit_match_path = True
+                return t
+
+        # Pass 2: 3D match (B, N, d_llm) — flatten leading dims. Some
+        # transformers builds return per-batch instead of packed.
+        for t, path in _walk(vit_out):
+            if t.dim() == 3 and t.size(-1) == d_llm:
+                if not getattr(self, "_logged_vit_match_path", False):
+                    print(f"[Qwen-VL ViT] Picked {path} with shape {tuple(t.shape)} "
+                          f"(3D — flattening to 2D)", flush=True)
+                    self._logged_vit_match_path = True
+                return t.reshape(-1, d_llm)
+
+        # No match — dump everything we saw for debugging and raise.
+        seen = [(tuple(t.shape), str(t.dtype), path) for t, path in _walk(vit_out)]
+        raise RuntimeError(
+            f"Could not find a tensor with last-dim == d_llm ({d_llm}) inside "
+            f"base.visual(...) output. Saw the following tensors:\n  "
+            + "\n  ".join(f"{path}: shape={shape} dtype={dtype}" for shape, dtype, path in seen)
+            + "\nPaste this list back to debug. The fix is either to (a) pick the "
+              "right tensor here, or (b) lower the SG generator's visual_dim to "
+              "match a real ViT level."
+        )
+
     def _extract_qwen_vit_feature_maps(
         self,
         pixel_values: torch.Tensor,
@@ -1229,47 +1333,14 @@ class SSGVQANetV2(nn.Module):
         with ctx:
             vit_out = visual(pixel_values, grid_thw=image_grid_thw)
 
-        # DeepStack tolerance — collapse to a single tensor regardless of which
-        # return convention this transformers build uses.
-        if isinstance(vit_out, (list, tuple)):
-            if not getattr(self, "_logged_vit_return_shape", False):
-                shapes = [getattr(t, "shape", type(t).__name__) for t in vit_out]
-                logger.info(
-                    f"[Qwen3-VL DeepStack] base.visual(...) returned a "
-                    f"{type(vit_out).__name__} of {len(vit_out)} tensors with "
-                    f"shapes {shapes}. Using the LAST element for SG features."
-                )
-                self._logged_vit_return_shape = True
-            vit_out = vit_out[-1]
-        elif hasattr(vit_out, "last_hidden_state"):
-            # Some transformers versions wrap ViT output in a ModelOutput dataclass.
-            if not getattr(self, "_logged_vit_return_shape", False):
-                logger.info(
-                    f"[Qwen3-VL] base.visual(...) returned a {type(vit_out).__name__} "
-                    f"ModelOutput; using .last_hidden_state."
-                )
-                self._logged_vit_return_shape = True
-            vit_out = vit_out.last_hidden_state
-        else:
-            if not getattr(self, "_logged_vit_return_shape", False):
-                logger.info(
-                    f"[Qwen-VL] base.visual(...) returned a single tensor of "
-                    f"shape {tuple(vit_out.shape)}; using directly (Qwen2.5-VL style)."
-                )
-                self._logged_vit_return_shape = True
-
-        # Final shape check: must be (total_merged_tokens, d_llm). If the deepest
-        # tensor is at the raw ViT hidden (e.g. 1152) instead of d_llm, the
-        # downstream Conv2d RPN's in_channels will mismatch and crash loudly.
-        # Catch it here with a more legible error.
-        if vit_out.dim() != 2 or vit_out.size(-1) != self.d_llm:
-            raise RuntimeError(
-                f"Qwen ViT returned shape {tuple(vit_out.shape)}, expected "
-                f"(total_merged_tokens, d_llm={self.d_llm}). This usually means "
-                f"DeepStack is returning a pre-merger feature level — pick the "
-                f"correct element in _extract_qwen_vit_feature_maps, or change "
-                f"SceneGraphGenerator's visual_dim to match."
-            )
+        # DeepStack tolerance — Qwen3-VL's `.visual(...)` can return a NESTED
+        # structure (tuple/list/dict/ModelOutput, sometimes nested 2+ deep).
+        # Earlier attempts to grab `[-1]` blindly hit "list of lists" cases.
+        # Instead: recursively search the structure for a 2D tensor whose
+        # last-dim matches d_llm — that's the post-merger feature tensor we
+        # actually want. We print (not log) the structure on first call so
+        # smoke-test stdout shows it regardless of how logging is configured.
+        vit_out = self._unwrap_vit_features(vit_out)
 
         # Qwen3-VL renamed vision_config.spatial_merge_size in some builds;
         # try both before defaulting.
