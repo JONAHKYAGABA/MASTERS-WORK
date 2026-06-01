@@ -2,14 +2,14 @@
 models — v2 entry point.
 
 The previous v1 model (MIMICCXRVQAModel + ConvNeXt + Bio_ClinicalBERT + custom
-decoder) has been retired. v2 wraps Qwen2.5-VL with LoRA, scene-graph soft
+decoder) has been retired. v2 wraps Qwen3-VL with LoRA, scene-graph soft
 tokens, and a manifold-constrained grounding refinement head.
 
 Usage:
     from models import SSGVQANetV2
 
     model = SSGVQANetV2(
-        qwen_model_id="Qwen/Qwen2.5-VL-7B-Instruct",
+        qwen_model_id="Qwen/Qwen3-VL-8B-Instruct",
         use_quantization=True,
         training_mode="pretrain",
     )

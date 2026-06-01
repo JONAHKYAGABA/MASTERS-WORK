@@ -16,7 +16,7 @@ Exit codes:
 
 Usage:
   python scripts/smoke_test_v2.py
-  python scripts/smoke_test_v2.py --model_id Qwen/Qwen2.5-VL-7B-Instruct
+  python scripts/smoke_test_v2.py --model_id Qwen/Qwen3-VL-4B-Instruct
   python scripts/smoke_test_v2.py --no_quantization   # full-precision LoRA
   python scripts/smoke_test_v2.py --gpus 0,2          # subset of GPUs
 """
@@ -263,8 +263,8 @@ def _run_one_gpu(
 
 def main(argv: List[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="SSG-VQA-Net v2 per-GPU smoke test")
-    p.add_argument("--model_id", default="Qwen/Qwen2.5-VL-3B-Instruct",
-                   help="Qwen2.5-VL HF id (default: 3B for fast iteration)")
+    p.add_argument("--model_id", default="Qwen/Qwen3-VL-8B-Instruct",
+                   help="Qwen-VL HF id (default: Qwen3-VL-8B; use 4B/2B for faster iteration)")
     p.add_argument("--no_quantization", action="store_true",
                    help="Disable 4-bit QLoRA (only use on Ampere+ with VRAM headroom)")
     p.add_argument("--batch_size", type=int, default=1)

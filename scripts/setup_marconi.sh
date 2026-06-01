@@ -24,7 +24,7 @@ VENV_DIR="${VENV_DIR:-$PROJECT_ROOT/.venv}"
 MIMIC_CXR_ROOT="${MIMIC_CXR_ROOT:-$PROJECT_ROOT/data/mimic-cxr-jpg}"
 MIMIC_QA_ROOT="${MIMIC_QA_ROOT:-$PROJECT_ROOT/data/mimic-ext-cxr-qba}"
 SG_ROOT="${SG_ROOT:-$PROJECT_ROOT/data/mimic-ext-cxr-qba}"
-SMOKE_MODEL="${SMOKE_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
+SMOKE_MODEL="${SMOKE_MODEL:-Qwen/Qwen3-VL-4B-Instruct}"
 SYSTEM_PY="${SYSTEM_PY:-python3}"
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; B='\033[0;34m'; N='\033[0m'

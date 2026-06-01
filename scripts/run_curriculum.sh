@@ -212,14 +212,15 @@ declare -a STAGE_QA=(
     "$QA_PRETRAIN"   # Stage 3: pretrain on broad data
     "$QA_FINETUNE"   # Stage 4: finetune on clean A-grade data
 )
-# --- Pick Qwen model size:
-#   smoke / budget → 3B (fast, batch=2 fits comfortably on RTX 8000)
-#   full           → 7B (production target; needs batch=1)
+# --- Pick Qwen3-VL model size:
+#   smoke / budget → 4B (fast iteration, batch=1-2 fits on RTX 8000)
+#   full           → 8B (production target; needs batch=1 on 48GB Turing)
 # Override with QWEN_MODEL=Qwen/... at the env-var level.
+# (Use Qwen/Qwen3-VL-2B-Instruct for the absolute fastest smoke loop.)
 if [[ "$MODE" == "full" ]]; then
-    QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
+    QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen3-VL-8B-Instruct}"
 else
-    QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
+    QWEN_MODEL="${QWEN_MODEL:-Qwen/Qwen3-VL-4B-Instruct}"
 fi
 info "Qwen model: $QWEN_MODEL"
 

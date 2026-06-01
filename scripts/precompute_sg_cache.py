@@ -218,7 +218,7 @@ def main():
                     choices=["train", "validate", "test"])
     ap.add_argument("--max_samples",    type=int, default=None,
                     help="Limit (for smoke tests). Default: full split.")
-    ap.add_argument("--qwen_model_id",  type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
+    ap.add_argument("--qwen_model_id",  type=str, default="Qwen/Qwen3-VL-8B-Instruct")
     ap.add_argument("--device",         type=str, default="cuda:0")
     ap.add_argument("--skip_existing",  action="store_true", default=True,
                     help="Skip studies that already have a cache file. Default ON.")

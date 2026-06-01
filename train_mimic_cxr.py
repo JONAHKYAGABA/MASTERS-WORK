@@ -1787,7 +1787,7 @@ def main(args):
     _qwen_id = (
         getattr(args, 'qwen_model_id', None)
         or getattr(config.model, 'qwen_model_id', None)
-        or 'Qwen/Qwen2.5-VL-7B-Instruct'
+        or 'Qwen/Qwen3-VL-8B-Instruct'
     )
     _use_quant = bool(getattr(config.model, 'use_quantization', _force_qlora))
     _lora_rank = int(getattr(config.model, 'lora_rank', 16))
@@ -2507,8 +2507,8 @@ if __name__ == "__main__":
                             'Default per phase: pretrain→B, finetune→A. Use "all" if your QBA dataset '
                             'lacks the auto-selected grade.')
     parser.add_argument('--qwen_model_id', type=str, default=None,
-                       help='Override Qwen model id (e.g. Qwen/Qwen2.5-VL-3B-Instruct for smoke). '
-                            'Default: Qwen/Qwen2.5-VL-7B-Instruct')
+                       help='Override Qwen model id (e.g. Qwen/Qwen3-VL-4B-Instruct for smoke). '
+                            'Default: Qwen/Qwen3-VL-8B-Instruct')
 
     # Wandb
     parser.add_argument('--wandb_project', type=str, default='mimic-cxr-vqa', help='W&B project name')

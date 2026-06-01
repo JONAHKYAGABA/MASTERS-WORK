@@ -71,10 +71,10 @@ def main():
         return 1
 
     # Run model forward + loss
-    print("\n[3] Building model (this takes ~30s for Qwen 3B in 4-bit)...")
+    print("\n[3] Building model (this takes ~60s for Qwen3-VL 8B in 4-bit)...")
     device = torch.device('cuda:0')
     model = SSGVQANetV2(
-        qwen_model_id='Qwen/Qwen2.5-VL-3B-Instruct',
+        qwen_model_id='Qwen/Qwen3-VL-8B-Instruct',
         use_quantization=True,
         training_mode='sg_only',
     ).to(device)

@@ -807,13 +807,16 @@ def parse_structured_output(text: str) -> Dict[str, Any]:
 
 class SSGVQANetV2(nn.Module):
     """
-    Scene-Graph-Guided VQA model built around Qwen2.5-VL.
+    Scene-Graph-Guided VQA model built around Qwen3-VL.
 
     Parameters
     ----------
     qwen_model_id : str
-        HuggingFace model ID. Default Qwen/Qwen2.5-VL-7B-Instruct.
-        Use Qwen/Qwen2.5-VL-3B-Instruct for smaller GPU budgets.
+        HuggingFace model ID. Default Qwen/Qwen3-VL-8B-Instruct.
+        Use Qwen/Qwen3-VL-4B-Instruct (or -2B-Instruct) for smaller GPU budgets.
+        NOTE: requires transformers >= 4.57 (Qwen3-VL release). The Qwen2.5-VL
+        port lived in transformers 4.45+; if you previously had it pinned to
+        4.55.x, bump it before running this code.
     use_quantization : bool
         If True, load base model in 4-bit NF4 (QLoRA). Recommended for 48GB
         Turing cards (RTX 8000, Titan RTX, Quadro 6000). Disable on A100/H100
@@ -838,7 +841,7 @@ class SSGVQANetV2(nn.Module):
 
     def __init__(
         self,
-        qwen_model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        qwen_model_id: str = "Qwen/Qwen3-VL-8B-Instruct",
         use_quantization: bool = True,
         lora_rank: int = 16,
         lora_alpha: int = 32,
@@ -949,7 +952,11 @@ class SSGVQANetV2(nn.Module):
         )
         self.qwen = get_peft_model(self.qwen, lora_cfg)
 
-        # Discover LLM hidden size dynamically (7B: 3584, 3B: 2048)
+        # Discover LLM hidden size dynamically.
+        # Known sizes: Qwen2.5-VL-7B=3584, 2.5-VL-3B=2048, Qwen3-VL-8B=4096,
+        # Qwen3-VL-4B=2560, Qwen3-VL-2B=1536. The discovery walks both the
+        # top-level config and text_config; Qwen3-VL nests differently than
+        # 2.5-VL did but both attrs are covered.
         self.d_llm = self._discover_hidden_size()
 
         # ---- 3. Add SG placeholder tokens to the tokenizer -------------------
@@ -997,12 +1004,14 @@ class SSGVQANetV2(nn.Module):
 
         # ---- 4. Scene graph pipeline -----------------------------------------
         if scene_graph_generator is None:
-            # IMPORTANT: Qwen2.5-VL's `base.visual(...)` returns features
-            # AFTER the PatchMerger, which projects raw ViT hidden (1280) up
-            # to the LLM hidden dim (2048 for 3B, 3584 for 7B). The earlier
-            # version used vision_config.hidden_size (1280) here and crashed
-            # with "expected 1280 channels, got 2048" because the actual
-            # feature maps had been merged.
+            # IMPORTANT: Qwen-VL's `base.visual(...)` returns features AFTER
+            # the PatchMerger, which projects raw ViT hidden up to the LLM
+            # hidden dim (Qwen2.5-VL: 2048 for 3B, 3584 for 7B; Qwen3-VL:
+            # 1536 for 2B, 2560 for 4B, 4096 for 8B). The earlier version
+            # used vision_config.hidden_size here and crashed with
+            # "expected 1280 channels, got 2048" because the feature maps had
+            # been merged. _extract_qwen_vit_feature_maps now also handles
+            # Qwen3-VL DeepStack tuple/list returns; see its docstring.
             #
             # Using self.d_llm matches what _extract_qwen_vit_feature_maps
             # actually returns. If you ever change the extraction to bypass
@@ -1076,7 +1085,13 @@ class SSGVQANetV2(nn.Module):
     # ----------------------------------------------------------------------
 
     def _discover_hidden_size(self) -> int:
-        """Qwen2.5-VL-7B=3584, 3B=2048. Read from the loaded config."""
+        """Read the LLM hidden size from the loaded config.
+
+        Qwen2.5-VL-7B=3584, 2.5-VL-3B=2048.
+        Qwen3-VL-8B=4096, 3-VL-4B=2560, 3-VL-2B=1536.
+        Qwen3-VL nests `hidden_size` under `text_config` in some transformers
+        versions; the fallback below handles that.
+        """
         cfg = self.qwen.config
         # PEFT wraps the config; walk through common names
         for attr in ("hidden_size", "d_model"):
@@ -1185,7 +1200,17 @@ class SSGVQANetV2(nn.Module):
 
         Qwen2.5-VL ViT returns features with `spatial_merge_size` already
         applied (default 2), so for an input whose patchified grid is (H, W)
-        the output token grid is (H // 2, W // 2).
+        the output token grid is (H // 2, W // 2). Return is a single tensor
+        of shape (total_merged_tokens, d_llm).
+
+        Qwen3-VL adds DeepStack — internally the ViT consumes multi-level
+        features and may return EITHER a single packed tensor (same as 2.5-VL,
+        deepest level only — the LLM consumes the rest internally) OR a
+        tuple/list of per-level packed tensors. We can only feed ONE 2D grid
+        into the SG generator's RPN, so when we get a tuple we take the
+        LAST element (deepest, post-merger, matches d_llm). A one-shot log
+        on the first call documents what we actually got so you can spot
+        a version skew without re-reading the model file.
         """
         base = self.qwen.get_base_model() if hasattr(self.qwen, "get_base_model") else self.qwen
         visual = base.visual
@@ -1200,9 +1225,58 @@ class SSGVQANetV2(nn.Module):
         ctx = torch.no_grad() if self.freeze_sg_generator else torch.enable_grad()
         with ctx:
             vit_out = visual(pixel_values, grid_thw=image_grid_thw)
-            # vit_out: (total_merged_tokens, hidden_size)
 
-        spatial_merge = getattr(base.config.vision_config, "spatial_merge_size", 2)
+        # DeepStack tolerance — collapse to a single tensor regardless of which
+        # return convention this transformers build uses.
+        if isinstance(vit_out, (list, tuple)):
+            if not getattr(self, "_logged_vit_return_shape", False):
+                shapes = [getattr(t, "shape", type(t).__name__) for t in vit_out]
+                logger.info(
+                    f"[Qwen3-VL DeepStack] base.visual(...) returned a "
+                    f"{type(vit_out).__name__} of {len(vit_out)} tensors with "
+                    f"shapes {shapes}. Using the LAST element for SG features."
+                )
+                self._logged_vit_return_shape = True
+            vit_out = vit_out[-1]
+        elif hasattr(vit_out, "last_hidden_state"):
+            # Some transformers versions wrap ViT output in a ModelOutput dataclass.
+            if not getattr(self, "_logged_vit_return_shape", False):
+                logger.info(
+                    f"[Qwen3-VL] base.visual(...) returned a {type(vit_out).__name__} "
+                    f"ModelOutput; using .last_hidden_state."
+                )
+                self._logged_vit_return_shape = True
+            vit_out = vit_out.last_hidden_state
+        else:
+            if not getattr(self, "_logged_vit_return_shape", False):
+                logger.info(
+                    f"[Qwen-VL] base.visual(...) returned a single tensor of "
+                    f"shape {tuple(vit_out.shape)}; using directly (Qwen2.5-VL style)."
+                )
+                self._logged_vit_return_shape = True
+
+        # Final shape check: must be (total_merged_tokens, d_llm). If the deepest
+        # tensor is at the raw ViT hidden (e.g. 1152) instead of d_llm, the
+        # downstream Conv2d RPN's in_channels will mismatch and crash loudly.
+        # Catch it here with a more legible error.
+        if vit_out.dim() != 2 or vit_out.size(-1) != self.d_llm:
+            raise RuntimeError(
+                f"Qwen ViT returned shape {tuple(vit_out.shape)}, expected "
+                f"(total_merged_tokens, d_llm={self.d_llm}). This usually means "
+                f"DeepStack is returning a pre-merger feature level — pick the "
+                f"correct element in _extract_qwen_vit_feature_maps, or change "
+                f"SceneGraphGenerator's visual_dim to match."
+            )
+
+        # Qwen3-VL renamed vision_config.spatial_merge_size in some builds;
+        # try both before defaulting.
+        vis_cfg = getattr(base.config, "vision_config", None) or base.config
+        spatial_merge = (
+            getattr(vis_cfg, "spatial_merge_size", None)
+            or getattr(vis_cfg, "merge_size", None)
+            or getattr(base.config, "spatial_merge_size", None)
+            or 2
+        )
 
         feature_maps: List[torch.Tensor] = []
         offset = 0

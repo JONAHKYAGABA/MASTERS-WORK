@@ -364,8 +364,8 @@ def main(argv=None) -> int:
                    help="Question/prompt to ask about each image")
     p.add_argument("--checkpoint", type=Path, default=None,
                    help="Fine-tuned SSGVQANetV2 checkpoint dir (saved via save_pretrained)")
-    p.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct",
-                   help="Base model. Use 7B for production deployment.")
+    p.add_argument("--model_id", type=str, default="Qwen/Qwen3-VL-8B-Instruct",
+                   help="Base model. Use Qwen3-VL-4B-Instruct for faster smoke runs.")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--max_side", type=int, default=448,
                    help="Resize so the longest image side ≤ this value before model input")

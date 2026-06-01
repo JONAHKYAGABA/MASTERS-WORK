@@ -326,7 +326,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Test SSGVQANetV2 on real samples (cache-free)")
     p.add_argument("--n", type=int, default=3)
     p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--model_id", default="Qwen/Qwen2.5-VL-3B-Instruct")
+    p.add_argument("--model_id", default="Qwen/Qwen3-VL-8B-Instruct")
     p.add_argument("--max_visit", type=int, default=200,
                    help="Max qa.json files to scan before giving up")
     p.add_argument("--max_side", type=int, default=448,

@@ -12,7 +12,7 @@ Why this matters on marconi:
 
 Usage:
     python scripts/predownload_models.py
-    python scripts/predownload_models.py --model Qwen/Qwen2.5-VL-3B-Instruct
+    python scripts/predownload_models.py --model Qwen/Qwen3-VL-4B-Instruct
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from pathlib import Path
 
 DEFAULT_MODELS = [
     # Primary VLM backbone — picked up by SSGVQANetV2 default.
-    "Qwen/Qwen2.5-VL-7B-Instruct",
+    "Qwen/Qwen3-VL-8B-Instruct",
 ]
 
 
