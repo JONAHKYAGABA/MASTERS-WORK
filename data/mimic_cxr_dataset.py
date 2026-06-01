@@ -373,7 +373,8 @@ class MIMICCXRVQADataset(Dataset):
         cache_dir: Optional[str] = None,  # Cache directory for samples
         use_cache: bool = True,  # Whether to use caching
         force_rebuild_cache: bool = False,  # Force rebuild even if cache exists
-        prebuilt_cache_path: Optional[str] = None  # Optional: load samples from external prebuilt cache (.pkl)
+        prebuilt_cache_path: Optional[str] = None,  # Optional: load samples from external prebuilt cache (.pkl)
+        sg_cache_root: Optional[str] = None,  # Stage-3+ pre-generated SG cache (precompute_sg_cache.py)
     ):
         self.mimic_cxr_path = Path(mimic_cxr_path)
         self.mimic_qa_path = Path(mimic_qa_path)
@@ -454,11 +455,69 @@ class MIMICCXRVQADataset(Dataset):
         
         # Load samples (with caching support)
         self.samples = self._load_samples_with_cache()
+
+        # Pre-generated SG cache (Stage 3+ only — frozen + deterministic generator).
+        # Manifest verification is the trainer's responsibility (it needs the live
+        # model to compute the expected signature). Here we just record the root
+        # and let __getitem__ attempt loads.
+        self.sg_cache_root: Optional[Path] = Path(sg_cache_root) if sg_cache_root else None
+        if self.sg_cache_root is not None:
+            mpath = self.sg_cache_root / "manifest.json"
+            if not mpath.exists():
+                raise FileNotFoundError(
+                    f"sg_cache_root={self.sg_cache_root} has no manifest.json. "
+                    f"Run scripts/precompute_sg_cache.py first, or pass "
+                    f"sg_cache_root=None to fall back to on-the-fly."
+                )
+        # Process-local hit-rate counters (workers each maintain their own;
+        # the trainer aggregates after the first epoch via assert_sg_cache_hit_rate).
+        self._sg_cache_hits = 0
+        self._sg_cache_misses = 0
     def _get_tokenizer(self):
         """Lazily initialize tokenizer (fork-safe for DataLoader workers)."""
         if self.tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
         return self.tokenizer
+
+    def _load_generated_sg_for(self, subject_id: int, study_id: int) -> Optional[Dict[str, Any]]:
+        """Try to load a pre-generated SG dict from disk. Returns None on miss.
+
+        Trap-aware: uses weights_only=True (the file contains only tensors +
+        plain python primitives saved by scripts/precompute_sg_cache.py). If
+        the file is malformed, count it as a miss and let the model fall back
+        to on-the-fly generation rather than crash the whole run.
+        """
+        if self.sg_cache_root is None:
+            return None
+        try:
+            p_short = f"p{str(subject_id)[:2]}"
+            p_full = f"p{subject_id}"
+            cache_file = self.sg_cache_root / p_short / p_full / f"s{study_id}.sg.pt"
+            if not cache_file.exists():
+                self._sg_cache_misses += 1
+                return None
+            d = torch.load(cache_file, map_location="cpu", weights_only=True)
+            self._sg_cache_hits += 1
+            # Cast id tensors back to long for downstream indexing. Bboxes /
+            # relations stay fp16 on disk; the encoder upcasts them.
+            return {
+                "bboxes":       d["bboxes"].float() if d["bboxes"].numel() else d["bboxes"],
+                "entity_ids":   d["entity_ids"].long(),
+                "region_ids":   d["region_ids"].long(),
+                "positiveness": d["positiveness"].long(),
+                "relations":    d["relations"].float() if d["relations"].numel() else d["relations"],
+                "num_objects":  int(d["num_objects"]),
+            }
+        except Exception as e:
+            logger.debug(f"SG cache load failed for s={study_id}: {e}")
+            self._sg_cache_misses += 1
+            return None
+
+    def get_sg_cache_stats(self) -> Dict[str, int]:
+        """Snapshot of this dataset's hit/miss counters. Workers each maintain
+        their own; in DDP the trainer must reduce across ranks if it wants a
+        global rate."""
+        return {"hits": self._sg_cache_hits, "misses": self._sg_cache_misses}
     
     def _load_metadata(self) -> Optional[pd.DataFrame]:
         """
@@ -1519,6 +1578,19 @@ class MIMICCXRVQADataset(Dataset):
             image_height,
             image_id=dicom_id
         )
+
+        # =====================================================
+        # PRE-GENERATED SG (Stage 3+ only — cache hit or None)
+        # =====================================================
+        # When sg_cache_root is configured, attempt to load a cached graph
+        # that the frozen Stage-1 generator produced offline. On a hit the
+        # trainer's pretrain/finetune gate will pass this in as scene_graphs,
+        # so the model skips _run_sg_generator entirely (sg_outputs=None,
+        # sg_loss=0 — expected under caching, see scripts/precompute_sg_cache.py
+        # docstring).
+        generated_sg = self._load_generated_sg_for(
+            sample['subject_id'], sample['study_id']
+        )
         
         # =====================================================
         # CHEXPERT LABELS (for auxiliary supervision)
@@ -1622,6 +1694,9 @@ class MIMICCXRVQADataset(Dataset):
             'gt_sg_entities': sg_targets['gt_entities'],    # (N,) entity indices or None
             'gt_sg_regions': sg_targets['gt_regions'],      # (N,) region indices or None
             'gt_sg_positiveness': sg_targets['gt_positiveness'],  # (N,) 0/1 or None
+
+            # === PRE-GENERATED SG (Stage 3+ cache hit, else None) ===
+            'generated_sg': generated_sg,
             
             # === PATIENT/STUDY METADATA ===
             'subject_id': sample['subject_id'],
@@ -1730,6 +1805,9 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     
     # === Collect variable-length scene graphs ===
     scene_graphs = [item['scene_graphs'] for item in batch]
+
+    # === Collect pre-generated SGs (Stage 3+ only; per-item None on miss) ===
+    generated_sg = [item.get('generated_sg') for item in batch]
     
     # === Collect routing info ===
     question_types = [item['question_types'] for item in batch]
@@ -1786,6 +1864,9 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'gt_sg_bboxes': gt_sg_bboxes,      # List[Tensor(N, 4) | None]
         'gt_sg_entities': gt_sg_entities,  # List[Tensor(N,) | None]
         'gt_sg_regions': gt_sg_regions,    # List[Tensor(N,) | None]
+
+        # === Pre-generated SGs (Stage 3+ cache; None on miss/disabled) ===
+        'generated_sg': generated_sg,      # List[Dict | None]
         
         # === MIMIC-CXR-JPG Image Metadata ===
         'image_widths': image_widths,           # Current image width

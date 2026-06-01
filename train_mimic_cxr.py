@@ -613,6 +613,109 @@ model = SSGVQANetV2(qwen_model_id="{config.training.hub_model_id}")
     return card
 
 
+def assert_sg_is_generated_not_gt_histogram(
+    batch: Dict[str, Any],
+    num_regions: int,
+    leak_tvd_threshold: float = 0.05,
+    flip_tvd_threshold: float = 0.95,
+    min_objects: int = 32,
+) -> Dict[str, float]:
+    """Histogram-based tripwire confirming Stage-3+ region_ids come from the
+    generator (cached or live), NOT from GT.
+
+    Why histograms and not per-object compare:
+        Cached graphs are in centerness-rank order (n_keep <= max_objects=20).
+        GT graphs are in their own annotation order with arbitrary count. Pairing
+        by index is meaningless, so a per-object equality check would either
+        false-alarm or false-pass depending on how the orderings happen to line
+        up. The histogram of region_id COUNTS across the batch is alignment-free
+        and still catches the failure mode we care about (the IDs being literally
+        GT-equal).
+
+    The check:
+        - Build region_id count histograms for cached vs GT across all objects
+          in the batch, normalize to distributions p_cached, p_gt.
+        - TVD = 0.5 * sum(|p_cached - p_gt|), bounded in [0, 1].
+        - TVD ~ 0 → distributions identical → LEAK SUSPECTED (raise)
+        - TVD ~ 1 → distributions disjoint → id-space / vocab bug (raise)
+        - Middle band → expected (generator argmax accuracy ~0.75; the marginal
+          distribution should differ measurably from GT's marginal).
+
+    Two honest limitations baked in:
+        1. With very few objects in the batch (< min_objects), the histograms
+           are too noisy to be informative — we return {'skipped': 1.0} rather
+           than fire a false alarm.
+        2. Per-object identity is NOT what this tests. A subtle leak that swaps
+           IDs while preserving marginals (e.g. permuted vocab) would slip
+           through. The tripwire catches the dumb leaks (literal GT pass-through,
+           wrong-field assignment, off-by-vocab); it does NOT certify "correct
+           graphs."
+
+    Args:
+        batch: collated batch dict with 'generated_sg' and 'gt_sg_regions'
+        num_regions: vocab size (model.sg_generator.region_classifier output dim)
+        leak_tvd_threshold: TVD below this → raise leak suspicion
+        flip_tvd_threshold: TVD above this → raise id-space mismatch
+        min_objects: skip the check if fewer than this many comparable objects
+
+    Returns:
+        Dict with 'tvd', 'n_cached', 'n_gt', and 'skipped' (1.0 if skipped).
+    """
+    cached_list = batch.get("generated_sg")
+    gt_list = batch.get("gt_sg_regions")
+    if cached_list is None or gt_list is None:
+        return {"skipped": 1.0, "reason": "missing field"}
+
+    cached_counts = torch.zeros(num_regions, dtype=torch.long)
+    gt_counts = torch.zeros(num_regions, dtype=torch.long)
+    n_cached = n_gt = 0
+
+    for c, g in zip(cached_list, gt_list):
+        if c is not None:
+            ids = c.get("region_ids")
+            if ids is not None and ids.numel() > 0:
+                ids = ids.long().clamp_(0, num_regions - 1)
+                cached_counts.index_add_(0, ids, torch.ones_like(ids))
+                n_cached += int(ids.numel())
+        if g is not None:
+            ids = g.long().clamp_(0, num_regions - 1) if hasattr(g, "long") else None
+            if ids is not None and ids.numel() > 0:
+                gt_counts.index_add_(0, ids, torch.ones_like(ids))
+                n_gt += int(ids.numel())
+
+    if n_cached < min_objects or n_gt < min_objects:
+        logger.info(
+            f"[Stage3 SG check] skipped — too few objects "
+            f"(cached={n_cached}, gt={n_gt}, min={min_objects})"
+        )
+        return {"skipped": 1.0, "n_cached": n_cached, "n_gt": n_gt}
+
+    p_c = cached_counts.float() / max(n_cached, 1)
+    p_g = gt_counts.float() / max(n_gt, 1)
+    tvd = 0.5 * (p_c - p_g).abs().sum().item()
+
+    if tvd < leak_tvd_threshold:
+        raise RuntimeError(
+            f"Stage 3 LEAK SUSPECTED: cached region_id distribution matches GT "
+            f"with TVD={tvd:.4f} (threshold {leak_tvd_threshold}). "
+            f"The trainer is likely passing GT instead of generated graphs. "
+            f"n_cached={n_cached}, n_gt={n_gt}, num_regions={num_regions}."
+        )
+    if tvd > flip_tvd_threshold:
+        raise RuntimeError(
+            f"Stage 3 ID-SPACE MISMATCH: cached vs GT region distributions are "
+            f"effectively disjoint (TVD={tvd:.4f}, threshold {flip_tvd_threshold}). "
+            f"Likely an off-by-vocab or wrong-field bug. "
+            f"n_cached={n_cached}, n_gt={n_gt}, num_regions={num_regions}."
+        )
+
+    logger.info(
+        f"[Stage3 SG check] OK — region histogram TVD vs GT = {tvd:.3f} "
+        f"(n_cached={n_cached}, n_gt={n_gt}) — generated, not GT."
+    )
+    return {"tvd": tvd, "n_cached": n_cached, "n_gt": n_gt, "skipped": 0.0}
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -663,17 +766,60 @@ def train_epoch(
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         token_type_ids = batch.get('token_type_ids', torch.zeros_like(input_ids)).to(device)
-        scene_graphs = batch['scene_graphs']
+        # CURRICULUM-CORRECT SCENE GRAPH ROUTING (per PDF spec §4-5):
+        #   sg_only / alignment → use GT scene graphs from dataset
+        #                         (clean signal, encoder learns the manifold)
+        #   pretrain / finetune / rl → use GENERATED scene graphs from the
+        #                         frozen Stage-1 SG generator (matches inference;
+        #                         avoids GT→noisy distribution mismatch)
+        # Passing GT graphs in Stage 3+ creates a train/test leak: the encoder
+        # sees clean entity/region IDs during training but argmax(noisy generator
+        # logits) at inference, inflating val metrics and collapsing on deployment.
+        _phase_for_sg = getattr(config.training, 'phase', 'pretrain').lower()
+        if _phase_for_sg in {'sg_only', 'alignment'}:
+            scene_graphs = batch['scene_graphs']      # GT — clean signal
+        else:
+            # Stage 3+: prefer cached pre-generated SGs (frozen + deterministic
+            # generator → cache hit is bit-identical to on-the-fly). Per-item
+            # cache miss → None for that item, which the model resolves by
+            # falling back to _run_sg_generator at inference semantics.
+            # NOTE: when ANY item supplies a cached graph, the model skips the
+            #   generator forward → outputs['scene_graph_outputs'] is None →
+            #   sg_loss = 0. This is expected, not a regression — the generator
+            #   is frozen at Stage 3+, so its detection loss is unoptimizable.
+            #   The Stage-3 leak corroborator is now histogram-divergence (see
+            #   assert_sg_is_generated_not_gt_histogram), not sg_loss != 0.
+            _gen_sg = batch.get('generated_sg')
+            if _gen_sg is not None and any(g is not None for g in _gen_sg):
+                scene_graphs = _gen_sg
+            else:
+                scene_graphs = None                   # cache disabled → on-the-fly
+
+            # First-batch tripwire (Stage 3+ only): confirm the SGs we're about
+            # to train on are NOT GT. Runs once per training launch on the main
+            # process. Raises on leak; skips quietly if too few objects to tell.
+            if (
+                batch_idx == 0
+                and is_main_process(local_rank)
+                and not getattr(train_epoch, "_sg_check_done", False)
+            ):
+                try:
+                    _num_regions = int(
+                        (model.module if hasattr(model, "module") else model)
+                        .sg_generator.region_classifier[-1].out_features
+                    )
+                    assert_sg_is_generated_not_gt_histogram(batch, _num_regions)
+                except RuntimeError:
+                    raise  # leak / id-space mismatch — fail loud
+                except Exception as e:
+                    logger.debug(f"SG histogram check could not run: {e}")
+                train_epoch._sg_check_done = True  # one-shot per process
         question_types = batch['question_types']
 
         # === V2 raw inputs for Qwen processor (added by collate_fn) ===
         pil_images = batch.get('pil_images')          # List[PIL.Image]
         questions = batch.get('questions')            # List[str]
         answer_texts = batch.get('answer_texts')      # List[str] structured
-        # Pass scene_graphs=None to let v2 generate fresh from Qwen's ViT.
-        # When ground-truth scene graphs from the dataset are preferred (Stage
-        # 1 / debugging), keep batch['scene_graphs']. Default: trust dataset SG
-        # during training, regenerate at inference (handled inside SSGVQANetV2).
         answer_idx = batch['answer_idx'].to(device)
         chexpert_labels = batch['chexpert_labels'].to(device)
         chexpert_mask = batch['chexpert_mask'].to(device)
@@ -1086,7 +1232,21 @@ def validate(
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         token_type_ids = batch.get('token_type_ids', torch.zeros_like(input_ids)).to(device)
-        scene_graphs = batch['scene_graphs']
+        # Validation MUST always use generated scene graphs — at deployment
+        # we'll never have GT. Using GT here would inflate val metrics and
+        # give a misleading signal to early-stopping / best-model selection.
+        # Same routing rule as training (see train_epoch above).
+        _phase_for_sg = getattr(config.training, 'phase', 'pretrain').lower()
+        if _phase_for_sg in {'sg_only', 'alignment'}:
+            scene_graphs = batch['scene_graphs']      # GT — only stages that train ON them
+        else:
+            # Validation MUST match training's SG source, otherwise val/train
+            # distributions diverge and metrics lie. Same cache-first rule.
+            _gen_sg = batch.get('generated_sg')
+            if _gen_sg is not None and any(g is not None for g in _gen_sg):
+                scene_graphs = _gen_sg
+            else:
+                scene_graphs = None                   # all eval paths see generated SGs
         question_types = batch['question_types']
         answer_idx = batch['answer_idx'].to(device)
         chexpert_labels = batch['chexpert_labels'].to(device)
