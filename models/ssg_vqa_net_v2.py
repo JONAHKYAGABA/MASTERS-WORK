@@ -42,6 +42,7 @@ Authors: migration spec 2026-04-24
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import warnings
@@ -50,6 +51,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Optional dependencies — graceful failure with clear error messages
