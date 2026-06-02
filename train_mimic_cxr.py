@@ -1459,6 +1459,8 @@ def main(args):
         config.training.output_dir = args.output_dir
     if args.batch_size:
         config.training.batch_size_per_gpu = args.batch_size
+    if args.gradient_accumulation_steps:
+        config.training.gradient_accumulation_steps = args.gradient_accumulation_steps
     if args.epochs:
         config.training.num_epochs = args.epochs
     if args.learning_rate:
@@ -2453,6 +2455,9 @@ if __name__ == "__main__":
     
     # Training params
     parser.add_argument('--batch_size', type=int, help='Batch size per GPU')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=None,
+                        help='Gradient accumulation steps. Effective batch = '
+                             'batch_size * num_gpus * grad_accum. Overrides YAML config.')
     parser.add_argument('--epochs', type=int, help='Number of epochs')
     parser.add_argument('--learning_rate', type=float, help='Learning rate')
     parser.add_argument('--max_samples', type=int, default=None, help='Max samples (for debugging)')
