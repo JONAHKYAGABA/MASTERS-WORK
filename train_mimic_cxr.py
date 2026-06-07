@@ -1467,6 +1467,16 @@ def main(args):
         config.training.learning_rate = args.learning_rate
     if args.hub_model_id:
         config.training.hub_model_id = args.hub_model_id
+    if getattr(args, 'no_push', False):
+        # Disable all hub push paths for this run. Reason: HF upload on rank 0
+        # blocks the rank for many minutes (an 11 GB checkpoint @ 5 MB/s is
+        # >30 minutes), while rank 1 keeps running into the next NCCL
+        # all-reduce and trips the 10-min watchdog timeout → SIGABRT.
+        # If you need a checkpoint on the Hub after training finishes, push
+        # ./checkpoints/.../best_model manually with `huggingface-cli upload`.
+        config.training.hub_model_id = ""
+        config.training.push_every_save = False
+        logger.info("--no_push set; disabling all HF Hub uploads for this run.")
     if args.hub_token:
         # Set in env so push_to_hub() picks it up via its env-fallback chain.
         os.environ['HF_TOKEN'] = args.hub_token
@@ -2495,6 +2505,10 @@ if __name__ == "__main__":
                        help='HF Hub token. If unset, falls back to env HF_TOKEN / HUGGING_FACE_HUB_TOKEN / cached login')
     parser.add_argument('--push_every_save', action='store_true',
                        help='Push to HF Hub on EVERY checkpoint save (not just best). Slower but safer for power loss')
+    parser.add_argument('--no_push', action='store_true',
+                       help='Disable ALL HF Hub uploads (overrides hub_model_id in YAML). '
+                            'Use for short test runs where the 10+ minute checkpoint upload '
+                            'would trip the NCCL collective-timeout watchdog (default 600s).')
     parser.add_argument('--resume_from_checkpoint', type=str, default=None,
                        help='Path to pretrained checkpoint dir/file to load weights from')
     parser.add_argument('--auto_resume', action='store_true',
