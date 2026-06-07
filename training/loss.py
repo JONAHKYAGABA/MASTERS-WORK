@@ -408,7 +408,17 @@ class MultiTaskLoss(nn.Module):
         else:
             pointing_target = torch.ones(B, 1, dtype=torch.float32, device=device)
 
-        pointing_loss = F.binary_cross_entropy(score, pointing_target)
+        # BCE is in PyTorch's autocast denylist — it refuses to run inside
+        # an autocast region even with fp32 inputs ("unsafe to autocast").
+        # Wrap in autocast(enabled=False) to compute the BCE in pure fp32.
+        # We can't switch to BCE-with-logits here because pointing_score is
+        # already post-sigmoid coming out of the grounding head; converting
+        # back via log(p/(1-p)) is numerically lossier than just disabling
+        # autocast for one cheap loss term.
+        with torch.amp.autocast('cuda', enabled=False):
+            pointing_loss = F.binary_cross_entropy(
+                score.float(), pointing_target.float()
+            )
         loss_dict['grounding_pointing_loss'] = pointing_loss
         
         total = bbox_loss + 0.5 * pointing_loss
