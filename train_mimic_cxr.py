@@ -1861,6 +1861,26 @@ def main(args):
         if is_main_process(local_rank):
             logger.info(f"Re-cast mHC sub-block to fp32 (Option C — stability fix).")
 
+    # CRITICAL: trainable params must stay fp32, even when the base model is fp16.
+    # PyTorch's GradScaler.unscale_() refuses to operate on fp16 gradients
+    # ("Attempting to unscale FP16 gradients") because the optimizer needs
+    # numerically-safe fp32 grads. Stage 1 (sg_only) didn't hit this because
+    # its trainable module (SG generator) is already fp32 above; Stage 2+
+    # (alignment / pretrain / finetune) unfreeze sg_encoder / sg_projector /
+    # aux_heads / LoRA, which got swept into the bulk fp16 cast.
+    # Standard QLoRA pattern: forward in fp16 (via autocast), grads stored in
+    # fp32 on the trainable params themselves so the scaler can unscale them.
+    _n_recast_fp32 = 0
+    for _p in model.parameters():
+        if _p.requires_grad and _p.dtype == torch.float16:
+            _p.data = _p.data.float()
+            _n_recast_fp32 += 1
+    if is_main_process(local_rank) and _n_recast_fp32 > 0:
+        logger.info(
+            f"Re-cast {_n_recast_fp32} trainable params to fp32 "
+            "(GradScaler requires fp32 grads — fp16 trainables crash unscale_)."
+        )
+
     # Mode-specific LR override (ADR-026 / migration notes):
     #   pretrain → 2e-4 (LoRA warmup), finetune → 5e-5 (refinement)
     # The override is SKIPPED if the user explicitly passed --learning_rate on
