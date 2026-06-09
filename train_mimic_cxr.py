@@ -2114,24 +2114,23 @@ def main(args):
                 logger.info("Initializing DistributedDataParallel...")
             
             model = model.to(device)
-            # static_graph=True: REQUIRED for stages that train the full pipeline
-            # (Stage 3+) because mHC's hyper-connections reuse parameters across
-            # reentrant backward passes — DDP's default dynamic graph tracking
-            # raises "Expected to mark a variable ready only once" when params
-            # are seen by multiple backward sub-graphs in the same iteration.
-            # Setting static_graph=True tells DDP the graph topology is stable
-            # across iterations (which it is for us — same modules trainable
-            # each step), enabling the all-reduce buckets to be reused.
-            # Also flips find_unused_parameters off: under static_graph the
-            # earlier-logged "find_unused_parameters=True but did not find any
-            # unused parameters" warning is moot, and the dual flags conflict
-            # in newer torch versions.
+            # DDP config for stages with dynamic per-sample routing:
+            # - find_unused_parameters=True: required because grounding/pointing/
+            #   aux heads only receive gradients when their target is valid for
+            #   the given sample (some MIMIC questions have no bbox, no pointing
+            #   target, etc.). Different ranks see different unused param sets,
+            #   so static_graph=True is NOT viable.
+            # - static_graph=False: see above.
+            # The conflicting "mark a variable ready only once" error that
+            # static_graph was meant to fix comes from gradient checkpointing's
+            # reentrant mode wrapping mHC twice. Fix that at its source:
+            # pass --no_gradient_checkpointing for Stage 3+, OR ensure any
+            # remaining checkpoint() call uses use_reentrant=False.
             model = DDP(
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=False,
-                static_graph=True,
+                find_unused_parameters=True,
             )
             
             # Standard optimizer and scheduler
