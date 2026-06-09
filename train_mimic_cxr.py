@@ -2114,11 +2114,24 @@ def main(args):
                 logger.info("Initializing DistributedDataParallel...")
             
             model = model.to(device)
+            # static_graph=True: REQUIRED for stages that train the full pipeline
+            # (Stage 3+) because mHC's hyper-connections reuse parameters across
+            # reentrant backward passes — DDP's default dynamic graph tracking
+            # raises "Expected to mark a variable ready only once" when params
+            # are seen by multiple backward sub-graphs in the same iteration.
+            # Setting static_graph=True tells DDP the graph topology is stable
+            # across iterations (which it is for us — same modules trainable
+            # each step), enabling the all-reduce buckets to be reused.
+            # Also flips find_unused_parameters off: under static_graph the
+            # earlier-logged "find_unused_parameters=True but did not find any
+            # unused parameters" warning is moot, and the dual flags conflict
+            # in newer torch versions.
             model = DDP(
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
-                find_unused_parameters=True
+                find_unused_parameters=False,
+                static_graph=True,
             )
             
             # Standard optimizer and scheduler
