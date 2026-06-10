@@ -98,7 +98,12 @@ def load_vocab(dataset_info_path: Optional[Path]) -> Tuple[List[str], List[str]]
 # Model loading — mirrors scripts/predict_and_visualize.py:build_model
 # ---------------------------------------------------------------------------
 
-def build_model(model_id: str, gpu: int, checkpoint_path: Optional[Path]):
+def build_model(
+    model_id: str,
+    gpu: int,
+    checkpoint_path: Optional[Path],
+    trust_checkpoint: bool = False,
+):
     """Build a fresh SSGVQANetV2 and load weights from pytorch_model.bin.
 
     We deliberately AVOID ``SSGVQANetV2.from_pretrained`` because the
@@ -156,28 +161,61 @@ def build_model(model_id: str, gpu: int, checkpoint_path: Optional[Path]):
         bin_path = checkpoint_path / "pytorch_model.bin"
         if bin_path.exists():
             log.info(f"loading weights from {bin_path}")
-            # weights_only=True is the safe default in torch >= 2.6, but our
-            # checkpoint pickles a few numpy scalars alongside the tensors
-            # (training stores step counters / metric values via numpy). The
-            # right fix is to explicitly whitelist those numpy types — NOT
-            # to fall back to weights_only=False, which would re-enable
-            # arbitrary code execution from any path passed via --checkpoint.
-            try:
-                import numpy as _np
-                _allow = []
-                for _attr in ("scalar", "_reconstruct", "ndarray"):
-                    obj = getattr(_np.core.multiarray, _attr, None)
-                    if obj is not None:
-                        _allow.append(obj)
-                for _attr in ("dtype",):
-                    obj = getattr(_np, _attr, None)
-                    if obj is not None:
-                        _allow.append(obj)
-                if _allow:
-                    torch.serialization.add_safe_globals(_allow)
-            except Exception as _e:
-                log.warning(f"could not whitelist numpy globals: {_e}")
-            state = torch.load(str(bin_path), map_location="cpu", weights_only=True)
+            # weights_only=True is the safe default in torch >= 2.6, but the
+            # trainer pickles a fan-out of numpy types alongside the tensors
+            # (numpy scalars, parameterised dtypes like numpy.dtype[float64],
+            # etc. — whatever sklearn/numpy stashed into metric values that
+            # got swept into the state_dict). Whitelisting each one is
+            # whack-a-mole; the principled answer is:
+            #
+            #   - When --trust_checkpoint is set, load with weights_only=False.
+            #     This permits arbitrary unpickling — safe ONLY for files the
+            #     operator authored or fetched from a known source.
+            #
+            #   - Otherwise, try the strict path with as many numpy globals
+            #     whitelisted as we know about, and raise a clear error
+            #     (with the --trust_checkpoint hint) on failure.
+            if trust_checkpoint:
+                log.warning(
+                    "--trust_checkpoint set: loading with weights_only=False. "
+                    "This permits arbitrary code execution from the file. "
+                    "Make sure you trust the origin of this checkpoint."
+                )
+                state = torch.load(str(bin_path), map_location="cpu", weights_only=False)
+            else:
+                try:
+                    import numpy as _np
+                    _allow = []
+                    for _attr in ("scalar", "_reconstruct", "ndarray"):
+                        obj = getattr(_np.core.multiarray, _attr, None)
+                        if obj is not None:
+                            _allow.append(obj)
+                    for _attr in ("dtype", "ndarray"):
+                        obj = getattr(_np, _attr, None)
+                        if obj is not None:
+                            _allow.append(obj)
+                    # Parameterised dtypes (numpy >= 1.25). These are concrete
+                    # classes like Float64DType / Int64DType / etc.
+                    dtypes_mod = getattr(_np, "dtypes", None)
+                    if dtypes_mod is not None:
+                        for _attr in dir(dtypes_mod):
+                            if _attr.endswith("DType"):
+                                obj = getattr(dtypes_mod, _attr, None)
+                                if obj is not None:
+                                    _allow.append(obj)
+                    if _allow:
+                        torch.serialization.add_safe_globals(_allow)
+                except Exception as _e:
+                    log.warning(f"could not whitelist numpy globals: {_e}")
+                try:
+                    state = torch.load(str(bin_path), map_location="cpu", weights_only=True)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to load {bin_path} with weights_only=True. "
+                        f"Underlying error: {e}\n\n"
+                        "If you trust this checkpoint (e.g. you trained it yourself), "
+                        "re-run with --trust_checkpoint to enable weights_only=False."
+                    ) from e
             # The training save writes the trainable / custom-component
             # state_dict; the bnb-quantised base weights are NOT in this
             # file (they live in the HF cache and get loaded by the
@@ -606,10 +644,18 @@ def main():
                    default=Path("./data/mimic-ext-cxr-qba/metadata/dataset_info.json"),
                    help="dataset_info.json for entity/region names.")
     p.add_argument("--tunnel", action="store_true", help="Open a public ngrok tunnel.")
+    p.add_argument("--trust_checkpoint", action="store_true",
+                   help="Load the checkpoint with weights_only=False. Required when "
+                        "the file pickles numpy types the strict-loader cannot accept "
+                        "(e.g. parameterised dtypes). Safe ONLY for files you trust "
+                        "the origin of — your own training output is the canonical "
+                        "trusted case.")
     args = p.parse_args()
 
     region_names, entity_names = load_vocab(args.vocab)
-    model, device, _ = build_model(args.model_id, args.gpu, args.checkpoint)
+    model, device, _ = build_model(
+        args.model_id, args.gpu, args.checkpoint, trust_checkpoint=args.trust_checkpoint
+    )
 
     public_url = None
     if args.tunnel:
