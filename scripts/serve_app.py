@@ -216,15 +216,34 @@ def build_model(
                         "If you trust this checkpoint (e.g. you trained it yourself), "
                         "re-run with --trust_checkpoint to enable weights_only=False."
                     ) from e
+            # ---- Unwrap if the checkpoint is a save_checkpoint() bundle ----
+            # save_checkpoint() in train_mimic_cxr.py:385 saves
+            # {'model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict',
+            #  'epoch', 'global_step', 'rng_state', 'scaler_state_dict', 'metrics'}
+            # — roughly 8 top-level keys. We only want model_state_dict; loading
+            # the wrapper directly matches zero weight tensors and silently leaves
+            # the model with random LoRA + heads (produces garbage at inference).
+            if isinstance(state, dict) and "model_state_dict" in state:
+                log.info(
+                    f"unwrapped checkpoint bundle (top-level keys: "
+                    f"{list(state.keys())}); extracting model_state_dict"
+                )
+                state = state["model_state_dict"]
             # The training save writes the trainable / custom-component
             # state_dict; the bnb-quantised base weights are NOT in this
             # file (they live in the HF cache and get loaded by the
             # constructor above). Strict=False is REQUIRED.
             missing, unexpected = model.load_state_dict(state, strict=False)
+            # missing = params in the model but not in the file (mostly bnb-
+            # quantised base weights, which load from the HF cache via the
+            # constructor — expected).
+            # unexpected = keys in the file but not in the model (mostly bnb
+            # quant_state metadata — also expected).
             log.info(
-                f"loaded {len(state) - len(missing)} / {len(state)} keys "
-                f"(missing={len(missing)}, unexpected={len(unexpected)} — "
-                "unexpected are mostly bnb quant_state, expected)"
+                f"loaded {len(state)} weight keys from checkpoint "
+                f"(model has {len(missing)} keys not in file, file has "
+                f"{len(unexpected)} keys not in model — both mostly bnb "
+                f"quant_state, expected)"
             )
         else:
             warnings.warn(
