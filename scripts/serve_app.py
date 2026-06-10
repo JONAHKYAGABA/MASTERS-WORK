@@ -135,11 +135,21 @@ def build_model(
     t0 = time.time()
 
     # Always construct fresh — single code path, no from_pretrained surprises.
+    # num_sg_tokens=8 MUST match what training used (visible in the training
+    # log: `num_sg_tokens=8`). It controls two shapes that affect state-dict
+    # compatibility:
+    #   - tokenizer vocab grows by num_sg_tokens (adds <|sg_token_N|> tokens),
+    #     so qwen.base_model.model.model.language_model.embed_tokens.weight
+    #     and qwen.base_model.model.lm_head.weight have shape
+    #     [151669 + num_sg_tokens, 4096]
+    #   - sg_projector.queries has shape [num_sg_tokens, 128]
+    # Setting this lower than training would raise size_mismatch on those
+    # exact tensors (which is what happened with num_sg_tokens=4).
     log.info("constructing SSGVQANetV2 with explicit kwargs (training_mode=finetune)")
     model = SSGVQANetV2(
         qwen_model_id=model_id,
         use_quantization=force_qlora,
-        num_sg_tokens=4,
+        num_sg_tokens=8,
         training_mode="finetune",
         torch_dtype=dtype,
         max_answer_length=128,
@@ -229,6 +239,17 @@ def build_model(
                     f"{list(state.keys())}); extracting model_state_dict"
                 )
                 state = state["model_state_dict"]
+
+            # ---- Strip DDP "module." prefix from saved keys ----
+            # The trainer saves model.state_dict() AFTER wrapping with
+            # DistributedDataParallel, so every parameter key starts with
+            # "module.". A non-DDP model can't match those keys and
+            # load_state_dict raises (some failures bypass strict=False).
+            if isinstance(state, dict) and state:
+                sample_key = next(iter(state.keys()))
+                if sample_key.startswith("module."):
+                    log.info("stripping DDP 'module.' prefix from checkpoint keys")
+                    state = {k[len("module."):]: v for k, v in state.items()}
             # The training save writes the trainable / custom-component
             # state_dict; the bnb-quantised base weights are NOT in this
             # file (they live in the HF cache and get loaded by the
