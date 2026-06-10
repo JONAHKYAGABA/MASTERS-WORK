@@ -428,69 +428,138 @@ def _try_font(size: int) -> Optional[ImageFont.FreeTypeFont]:
     return None
 
 
+def _encode_png(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def annotate_image(pil: Image.Image, pred: Dict[str, Any]) -> bytes:
     """Draw the refined grounding bbox + scene-graph objects + answer overlay.
-    Returns PNG bytes."""
-    img = pil.copy().convert("RGB")
+
+    Bulletproof: each box draw is wrapped in its own try/except, so one bad
+    box can't kill the whole image. Degenerate bboxes (width or height < 4px
+    after scaling, or out-of-order coords) are filtered out — they're a
+    symptom of an undertrained SG generator (mode collapse to a single tiny
+    region near the image centre). Always returns valid PNG bytes; falls
+    back to the original image if any drawing fails catastrophically.
+    """
+    try:
+        img = pil.copy().convert("RGB")
+    except Exception as e:
+        log.warning(f"could not copy/convert PIL image: {e}")
+        # Return a tiny placeholder so the response always has SOMETHING
+        return _encode_png(Image.new("RGB", (64, 64), (60, 60, 60)))
+
     W, H = img.size
     draw = ImageDraw.Draw(img, "RGBA")
     lw = max(3, min(W, H) // 200)
     font_label = _try_font(max(14, min(W, H) // 60))
     font_ans = _try_font(max(14, min(W, H) // 70))
+    MIN_PX = 4   # below this, a "box" is just a smudge — skip
+
+    def _normalise(bbox):
+        """Returns (x1, y1, x2, y2) in pixel space, sorted, clamped to image.
+        Raises ValueError if degenerate after normalisation."""
+        if not bbox or len(bbox) != 4:
+            raise ValueError(f"bbox needs 4 floats, got {bbox!r}")
+        x1, y1, x2, y2 = (float(v) for v in bbox)
+        # Sort coords (the SG generator sometimes emits x2<x1)
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        px1 = max(0, min(W - 1, int(x1 * W)))
+        py1 = max(0, min(H - 1, int(y1 * H)))
+        px2 = max(0, min(W,     int(x2 * W)))
+        py2 = max(0, min(H,     int(y2 * H)))
+        if (px2 - px1) < MIN_PX or (py2 - py1) < MIN_PX:
+            raise ValueError(f"degenerate (pixels: {px2-px1}x{py2-py1})")
+        return px1, py1, px2, py2
+
+    skipped = 0
 
     def draw_box(bbox, color, label):
-        x1, y1, x2, y2 = bbox
-        px1, py1, px2, py2 = int(x1 * W), int(y1 * H), int(x2 * W), int(y2 * H)
-        draw.rectangle([px1, py1, px2, py2], outline=color, width=lw)
-        if label:
-            if font_label:
-                tb = draw.textbbox((0, 0), label, font=font_label)
-                tw, th = tb[2] - tb[0], tb[3] - tb[1]
-            else:
-                tw, th = max(8 * len(label), 20), 16
-            draw.rectangle([px1, py1 - th - 6, px1 + tw + 10, py1], fill=color)
-            kw = {"font": font_label} if font_label else {}
-            draw.text((px1 + 5, py1 - th - 4), label, fill="white", **kw)
+        nonlocal skipped
+        try:
+            px1, py1, px2, py2 = _normalise(bbox)
+        except ValueError:
+            skipped += 1
+            return
+        try:
+            draw.rectangle([px1, py1, px2, py2], outline=color, width=lw)
+            if label:
+                if font_label:
+                    tb = draw.textbbox((0, 0), label, font=font_label)
+                    tw, th = tb[2] - tb[0], tb[3] - tb[1]
+                else:
+                    tw, th = max(8 * len(label), 20), 16
+                # Clamp label box to image (don't draw past edges)
+                lbl_y_top = max(0, py1 - th - 6)
+                draw.rectangle(
+                    [px1, lbl_y_top, min(W, px1 + tw + 10), py1],
+                    fill=color,
+                )
+                kw = {"font": font_label} if font_label else {}
+                draw.text((px1 + 5, lbl_y_top + 2), label, fill="white", **kw)
+        except Exception as e:
+            log.debug(f"draw_box failed for {bbox} label={label!r}: {e}")
+            skipped += 1
 
-    # Refined grounding bbox: thick red box labelled "REFINED"
+    # Refined grounding bbox first (it's the most trustworthy signal)
     if pred.get("bbox_refined"):
         draw_box(pred["bbox_refined"], "#FF3B30", "REFINED")
 
-    # Per-object scene-graph bboxes: cycle through palette, label with entity name
-    for i, obj in enumerate(pred["scene_graph"]["objects"][:8]):  # cap at 8 to keep image readable
+    # Scene-graph proposals (cap to keep image readable)
+    for i, obj in enumerate(pred.get("scene_graph", {}).get("objects", [])[:8]):
         color = _BBOX_COLORS[(i + 1) % len(_BBOX_COLORS)]
-        label = f"{obj['entity']} @ {obj['region']}"
-        draw_box(obj["bbox"], color, label)
+        try:
+            label = f"{obj.get('entity', '?')} @ {obj.get('region', '?')}"
+        except Exception:
+            label = f"obj_{i}"
+        draw_box(obj.get("bbox"), color, label)
 
-    # Any <box> the LM emitted in text
+    # LM-emitted <box> coords (often whole-image, but draw them for transparency)
     for i, bb in enumerate(pred.get("bboxes_from_text", [])):
         draw_box(bb, "#AF52DE", f"LM#{i+1}")
 
-    # Answer overlay along the bottom (semi-transparent black bar)
-    ans = (pred.get("answer") or "")[:400]
-    if ans:
-        max_chars = max(40, W // 12)
-        words = ans.split()
-        lines, cur = [], ""
-        for w in words:
-            if len(cur) + len(w) + 1 <= max_chars:
-                cur = (cur + " " + w).strip()
-            else:
-                lines.append(cur)
-                cur = w
-        if cur:
-            lines.append(cur)
-        line_h = (font_ans.size + 6) if font_ans else 20
-        box_h = line_h * len(lines) + 16
-        draw.rectangle([0, H - box_h, W, H], fill=(0, 0, 0, 180))
-        for j, line in enumerate(lines):
-            y = H - box_h + 8 + j * line_h
-            kw = {"font": font_ans} if font_ans else {}
-            draw.text((10, y), line, fill="white", **kw)
+    if skipped:
+        log.info(
+            f"annotate_image: skipped {skipped} degenerate bboxes "
+            f"(width<{MIN_PX}px or height<{MIN_PX}px or out-of-order). "
+            "Symptom of undertrained SG generator — bboxes mode-collapsed."
+        )
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    # Answer overlay along the bottom (semi-transparent black bar)
+    try:
+        ans = (pred.get("answer") or "")[:400]
+        if ans:
+            max_chars = max(40, W // 12)
+            words, lines, cur = ans.split(), [], ""
+            for w in words:
+                if len(cur) + len(w) + 1 <= max_chars:
+                    cur = (cur + " " + w).strip()
+                else:
+                    lines.append(cur)
+                    cur = w
+            if cur:
+                lines.append(cur)
+            line_h = (font_ans.size + 6) if font_ans else 20
+            box_h = line_h * len(lines) + 16
+            draw.rectangle([0, H - box_h, W, H], fill=(0, 0, 0, 180))
+            for j, line in enumerate(lines):
+                y = H - box_h + 8 + j * line_h
+                kw = {"font": font_ans} if font_ans else {}
+                draw.text((10, y), line, fill="white", **kw)
+    except Exception as e:
+        log.debug(f"answer overlay failed: {e}")
+
+    # Always return PNG bytes — even if everything above silently failed,
+    # we still have the original (unmarked) image.
+    try:
+        return _encode_png(img)
+    except Exception as e:
+        log.warning(f"PNG encode of annotated image failed: {e}; "
+                    "falling back to unmodified original")
+        return _encode_png(pil.convert("RGB"))
 
 
 # ---------------------------------------------------------------------------
@@ -648,13 +717,23 @@ def build_app(model, device, region_names, entity_names):
             log.exception("inference failed")
             raise HTTPException(status_code=500, detail=f"inference error: {e}")
 
-        # Draw on the FULL-RESOLUTION original (looks better) and return base64
+        # Draw on the FULL-RESOLUTION original (looks better) and return base64.
+        # annotate_image() is now bulletproof — it always returns PNG bytes,
+        # so this try/except is only for catastrophic failures (PIL crash, OOM).
+        # If it does fail, fall back to encoding the unmodified original so the
+        # frontend at least sees the input image.
         try:
             png = annotate_image(pil, pred)
             pred["annotated_image_b64"] = base64.b64encode(png).decode("ascii")
         except Exception as e:
-            log.warning(f"annotation failed: {e}")
-            pred["annotated_image_b64"] = ""
+            log.exception(f"annotation crashed: {e} — falling back to original")
+            try:
+                buf = io.BytesIO()
+                pil.convert("RGB").save(buf, format="PNG")
+                pred["annotated_image_b64"] = base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception as e2:
+                log.exception(f"fallback PNG encode also failed: {e2}")
+                pred["annotated_image_b64"] = ""
 
         return JSONResponse(pred)
 
