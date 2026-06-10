@@ -64,6 +64,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
+# FastAPI imports MUST be at module top — `from __future__ import annotations`
+# (line 41) turns every annotation into a string ForwardRef. When FastAPI calls
+# pydantic's TypeAdapter on `image: UploadFile = File(...)`, pydantic evals the
+# string "UploadFile" against the MODULE-GLOBAL namespace, NOT the function's
+# local scope. Importing UploadFile inside build_app() therefore raises
+# NameError: name 'UploadFile' is not defined at endpoint-registration time.
+# Hoisting these imports to module top fixes that.
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+
 # Make `from models import ...` work whether this is run from repo root or scripts/.
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
@@ -598,14 +608,15 @@ def build_app(model, device, region_names, entity_names):
     # NOTE on version compatibility:
     # FastAPI 0.136 had two compounding bugs with this exact endpoint shape
     # (UploadFile TypeAdapter not rebuilt, and Request injection misidentified
-    # as a query param). Both vanish on FastAPI 0.115.x — the standard
+    # as a query param). Both vanish on FastAPI 0.115-0.119 — the standard
     # `image: UploadFile = File(...), question: str = Form(...)` signature
     # works correctly there. requirements.txt pins fastapi>=0.110,<0.120 to
     # keep this stable. If you upgrade fastapi past 0.120, retest /predict
     # before promoting the upgrade.
-    from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-    from fastapi.responses import HTMLResponse, JSONResponse
-
+    # NB: FastAPI imports live at module top (see comment near line 65) —
+    # they MUST be there because `from __future__ import annotations` makes
+    # endpoint signatures into string ForwardRefs that pydantic resolves
+    # against module globals, not function locals.
     app = FastAPI(title="SSG-VQA Inference Server")
 
     @app.get("/", response_class=HTMLResponse)
