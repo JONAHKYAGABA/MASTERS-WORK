@@ -652,9 +652,30 @@ def start_ngrok_tunnel(port: int) -> Optional[str]:
     except ImportError:
         log.error("pyngrok not installed. `pip install pyngrok` to enable --tunnel.")
         return None
-    token = os.environ.get("NGROK_AUTHTOKEN")
-    if token:
+    # Reading NGROK_AUTHTOKEN from the env was a footgun: an earlier
+    # `export NGROK_AUTHTOKEN=YOUR_TOKEN_HERE` (literal placeholder, set
+    # from a copy-pasted command) silently overrides the perfectly fine
+    # token in ~/.config/ngrok/ngrok.yml because we always preferred env
+    # over config. Two guards:
+    #   1) skip the env var if it looks like a placeholder
+    #   2) skip the env var if a real config file already has a token
+    token = os.environ.get("NGROK_AUTHTOKEN", "").strip()
+    placeholder_markers = ("YOUR_TOKEN", "PASTE", "REPLACE", "<token>", "xxxx")
+    looks_placeholder = (
+        not token
+        or len(token) < 20
+        or any(m.lower() in token.lower() for m in placeholder_markers)
+    )
+    if token and not looks_placeholder:
+        log.info("using NGROK_AUTHTOKEN from environment")
         conf.get_default().auth_token = token
+    elif token and looks_placeholder:
+        log.warning(
+            f"Ignoring NGROK_AUTHTOKEN={token!r} — looks like a placeholder. "
+            "Falling back to ~/.config/ngrok/ngrok.yml. Run `unset NGROK_AUTHTOKEN` "
+            "to silence this warning."
+        )
+    # else: no env var, pyngrok will read ~/.config/ngrok/ngrok.yml
     try:
         tunnel = ngrok.connect(port, "http")
         log.info(f"ngrok public URL: {tunnel.public_url}  →  http://localhost:{port}")
