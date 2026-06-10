@@ -2328,7 +2328,16 @@ def main(args):
             logger.info(f"Val Binary Acc: {val_metrics.get('binary_accuracy', 0):.4f}")
             logger.info(f"Val Category F1: {val_metrics.get('category_f1', 0):.4f}")
             logger.info(f"Val CheXpert AUROC: {val_metrics.get('chexpert_auroc', 0):.4f}")
-            logger.info(f"Val SG Entity Acc: {val_metrics.get('sg_entity_accuracy', 0):.4f}")
+            # Hungarian-matched (see training/metrics.py). The IoU-conditioned
+            # variants are the ones to put in tables — sg_entity_accuracy
+            # alone counts any-IoU>0 matches and inflates with small overlaps.
+            logger.info(
+                f"Val SG Entity Acc: {val_metrics.get('sg_entity_accuracy', 0):.4f} "
+                f"(IoU>=0.5: {val_metrics.get('sg_entity_acc_iou50', 0):.4f}, "
+                f"matches: {val_metrics.get('sg_match_count', 0)})"
+            )
+            logger.info(f"Val SG Mean IoU: {val_metrics.get('sg_mean_iou', 0):.4f} "
+                        f"(IoU>=0.5 rate: {val_metrics.get('sg_iou_50', 0):.4f})")
             logger.info(f"Val Grounding IoU: {val_metrics.get('grounding_mean_iou', 0):.4f}")
             if val_metrics.get('generation_bleu', 0) > 0:
                 logger.info(f"Val Gen BLEU: {val_metrics.get('generation_bleu', 0):.4f}")
@@ -2359,12 +2368,17 @@ def main(args):
                     'val/generation_rouge_l': val_metrics.get('generation_rouge_l', 0),
                     'val/generation_exact_match': val_metrics.get('generation_exact_match', 0),
                     'val/generation_word_overlap': val_metrics.get('generation_word_overlap', 0),
-                    # --- Scene Graph ---
+                    # --- Scene Graph (Hungarian-matched) ---
                     'val/sg_entity_accuracy': val_metrics.get('sg_entity_accuracy', 0),
+                    'val/sg_entity_acc_iou25': val_metrics.get('sg_entity_acc_iou25', 0),
+                    'val/sg_entity_acc_iou50': val_metrics.get('sg_entity_acc_iou50', 0),
                     'val/sg_entity_recall': val_metrics.get('sg_entity_recall', 0),
                     'val/sg_region_accuracy': val_metrics.get('sg_region_accuracy', 0),
+                    'val/sg_region_acc_iou50': val_metrics.get('sg_region_acc_iou50', 0),
                     'val/sg_mean_iou': val_metrics.get('sg_mean_iou', 0),
                     'val/sg_iou_50': val_metrics.get('sg_iou_50', 0),
+                    'val/sg_match_count': val_metrics.get('sg_match_count', 0),
+                    'val/sg_match_count_iou50': val_metrics.get('sg_match_count_iou50', 0),
                     # --- Visual Grounding ---
                     'val/grounding_mean_iou': val_metrics.get('grounding_mean_iou', 0),
                     'val/grounding_acc_iou25': val_metrics.get('grounding_acc_iou25', 0),

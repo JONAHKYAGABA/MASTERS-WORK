@@ -32,6 +32,15 @@ try:
 except ImportError:
     NLTK_AVAILABLE = False
 
+# Hungarian assignment for proper scene-graph matching.
+# Without scipy we fall back to greedy assignment; results match for small N
+# (chest X-rays have <= ~20 objects per study).
+try:
+    from scipy.optimize import linear_sum_assignment as _scipy_lsa
+    _SCIPY_LSA_AVAILABLE = True
+except ImportError:
+    _SCIPY_LSA_AVAILABLE = False
+
 
 # =============================================================================
 # IoU Utilities
@@ -43,14 +52,69 @@ def compute_iou(box1: np.ndarray, box2: np.ndarray) -> float:
     y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2])
     y2 = min(box1[3], box2[3])
-    
+
     inter_area = max(0, x2 - x1) * max(0, y2 - y1)
-    
+
     box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
     box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
     union_area = box1_area + box2_area - inter_area
-    
+
     return inter_area / (union_area + 1e-8)
+
+
+def pairwise_iou(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
+    """Compute the full (Na, Nb) IoU matrix between two sets of (x1,y1,x2,y2) boxes.
+
+    Used by the Hungarian-matched scene-graph metric: rows = predictions,
+    cols = ground-truth annotations. The old position-wise metric implicitly
+    assumed pred[i] was meant to predict gt[i] for every i, but the SG
+    generator returns proposals in centerness-rank order while GT is in
+    file-annotation order — those orderings are independent. Hungarian
+    assignment on IoU recovers the right pairing before checking entity
+    or region labels.
+    """
+    if boxes_a.shape[0] == 0 or boxes_b.shape[0] == 0:
+        return np.zeros((boxes_a.shape[0], boxes_b.shape[0]), dtype=np.float32)
+    a = boxes_a[:, None, :].astype(np.float32)  # (Na, 1, 4)
+    b = boxes_b[None, :, :].astype(np.float32)  # (1, Nb, 4)
+    x1 = np.maximum(a[..., 0], b[..., 0])
+    y1 = np.maximum(a[..., 1], b[..., 1])
+    x2 = np.minimum(a[..., 2], b[..., 2])
+    y2 = np.minimum(a[..., 3], b[..., 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    area_a = np.clip(a[..., 2] - a[..., 0], 0, None) * np.clip(a[..., 3] - a[..., 1], 0, None)
+    area_b = np.clip(b[..., 2] - b[..., 0], 0, None) * np.clip(b[..., 3] - b[..., 1], 0, None)
+    union = area_a + area_b - inter
+    return inter / (union + 1e-8)
+
+
+def hungarian_match(iou: np.ndarray) -> List[Tuple[int, int]]:
+    """Return [(pred_idx, gt_idx), ...] pairs maximising total IoU.
+
+    Uses scipy.optimize.linear_sum_assignment when available; otherwise
+    falls back to greedy max-IoU matching (sufficient for the small N we
+    see per study). Pairs with IoU == 0 are still returned by Hungarian
+    when sizes differ — the caller is responsible for filtering them out
+    with a IoU threshold (we use > 0 to keep any positive overlap, and
+    expose a 0.5 threshold variant for stricter accounting).
+    """
+    if iou.size == 0:
+        return []
+    if _SCIPY_LSA_AVAILABLE:
+        row, col = _scipy_lsa(-iou)
+        return list(zip(row.tolist(), col.tolist()))
+    # Greedy fallback
+    pairs: List[Tuple[int, int]] = []
+    work = iou.copy().astype(np.float32)
+    while True:
+        if work.size == 0 or work.max() <= 0:
+            break
+        idx = int(work.argmax())
+        i, j = divmod(idx, work.shape[1])
+        pairs.append((i, j))
+        work[i, :] = -1.0
+        work[:, j] = -1.0
+    return pairs
 
 
 def compute_batch_iou(pred_boxes: np.ndarray, gt_boxes: np.ndarray) -> np.ndarray:
@@ -179,13 +243,17 @@ class VQAMetrics:
         self.chexpert_labels = []
         self.chexpert_masks = []
         
-        # Scene Graph
+        # Scene Graph (Hungarian-matched — see update() / pairwise_iou).
+        # sg_iou_per_match holds the IoU of each matched (pred, gt) pair so
+        # compute() can report IoU-conditioned entity/region accuracy
+        # (e.g. accuracy among pairs with IoU >= 0.5).
         self.sg_entity_preds = []
         self.sg_entity_targets = []
         self.sg_region_preds = []
         self.sg_region_targets = []
         self.sg_bbox_preds = []
         self.sg_bbox_targets = []
+        self.sg_iou_per_match: List[float] = []
         
         # Grounding
         self.grounding_bbox_preds = []
@@ -280,37 +348,88 @@ class VQAMetrics:
         sg_outputs = outputs.get('scene_graph_outputs') if isinstance(outputs, dict) else None
         
         if sg_outputs is not None and gt_sg_entities is not None:
-            entity_logits = sg_outputs['entity_logits']
-            region_logits = sg_outputs['region_logits']
-            bbox_preds = sg_outputs['bbox_preds']
-            
+            # ===== Hungarian-matched scene-graph accuracy =====
+            # Previously this block extended sg_entity_preds/targets by raw
+            # position (pred[:N], gt[:N]). That was incorrect: the SG
+            # generator returns proposals in centerness-rank order, but GT is
+            # in annotation order — those orderings are uncorrelated, so the
+            # comparison effectively measured noise + ordering disagreement
+            # and consistently bottomed out near zero.
+            #
+            # Fix: match predictions to GT by bbox IoU (Hungarian), then
+            # compare entity/region labels on the matched pairs only. This
+            # is the standard DETR/CXR-SGG evaluation protocol.
+            entity_logits = sg_outputs['entity_logits']           # (B, N_pred, num_ent)
+            region_logits = sg_outputs['region_logits']           # (B, N_pred, num_reg)
+            bbox_preds_t  = sg_outputs['bbox_preds']              # (B, N_pred, 4)
+            objectness_t  = sg_outputs.get('objectness_scores')   # (B, N_pred) optional
+
             B = entity_logits.shape[0]
-            
+
             for b in range(min(B, len(gt_sg_entities))):
-                if gt_sg_entities[b] is None:
+                gt_ents = gt_sg_entities[b]
+                if gt_ents is None or len(gt_ents) == 0:
                     continue
-                
-                ent_pred = entity_logits[b].argmax(dim=-1).cpu().numpy()
-                ent_target = gt_sg_entities[b]
-                N = min(len(ent_pred), len(ent_target))
-                
-                self.sg_entity_preds.extend(ent_pred[:N].tolist())
-                self.sg_entity_targets.extend(ent_target[:N].tolist())
-                
-                if gt_sg_regions is not None and b < len(gt_sg_regions) and gt_sg_regions[b] is not None:
-                    reg_pred = region_logits[b].argmax(dim=-1).cpu().numpy()
-                    reg_target = gt_sg_regions[b]
-                    N = min(len(reg_pred), len(reg_target))
-                    self.sg_region_preds.extend(reg_pred[:N].tolist())
-                    self.sg_region_targets.extend(reg_target[:N].tolist())
-                
-                if gt_sg_bboxes is not None and b < len(gt_sg_bboxes) and gt_sg_bboxes[b] is not None:
-                    box_pred = bbox_preds[b].cpu().numpy()
-                    box_target = gt_sg_bboxes[b]
-                    N = min(len(box_pred), len(box_target))
-                    for i in range(N):
-                        self.sg_bbox_preds.append(box_pred[i])
-                        self.sg_bbox_targets.append(box_target[i])
+                gt_boxes = gt_sg_bboxes[b] if gt_sg_bboxes is not None and b < len(gt_sg_bboxes) else None
+                gt_regs  = gt_sg_regions[b] if gt_sg_regions is not None and b < len(gt_sg_regions) else None
+
+                # Without GT bboxes we cannot do Hungarian matching;
+                # rather than fall back to misleading position-wise comparison,
+                # skip the sample entirely. (Loss is still computed elsewhere.)
+                if gt_boxes is None or len(gt_boxes) == 0:
+                    continue
+
+                # ---- Pull predictions to CPU/numpy ----
+                ent_pred_ids = entity_logits[b].argmax(dim=-1).detach().cpu().numpy()
+                reg_pred_ids = region_logits[b].argmax(dim=-1).detach().cpu().numpy()
+                pred_boxes_b = bbox_preds_t[b].detach().cpu().numpy()
+
+                # ---- Filter predictions by objectness ----
+                # The SG generator emits N_max=100ish proposals per sample,
+                # most with near-zero objectness. Matching against all of them
+                # lets Hungarian pick high-IoU coincidences from random low-
+                # objectness boxes, inflating reported accuracy. Apply the
+                # same 0.3 threshold the model itself uses in
+                # _sg_outputs_to_dicts; fall back to top-K if nothing passes.
+                if objectness_t is not None:
+                    obj_b = objectness_t[b].detach().cpu().numpy()
+                    keep_mask = obj_b >= 0.3
+                    if not keep_mask.any():
+                        k = max(1, len(gt_ents))
+                        keep_idx = np.argsort(-obj_b)[:k]
+                        keep_mask = np.zeros_like(obj_b, dtype=bool)
+                        keep_mask[keep_idx] = True
+                    ent_pred_ids = ent_pred_ids[keep_mask]
+                    reg_pred_ids = reg_pred_ids[keep_mask]
+                    pred_boxes_b = pred_boxes_b[keep_mask]
+
+                if len(ent_pred_ids) == 0:
+                    continue
+
+                # ---- Normalise GT arrays ----
+                gt_boxes_np = gt_boxes.detach().cpu().numpy() if isinstance(gt_boxes, torch.Tensor) else np.asarray(gt_boxes)
+                gt_ents_np  = gt_ents.detach().cpu().numpy()  if isinstance(gt_ents,  torch.Tensor) else np.asarray(gt_ents)
+                gt_regs_np  = (gt_regs.detach().cpu().numpy()  if isinstance(gt_regs,  torch.Tensor) else np.asarray(gt_regs)) if gt_regs is not None else None
+
+                # ---- Hungarian match by IoU ----
+                iou_matrix = pairwise_iou(pred_boxes_b, gt_boxes_np)
+                pairs = hungarian_match(iou_matrix)
+
+                for p_idx, g_idx in pairs:
+                    iou_val = float(iou_matrix[p_idx, g_idx])
+                    # Hungarian returns size-balanced pairings even when IoU=0
+                    # (e.g. when N_pred > N_gt). Keep only positive-overlap
+                    # matches to avoid scoring nonsense pairings.
+                    if iou_val <= 0:
+                        continue
+                    self.sg_entity_preds.append(int(ent_pred_ids[p_idx]))
+                    self.sg_entity_targets.append(int(gt_ents_np[g_idx]))
+                    if gt_regs_np is not None and g_idx < len(gt_regs_np):
+                        self.sg_region_preds.append(int(reg_pred_ids[p_idx]))
+                        self.sg_region_targets.append(int(gt_regs_np[g_idx]))
+                    self.sg_bbox_preds.append(pred_boxes_b[p_idx])
+                    self.sg_bbox_targets.append(gt_boxes_np[g_idx])
+                    self.sg_iou_per_match.append(iou_val)
         
         # =====================================================
         # GROUNDING METRICS
@@ -529,21 +648,57 @@ class VQAMetrics:
         # =====================================================
         # SCENE GRAPH METRICS
         # =====================================================
+        # Scene-graph metrics are now computed only over Hungarian-matched
+        # pairs (see update()). Three accuracy variants are reported:
+        #   - sg_entity_accuracy:        all matched pairs (any IoU > 0)
+        #   - sg_entity_acc_iou50:       restricted to pairs with IoU >= 0.5
+        #                                (the COCO-style "correct localisation"
+        #                                threshold — strictly more meaningful)
+        #   - sg_match_count:            total matched pairs across the eval
+        #                                set (use as a denominator sanity check;
+        #                                a tiny match count means the model
+        #                                isn't producing usable proposals)
         if self.sg_entity_preds:
-            ent_preds = np.array(self.sg_entity_preds)
+            ent_preds   = np.array(self.sg_entity_preds)
             ent_targets = np.array(self.sg_entity_targets)
             metrics['sg_entity_accuracy'] = accuracy_score(ent_targets, ent_preds)
-            metrics['sg_entity_recall'] = recall_score(ent_targets, ent_preds, average='macro', zero_division=0)
-        
+            metrics['sg_entity_recall']   = recall_score(
+                ent_targets, ent_preds, average='macro', zero_division=0
+            )
+            metrics['sg_match_count'] = int(len(ent_preds))
+
+            if self.sg_iou_per_match:
+                ious_arr = np.array(self.sg_iou_per_match)
+                correct  = (ent_preds == ent_targets).astype(np.float32)
+                iou50    = ious_arr >= 0.5
+                if iou50.any():
+                    metrics['sg_entity_acc_iou50'] = float(correct[iou50].mean())
+                    metrics['sg_match_count_iou50'] = int(iou50.sum())
+                iou25 = ious_arr >= 0.25
+                if iou25.any():
+                    metrics['sg_entity_acc_iou25'] = float(correct[iou25].mean())
+
         if self.sg_region_preds:
-            reg_preds = np.array(self.sg_region_preds)
+            reg_preds   = np.array(self.sg_region_preds)
             reg_targets = np.array(self.sg_region_targets)
             metrics['sg_region_accuracy'] = accuracy_score(reg_targets, reg_preds)
-        
+            # Region accuracy under the same IoU filter
+            if self.sg_iou_per_match and len(self.sg_iou_per_match) == len(reg_preds):
+                ious_arr = np.array(self.sg_iou_per_match)
+                correct_r = (reg_preds == reg_targets).astype(np.float32)
+                iou50 = ious_arr >= 0.5
+                if iou50.any():
+                    metrics['sg_region_acc_iou50'] = float(correct_r[iou50].mean())
+
         if self.sg_bbox_preds:
-            ious = compute_batch_iou(np.array(self.sg_bbox_preds), np.array(self.sg_bbox_targets))
-            metrics['sg_mean_iou'] = float(ious.mean())
-            metrics['sg_iou_50'] = float((ious >= 0.5).mean())
+            # These bboxes are the IoU-paired matches now, not position pairs.
+            # sg_mean_iou therefore reports the OPTIMAL pairing IoU, which is
+            # the metric you actually want.
+            ious = compute_batch_iou(
+                np.array(self.sg_bbox_preds), np.array(self.sg_bbox_targets)
+            )
+            metrics['sg_mean_iou']    = float(ious.mean())
+            metrics['sg_iou_50']      = float((ious >= 0.5).mean())
         
         # =====================================================
         # GROUNDING METRICS
