@@ -155,6 +155,15 @@ def build_model(
     #   - sg_projector.queries has shape [num_sg_tokens, 128]
     # Setting this lower than training would raise size_mismatch on those
     # exact tensors (which is what happened with num_sg_tokens=4).
+    #
+    # max_answer_length=384: the model emits the structured template
+    #   <think>...</think><box>...</box><answer>...</answer>
+    # which is ~50-80 tokens of wrapper around an answer that itself can run
+    # 100-200 tokens for verbose findings. 128 tokens (training default)
+    # truncates mid-<answer> — the parser then can't find </answer>, so the
+    # entire raw generation (including <think> and <box> tags) leaks into
+    # the "Answer" field. 384 gives ~300 tokens for the actual answer text
+    # while keeping inference under ~12s on Qwen3-VL-8B QLoRA.
     log.info("constructing SSGVQANetV2 with explicit kwargs (training_mode=finetune)")
     model = SSGVQANetV2(
         qwen_model_id=model_id,
@@ -162,7 +171,7 @@ def build_model(
         num_sg_tokens=8,
         training_mode="finetune",
         torch_dtype=dtype,
-        max_answer_length=128,
+        max_answer_length=384,
     )
 
     # Cast trainable / non-quantised modules to device+dtype
@@ -295,7 +304,14 @@ _BOX_RE = re.compile(
     r"<box>\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*</box>"
 )
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+# Truncation-tolerant fallback: when the LM hits max_answer_length mid-output
+# the closing </answer> tag is missing. Match <answer> through end of string
+# so we still extract the partial answer text instead of dumping the entire
+# raw generation (including <think> + <box>) into the "Answer" field.
+_ANSWER_OPEN_RE = re.compile(r"<answer>(.*)", re.DOTALL)
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+# Truncation-tolerant for <think> too — same reason.
+_THINK_OPEN_RE = re.compile(r"<think>(.*?)(?=<box>|<answer>|$)", re.DOTALL)
 
 CHEXPERT_NAMES = [
     "Atelectasis", "Cardiomegaly", "Consolidation", "Edema",
@@ -342,10 +358,32 @@ def run_inference(
     elapsed = time.time() - t0
 
     raw_text = (out.get("generated_answer_text") or [""])[0]
-    answer = (_ANSWER_RE.search(raw_text).group(1).strip()
-              if _ANSWER_RE.search(raw_text) else raw_text.strip())
-    reasoning_m = _THINK_RE.search(raw_text)
-    reasoning = reasoning_m.group(1).strip() if reasoning_m else None
+
+    # Answer extraction with truncation-tolerant fallback.
+    # Order: closed <answer>...</answer> → open <answer>... (truncated at end)
+    #        → empty (rather than dumping <think> + <box> into the answer field
+    #          which is what the old "show raw_text as fallback" did).
+    m_closed = _ANSWER_RE.search(raw_text)
+    if m_closed:
+        answer = m_closed.group(1).strip()
+        answer_truncated = False
+    else:
+        m_open = _ANSWER_OPEN_RE.search(raw_text)
+        if m_open:
+            answer = m_open.group(1).strip()
+            answer_truncated = True  # ← mark so the UI can show a hint
+        else:
+            answer = ""
+            answer_truncated = False
+
+    # Reasoning extraction with the same fallback approach.
+    m_think_closed = _THINK_RE.search(raw_text)
+    if m_think_closed:
+        reasoning = m_think_closed.group(1).strip()
+    else:
+        m_think_open = _THINK_OPEN_RE.search(raw_text)
+        reasoning = m_think_open.group(1).strip() if m_think_open else None
+
     text_bboxes = parse_text_bboxes(raw_text)
 
     # Grounding head's refined bbox (the one the model is most confident about)
@@ -391,6 +429,7 @@ def run_inference(
     return {
         "question": question,
         "answer": answer,
+        "answer_truncated": answer_truncated,
         "reasoning": reasoning,
         "bbox_refined": [round(v, 3) for v in bbox_refined],
         "bboxes_from_text": [[round(v, 3) for v in b] for b in text_bboxes],
@@ -786,8 +825,8 @@ f.addEventListener('submit', async (e) => {
       <h2>Result <span class="pill">${dt}s wall</span>
                   <span class="pill">${j.inference_seconds}s model</span></h2>
       <img src="data:image/png;base64,${j.annotated_image_b64}">
-      <h3>Answer</h3>
-      <p>${esc(j.answer)}</p>
+      <h3>Answer ${j.answer_truncated ? '<span class="pill" style="background:#FF9500;color:white">truncated</span>' : ''}</h3>
+      <p>${esc(j.answer)}${j.answer_truncated ? '<span style="color:#FF9500"> … <em>(generation hit max length; consider raising max_answer_length)</em></span>' : ''}</p>
       ${j.reasoning ? '<h3>Reasoning</h3><p>'+esc(j.reasoning)+'</p>' : ''}
       <h3>Scene Graph (${sg.num_objects} objects detected)</h3>
       ${renderSceneGraph(sg.objects || [])}
