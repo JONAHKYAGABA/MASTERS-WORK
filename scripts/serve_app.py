@@ -99,6 +99,22 @@ def load_vocab(dataset_info_path: Optional[Path]) -> Tuple[List[str], List[str]]
 # ---------------------------------------------------------------------------
 
 def build_model(model_id: str, gpu: int, checkpoint_path: Optional[Path]):
+    """Build a fresh SSGVQANetV2 and load weights from pytorch_model.bin.
+
+    We deliberately AVOID ``SSGVQANetV2.from_pretrained`` because the
+    config.json saved next to the model is the full training config
+    (nested: ``{model: {...}, training: {...}, data: {...}}``), not the
+    flat init kwargs the model constructor accepts. Calling
+    from_pretrained therefore raises:
+
+        TypeError: SSGVQANetV2.__init__() got an unexpected keyword
+        argument 'model'
+
+    Instead we mirror exactly what train_mimic_cxr.py does on resume:
+    construct the model with explicit kwargs, then load
+    ``pytorch_model.bin`` with strict=False (bitsandbytes quant metadata
+    intentionally produces "unexpected keys" — harmless).
+    """
     from models import SSGVQANetV2
 
     if torch.cuda.is_available():
@@ -112,24 +128,17 @@ def build_model(model_id: str, gpu: int, checkpoint_path: Optional[Path]):
 
     log.info(f"device={device}  dtype={dtype}  qlora={force_qlora}  model={model_id}")
     t0 = time.time()
-    if checkpoint_path and checkpoint_path.exists():
-        log.info(f"loading SSGVQANetV2 from checkpoint: {checkpoint_path}")
-        model = SSGVQANetV2.from_pretrained(
-            str(checkpoint_path),
-            torch_dtype=dtype,
-            use_quantization=force_qlora,
-        )
-    else:
-        if checkpoint_path:
-            warnings.warn(f"Checkpoint not found at {checkpoint_path}; loading base model.")
-        model = SSGVQANetV2(
-            qwen_model_id=model_id,
-            use_quantization=force_qlora,
-            num_sg_tokens=4,
-            training_mode="finetune",
-            torch_dtype=dtype,
-            max_answer_length=128,
-        )
+
+    # Always construct fresh — single code path, no from_pretrained surprises.
+    log.info("constructing SSGVQANetV2 with explicit kwargs (training_mode=finetune)")
+    model = SSGVQANetV2(
+        qwen_model_id=model_id,
+        use_quantization=force_qlora,
+        num_sg_tokens=4,
+        training_mode="finetune",
+        torch_dtype=dtype,
+        max_answer_length=128,
+    )
 
     # Cast trainable / non-quantised modules to device+dtype
     for name in ("sg_encoder", "sg_projector", "grounding_head", "aux_heads", "view_proj"):
@@ -138,6 +147,39 @@ def build_model(model_id: str, gpu: int, checkpoint_path: Optional[Path]):
             sub.to(device=device, dtype=dtype)
     if getattr(model, "sg_generator", None) is not None:
         model.sg_generator.to(device=device)
+    # Recast mHC to fp32 — same Option-C stability fix used in training.
+    if hasattr(model, "grounding_head") and getattr(model.grounding_head, "mhc", None) is not None:
+        model.grounding_head.mhc.to(dtype=torch.float32)
+
+    # ---- Load fine-tuned weights from pytorch_model.bin ----
+    if checkpoint_path:
+        bin_path = checkpoint_path / "pytorch_model.bin"
+        if bin_path.exists():
+            log.info(f"loading weights from {bin_path}")
+            # weights_only=True: the trainer's pytorch_model.bin is pure
+            # tensors + plain dict structure (no pickled python objects).
+            # Defaulting to False would allow arbitrary code execution from
+            # whatever path you point --checkpoint at; lock that down here.
+            # If a future checkpoint format adds non-tensor metadata, whitelist
+            # the globals via torch.serialization.add_safe_globals rather than
+            # reverting to weights_only=False.
+            state = torch.load(str(bin_path), map_location="cpu", weights_only=True)
+            # The training save writes the trainable / custom-component
+            # state_dict; the bnb-quantised base weights are NOT in this
+            # file (they live in the HF cache and get loaded by the
+            # constructor above). Strict=False is REQUIRED.
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            log.info(
+                f"loaded {len(state) - len(missing)} / {len(state)} keys "
+                f"(missing={len(missing)}, unexpected={len(unexpected)} — "
+                "unexpected are mostly bnb quant_state, expected)"
+            )
+        else:
+            warnings.warn(
+                f"Checkpoint path {checkpoint_path} has no pytorch_model.bin; "
+                "serving with UNTRAINED LoRA + heads. Outputs will be garbage."
+            )
+
     model.eval()
     log.info(f"model ready in {time.time()-t0:.1f}s")
     return model, device, dtype
