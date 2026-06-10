@@ -117,15 +117,21 @@ def section1_filesystem_inventory(mimic_cxr_path: Path, mimic_qa_path: Path) -> 
         inv["mimic_cxr_jpg"] = {"root_exists": False}
 
     if mimic_qa_path.exists():
+        # Actual layout (discovered 2026-06-10):
+        #   data/mimic-ext-cxr-qba/qa/p{XX}/p{patient}/s{study}.qa.json
+        #   data/mimic-ext-cxr-qba/scene_data/p{XX}/p{patient}/s{study}.scene_graph.json
+        #   data/mimic-ext-cxr-qba/scene_data/p{XX}/p{patient}/s{study}.metadata.json
+        # NO train/validate/test directories — files are by patient ID only.
+        # Splits must be determined from a manifest (quality_mappings.csv or
+        # metadata/dataset_info.json) outside this filesystem walk.
         inv["mimic_ext_cxr_qba"] = {
             "root_exists": True,
-            "n_train_qa":     count_glob(mimic_qa_path, "train/p*/p*/s*/qa.json",          "train qa.json"),
-            "n_validate_qa":  count_glob(mimic_qa_path, "validate/p*/p*/s*/qa.json",       "validate qa.json"),
-            "n_test_qa":      count_glob(mimic_qa_path, "test/p*/p*/s*/qa.json",           "test qa.json"),
-            "n_train_sg":     count_glob(mimic_qa_path, "train/p*/p*/s*/scene_graph.json", "train scene_graph.json"),
-            "n_validate_sg":  count_glob(mimic_qa_path, "validate/p*/p*/s*/scene_graph.json", "validate scene_graph.json"),
-            "n_test_sg":      count_glob(mimic_qa_path, "test/p*/p*/s*/scene_graph.json",  "test scene_graph.json"),
+            "n_qa":           count_glob(mimic_qa_path, "qa/p*/p*/s*.qa.json",                "*.qa.json"),
+            "n_scene_graph":  count_glob(mimic_qa_path, "scene_data/p*/p*/s*.scene_graph.json", "*.scene_graph.json"),
+            "n_metadata":     count_glob(mimic_qa_path, "scene_data/p*/p*/s*.metadata.json",  "*.metadata.json"),
             "dataset_info":   (mimic_qa_path / "metadata" / "dataset_info.json").exists(),
+            "quality_mappings_csv": (mimic_qa_path / "quality_mappings.csv").exists(),
+            "exports_dir":    (mimic_qa_path / "exports").exists(),
         }
     else:
         log.warning(f"  MIMIC-Ext path does not exist: {mimic_qa_path}")
@@ -142,12 +148,14 @@ def section1_filesystem_inventory(mimic_cxr_path: Path, mimic_qa_path: Path) -> 
 def section2_scene_graph_structure(mimic_qa_path: Path, max_studies: int,
                                     split: str = "train") -> Tuple[Dict[str, Any], List[Path]]:
     log.info("=" * 70)
-    log.info(f"SECTION 2 — scene-graph structure (split={split}, "
-             f"max_studies={max_studies or 'ALL'})")
+    log.info(f"SECTION 2 — scene-graph structure "
+             f"(max_studies={max_studies or 'ALL'})")
     log.info("=" * 70)
-
-    sg_paths = sorted((mimic_qa_path / split).glob("p*/p*/s*/scene_graph.json"))
-    log.info(f"found {len(sg_paths):,} scene_graph.json files in {split} split")
+    # Note: `split` arg is kept for backward compat but ignored — there are
+    # no train/validate/test subdirs in the actual layout. Splits are
+    # determined elsewhere (manifest / dataset_info.json).
+    sg_paths = sorted((mimic_qa_path / "scene_data").glob("p*/p*/s*.scene_graph.json"))
+    log.info(f"found {len(sg_paths):,} scene_graph.json files")
 
     if max_studies > 0 and len(sg_paths) > max_studies:
         random.seed(42)
@@ -366,11 +374,11 @@ def section3_bbox_hypothesis(sg_paths: List[Path]) -> Dict[str, Any]:
 def section4_qa_patterns(mimic_qa_path: Path, max_studies: int,
                           split: str = "train") -> Dict[str, Any]:
     log.info("=" * 70)
-    log.info(f"SECTION 4 — Q/A patterns (split={split})")
+    log.info("SECTION 4 — Q/A patterns")
     log.info("=" * 70)
 
-    qa_paths = sorted((mimic_qa_path / split).glob("p*/p*/s*/qa.json"))
-    log.info(f"found {len(qa_paths):,} qa.json files")
+    qa_paths = sorted((mimic_qa_path / "qa").glob("p*/p*/s*.qa.json"))
+    log.info(f"found {len(qa_paths):,} qa files")
     if max_studies > 0 and len(qa_paths) > max_studies:
         random.seed(42)
         qa_paths = random.sample(qa_paths, max_studies)
@@ -462,10 +470,10 @@ def section4_qa_patterns(mimic_qa_path: Path, max_studies: int,
 def section5_cross_reference(mimic_qa_path: Path, max_studies: int,
                               split: str = "train") -> Dict[str, Any]:
     log.info("=" * 70)
-    log.info(f"SECTION 5 — cross-reference (sg vs answer)  split={split}")
+    log.info("SECTION 5 — cross-reference (sg vs answer)")
     log.info("=" * 70)
 
-    qa_paths = sorted((mimic_qa_path / split).glob("p*/p*/s*/qa.json"))
+    qa_paths = sorted((mimic_qa_path / "qa").glob("p*/p*/s*.qa.json"))
     if max_studies > 0 and len(qa_paths) > max_studies:
         random.seed(43)
         qa_paths = random.sample(qa_paths, max_studies)
@@ -477,7 +485,12 @@ def section5_cross_reference(mimic_qa_path: Path, max_studies: int,
     answer_polarity_total = 0
 
     for i, qa_p in enumerate(qa_paths):
-        sg_p = qa_p.parent / "scene_graph.json"
+        # Map qa path → scene_graph path:
+        #   qa/p10/p10000032/s50414267.qa.json
+        # → scene_data/p10/p10000032/s50414267.scene_graph.json
+        sid_part = qa_p.name.replace(".qa.json", "")
+        rel_dir = qa_p.parent.relative_to(mimic_qa_path / "qa")
+        sg_p = mimic_qa_path / "scene_data" / rel_dir / f"{sid_part}.scene_graph.json"
         if not sg_p.exists():
             continue
         try:
@@ -570,7 +583,7 @@ def section6_visual_samples(mimic_cxr_path: Path, mimic_qa_path: Path,
         log.error("PIL not available — `pip install pillow`")
         return []
 
-    sg_paths = sorted((mimic_qa_path / split).glob("p*/p*/s*/scene_graph.json"))
+    sg_paths = sorted((mimic_qa_path / "scene_data").glob("p*/p*/s*.scene_graph.json"))
     random.seed(44)
     random.shuffle(sg_paths)
 
@@ -588,10 +601,14 @@ def section6_visual_samples(mimic_cxr_path: Path, mimic_qa_path: Path,
     for p in sg_paths:
         if n_saved >= n_samples:
             break
-        # Find a matching image
-        study_dir = p.parent
-        jpgs = list((mimic_cxr_path / "files" / study_dir.parent.parent.name /
-                     study_dir.parent.name / study_dir.name).glob("*.jpg"))
+        # SG path: scene_data/p10/p10000032/s50414267.scene_graph.json
+        # Image path: mimic_cxr/files/p10/p10000032/s50414267/*.jpg
+        sid = p.name.replace(".scene_graph.json", "")  # "s50414267"
+        patient_dir = p.parent          # p10000032
+        p_short_dir = p.parent.parent   # p10
+        img_dir = (mimic_cxr_path / "files" / p_short_dir.name /
+                   patient_dir.name / sid)
+        jpgs = list(img_dir.glob("*.jpg"))
         if not jpgs:
             continue
         try:
@@ -647,7 +664,7 @@ def section6_visual_samples(mimic_cxr_path: Path, mimic_qa_path: Path,
                 draw.text((x1 + 4, max(0, y1 - th - 2)), label, fill="white", **kw)
                 drawn += 1
 
-            out_path = output_dir / f"{study_dir.parent.parent.name}_{study_dir.parent.name}_{study_dir.name}.png"
+            out_path = output_dir / f"{p_short_dir.name}_{patient_dir.name}_{sid}.png"
             pil.save(out_path)
             out_summary.append({
                 "image": str(out_path.relative_to(_ROOT)),
@@ -676,8 +693,14 @@ def section7_per_stage_preview(mimic_qa_path: Path, max_studies: int,
     log.info("=" * 70)
     log.info("SECTION 7 — per-stage filter preview")
     log.info("=" * 70)
+    # Note: the dataset's quality grade lives in
+    # question["answers"][i]["answer_quality"]["rating"] with values like
+    # "0_", "1_", "3_B", "4_A", "5_A+", "6_A++". We bucket by the first
+    # letter of the rating suffix. The trainer's current filter uses
+    # extraction_quality which is a sub-dict of numerical scores — that's
+    # a different (coarser) signal; we report both for comparison.
 
-    qa_paths = sorted((mimic_qa_path / split).glob("p*/p*/s*/qa.json"))
+    qa_paths = sorted((mimic_qa_path / "qa").glob("p*/p*/s*.qa.json"))
     if max_studies > 0 and len(qa_paths) > max_studies:
         random.seed(45)
         qa_paths = random.sample(qa_paths, max_studies)
@@ -690,13 +713,27 @@ def section7_per_stage_preview(mimic_qa_path: Path, max_studies: int,
             qa = json.loads(p.read_text())
         except Exception:
             continue
-        sid = str(qa.get("study_id", p.parent.name.lstrip("s")))
+        sid = str(qa.get("study_id", p.name.replace(".qa.json", "").lstrip("s")))
         questions = qa.get("questions") or qa.get("qa_pairs") or []
         seen_grades_for_study: Set[str] = set()
         for q in questions if isinstance(questions, list) else []:
             if not isinstance(q, dict):
                 continue
-            gr = (q.get("extraction_quality") or "").strip().upper()
+            # New (correct) grade source: answer_quality.rating, e.g. "4_A".
+            # Extract the trailing letter (A, B, C, etc.) — first letter of
+            # the part after the underscore. Skip "0_" / unrated entries.
+            answers = q.get("answers") or []
+            gr = None
+            for a in answers if isinstance(answers, list) else []:
+                if not isinstance(a, dict):
+                    continue
+                aq = a.get("answer_quality") or {}
+                rating = (aq.get("rating") or "") if isinstance(aq, dict) else ""
+                if isinstance(rating, str) and "_" in rating and len(rating) > 2:
+                    suffix = rating.split("_", 1)[1].strip()
+                    if suffix and suffix[0].isalpha():
+                        gr = suffix[0].upper()
+                        break
             if gr in {"A", "B", "C"}:
                 questions_by_grade[gr] += 1
                 seen_grades_for_study.add(gr)
