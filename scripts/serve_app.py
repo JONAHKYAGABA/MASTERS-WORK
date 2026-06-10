@@ -595,8 +595,9 @@ from_text: ${JSON.stringify(j.bboxes_from_text)}</pre>
 
 
 def build_app(model, device, region_names, entity_names):
-    from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+    from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse, JSONResponse
+    from starlette.requests import Request
 
     app = FastAPI(title="SSG-VQA Inference Server")
 
@@ -609,9 +610,29 @@ def build_app(model, device, region_names, entity_names):
         return {"status": "ok", "device": str(device)}
 
     @app.post("/predict")
-    async def predict(image: UploadFile = File(...), question: str = Form(...)):
-        if not question.strip():
-            raise HTTPException(status_code=400, detail="question must be non-empty")
+    async def predict(request: Request):
+        # Use Starlette's request.form() directly instead of declaring
+        #     image: UploadFile = File(...), question: str = Form(...)
+        # in the signature. FastAPI 0.136 + Pydantic 2.13 has a known bug
+        # where the UploadFile TypeAdapter isn't rebuilt before validation:
+        #     PydanticUserError: TypeAdapter[Annotated[ForwardRef('UploadFile'),
+        #     FieldInfo(...)]] is not fully defined ... call .rebuild() ...
+        # The form() API bypasses Pydantic's type-adapter path entirely and
+        # gives us the multipart parts directly — same UploadFile object, no
+        # TypeAdapter involvement.
+        try:
+            form = await request.form()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"could not parse form: {e}")
+        image = form.get("image")
+        question = form.get("question")
+
+        if image is None:
+            raise HTTPException(status_code=400, detail="missing 'image' field in form")
+        if not question or not str(question).strip():
+            raise HTTPException(status_code=400, detail="missing or empty 'question' field")
+        question = str(question)
+
         try:
             raw = await image.read()
             pil = Image.open(io.BytesIO(raw)).convert("RGB")
