@@ -103,9 +103,15 @@ class StageStats:
 
     def _bucket_for(self, item: Dict[str, Any]) -> str:
         """Stratify examples so we get variety, not 10 of the same thing."""
-        n_objs = len(item.get("gt_sg_entities") or [])
+        # NOTE: gt_sg_entities is a numpy array, so `array or []` would raise
+        # ValueError: The truth value of an array ... is ambiguous. Compare
+        # to None explicitly instead of using `or`.
+        ents = item.get("gt_sg_entities")
+        n_objs = len(ents) if ents is not None else 0
         pos = item.get("gt_sg_positiveness")
-        any_pos = bool(pos is not None and any(int(p) == 1 for p in pos))
+        any_pos = False
+        if pos is not None and len(pos) > 0:
+            any_pos = bool(any(int(p) == 1 for p in pos))
         size = "empty" if n_objs == 0 else "small" if n_objs <= 3 else "medium" if n_objs <= 10 else "large"
         polarity = "pos" if any_pos else "neg"
         return f"{size}_{polarity}"
@@ -133,7 +139,8 @@ class StageStats:
             "structured_answer_text": (
                 str(item.get("structured_answer_text") or "")[:600]
             ),
-            "n_sg_objects": len(item.get("gt_sg_entities") or []),
+            "n_sg_objects": (len(item["gt_sg_entities"])
+                             if item.get("gt_sg_entities") is not None else 0),
             "gt_sg_entities":     _safe(item.get("gt_sg_entities")),
             "gt_sg_regions":      _safe(item.get("gt_sg_regions")),
             "gt_sg_bboxes":       _safe(item.get("gt_sg_bboxes")),
