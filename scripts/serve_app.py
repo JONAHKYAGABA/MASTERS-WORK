@@ -595,12 +595,15 @@ from_text: ${JSON.stringify(j.bboxes_from_text)}</pre>
 
 
 def build_app(model, device, region_names, entity_names):
-    # IMPORTANT: Request must come from `fastapi`, not `starlette.requests`.
-    # FastAPI 0.136 only recognises its own re-exported Request as the
-    # special "inject the raw request" annotation; the starlette one is
-    # treated as an ordinary query parameter and the endpoint returns
-    # HTTP 422 "Field required loc=['query', 'request']".
-    from fastapi import FastAPI, HTTPException, Request
+    # NOTE on version compatibility:
+    # FastAPI 0.136 had two compounding bugs with this exact endpoint shape
+    # (UploadFile TypeAdapter not rebuilt, and Request injection misidentified
+    # as a query param). Both vanish on FastAPI 0.115.x — the standard
+    # `image: UploadFile = File(...), question: str = Form(...)` signature
+    # works correctly there. requirements.txt pins fastapi>=0.110,<0.120 to
+    # keep this stable. If you upgrade fastapi past 0.120, retest /predict
+    # before promoting the upgrade.
+    from fastapi import FastAPI, File, UploadFile, Form, HTTPException
     from fastapi.responses import HTMLResponse, JSONResponse
 
     app = FastAPI(title="SSG-VQA Inference Server")
@@ -614,29 +617,9 @@ def build_app(model, device, region_names, entity_names):
         return {"status": "ok", "device": str(device)}
 
     @app.post("/predict")
-    async def predict(request: Request):
-        # Use Starlette's request.form() directly instead of declaring
-        #     image: UploadFile = File(...), question: str = Form(...)
-        # in the signature. FastAPI 0.136 + Pydantic 2.13 has a known bug
-        # where the UploadFile TypeAdapter isn't rebuilt before validation:
-        #     PydanticUserError: TypeAdapter[Annotated[ForwardRef('UploadFile'),
-        #     FieldInfo(...)]] is not fully defined ... call .rebuild() ...
-        # The form() API bypasses Pydantic's type-adapter path entirely and
-        # gives us the multipart parts directly — same UploadFile object, no
-        # TypeAdapter involvement.
-        try:
-            form = await request.form()
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"could not parse form: {e}")
-        image = form.get("image")
-        question = form.get("question")
-
-        if image is None:
-            raise HTTPException(status_code=400, detail="missing 'image' field in form")
-        if not question or not str(question).strip():
-            raise HTTPException(status_code=400, detail="missing or empty 'question' field")
-        question = str(question)
-
+    async def predict(image: UploadFile = File(...), question: str = Form(...)):
+        if not question.strip():
+            raise HTTPException(status_code=400, detail="question must be non-empty")
         try:
             raw = await image.read()
             pil = Image.open(io.BytesIO(raw)).convert("RGB")
