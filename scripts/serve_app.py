@@ -156,13 +156,27 @@ def build_model(model_id: str, gpu: int, checkpoint_path: Optional[Path]):
         bin_path = checkpoint_path / "pytorch_model.bin"
         if bin_path.exists():
             log.info(f"loading weights from {bin_path}")
-            # weights_only=True: the trainer's pytorch_model.bin is pure
-            # tensors + plain dict structure (no pickled python objects).
-            # Defaulting to False would allow arbitrary code execution from
-            # whatever path you point --checkpoint at; lock that down here.
-            # If a future checkpoint format adds non-tensor metadata, whitelist
-            # the globals via torch.serialization.add_safe_globals rather than
-            # reverting to weights_only=False.
+            # weights_only=True is the safe default in torch >= 2.6, but our
+            # checkpoint pickles a few numpy scalars alongside the tensors
+            # (training stores step counters / metric values via numpy). The
+            # right fix is to explicitly whitelist those numpy types — NOT
+            # to fall back to weights_only=False, which would re-enable
+            # arbitrary code execution from any path passed via --checkpoint.
+            try:
+                import numpy as _np
+                _allow = []
+                for _attr in ("scalar", "_reconstruct", "ndarray"):
+                    obj = getattr(_np.core.multiarray, _attr, None)
+                    if obj is not None:
+                        _allow.append(obj)
+                for _attr in ("dtype",):
+                    obj = getattr(_np, _attr, None)
+                    if obj is not None:
+                        _allow.append(obj)
+                if _allow:
+                    torch.serialization.add_safe_globals(_allow)
+            except Exception as _e:
+                log.warning(f"could not whitelist numpy globals: {_e}")
             state = torch.load(str(bin_path), map_location="cpu", weights_only=True)
             # The training save writes the trainable / custom-component
             # state_dict; the bnb-quantised base weights are NOT in this
