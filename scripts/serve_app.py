@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+scripts/serve_app.py — FastAPI inference server + optional ngrok tunnel.
+
+A minimal web UI that lets a user upload a chest X-ray and ask a question.
+The server:
+  - Loads the trained SSGVQANetV2 once at startup (the Stage 4 best_model by
+    default; override with --checkpoint).
+  - Serves a single HTML page at GET / with an upload form.
+  - Accepts multipart POST /predict (image + question), runs inference, and
+    returns JSON containing:
+      * generated answer (parsed <answer>...</answer>)
+      * reasoning trace (parsed <think>...</think>)
+      * refined grounding bbox (from the grounding head)
+      * any <box> coordinates the LM emitted (often multiple)
+      * scene graph: per-object bboxes + entity names + region names
+      * CheXpert top-5 findings with probabilities
+      * the original image with bboxes drawn on it (base64-encoded PNG)
+      * the raw LM generation for debugging
+
+Why this file exists separately from predict_and_visualize.py:
+  predict_and_visualize.py is a CLI batch tool that writes annotated PNGs and
+  JSON sidecars to disk. The serving path needs the full scene-graph dict
+  (not just a num_objects summary) and has to return bytes, so we inline the
+  inference + drawing here rather than try to retrofit the CLI script.
+
+Usage:
+    pip install fastapi uvicorn python-multipart pyngrok pillow
+
+    # Local-only (LAN access only)
+    python scripts/serve_app.py
+
+    # With public ngrok tunnel
+    NGROK_AUTHTOKEN=your_token_here python scripts/serve_app.py --tunnel
+
+    # Override defaults
+    python scripts/serve_app.py \\
+        --checkpoint ./checkpoints/stage4_finetune_qwen3vl8b_5k/best_model \\
+        --port 8000 \\
+        --gpu 0 \\
+        --tunnel
+
+Get a free ngrok auth token at https://dashboard.ngrok.com/get-started/your-authtoken
+Then either:
+  - export NGROK_AUTHTOKEN=...   (read by this script when --tunnel is set)
+  - or run `ngrok config add-authtoken <token>` once to save it globally
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import logging
+import os
+import re
+import sys
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+from PIL import Image, ImageDraw, ImageFont
+
+# Make `from models import ...` work whether this is run from repo root or scripts/.
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("serve_app")
+
+
+# ---------------------------------------------------------------------------
+# Vocab loading — turns entity_id 42 into "consolidation" in the response
+# ---------------------------------------------------------------------------
+
+def load_vocab(dataset_info_path: Optional[Path]) -> Tuple[List[str], List[str]]:
+    """Return (region_names, entity_names). Empty lists if file missing."""
+    if not dataset_info_path or not dataset_info_path.exists():
+        log.warning(
+            f"Vocab not found at {dataset_info_path}; scene-graph response "
+            "will show numeric IDs instead of names."
+        )
+        return [], []
+    with open(dataset_info_path) as f:
+        info = json.load(f)
+    regions = info.get("regions") or info.get("region_names") or []
+    entities = info.get("finding_entities") or info.get("entity_names") or []
+    log.info(f"Loaded vocab: {len(regions)} regions, {len(entities)} entities")
+    return regions, entities
+
+
+# ---------------------------------------------------------------------------
+# Model loading — mirrors scripts/predict_and_visualize.py:build_model
+# ---------------------------------------------------------------------------
+
+def build_model(model_id: str, gpu: int, checkpoint_path: Optional[Path]):
+    from models import SSGVQANetV2
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu)
+        cc = torch.cuda.get_device_capability(gpu)
+        dtype = torch.bfloat16 if cc >= (8, 0) else torch.float16
+        device = torch.device(f"cuda:{gpu}")
+        force_qlora = cc < (8, 0)
+    else:
+        dtype, device, force_qlora = torch.float32, torch.device("cpu"), False
+
+    log.info(f"device={device}  dtype={dtype}  qlora={force_qlora}  model={model_id}")
+    t0 = time.time()
+    if checkpoint_path and checkpoint_path.exists():
+        log.info(f"loading SSGVQANetV2 from checkpoint: {checkpoint_path}")
+        model = SSGVQANetV2.from_pretrained(
+            str(checkpoint_path),
+            torch_dtype=dtype,
+            use_quantization=force_qlora,
+        )
+    else:
+        if checkpoint_path:
+            warnings.warn(f"Checkpoint not found at {checkpoint_path}; loading base model.")
+        model = SSGVQANetV2(
+            qwen_model_id=model_id,
+            use_quantization=force_qlora,
+            num_sg_tokens=4,
+            training_mode="finetune",
+            torch_dtype=dtype,
+            max_answer_length=128,
+        )
+
+    # Cast trainable / non-quantised modules to device+dtype
+    for name in ("sg_encoder", "sg_projector", "grounding_head", "aux_heads", "view_proj"):
+        sub = getattr(model, name, None)
+        if sub is not None:
+            sub.to(device=device, dtype=dtype)
+    if getattr(model, "sg_generator", None) is not None:
+        model.sg_generator.to(device=device)
+    model.eval()
+    log.info(f"model ready in {time.time()-t0:.1f}s")
+    return model, device, dtype
+
+
+# ---------------------------------------------------------------------------
+# Inference — replicates run_inference but returns the full scene graph
+# ---------------------------------------------------------------------------
+
+_BOX_RE = re.compile(
+    r"<box>\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*</box>"
+)
+_ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+CHEXPERT_NAMES = [
+    "Atelectasis", "Cardiomegaly", "Consolidation", "Edema",
+    "Enlarged Cardiomediastinum", "Fracture", "Lung Lesion", "Lung Opacity",
+    "No Finding", "Pleural Effusion", "Pleural Other", "Pneumonia",
+    "Pneumothorax", "Support Devices",
+]
+
+
+def parse_text_bboxes(text: str) -> List[List[float]]:
+    out = []
+    for m in _BOX_RE.finditer(text or ""):
+        try:
+            coords = [max(0.0, min(1.0, float(m.group(i)))) for i in (1, 2, 3, 4)]
+            if coords[2] > coords[0] and coords[3] > coords[1]:
+                out.append(coords)
+        except (ValueError, IndexError):
+            pass
+    return out
+
+
+def _to_list(x):
+    if hasattr(x, "tolist"):
+        return x.tolist()
+    return list(x)
+
+
+def run_inference(
+    model,
+    pil_image: Image.Image,
+    question: str,
+    region_names: List[str],
+    entity_names: List[str],
+) -> Dict[str, Any]:
+    """Run the model and return a serialisable dict including the FULL scene graph."""
+    t0 = time.time()
+    with torch.no_grad():
+        out = model(
+            images=None,
+            pil_images=[pil_image],
+            questions=[question],
+            scene_graphs=None,  # let the SG generator predict from the image
+        )
+    elapsed = time.time() - t0
+
+    raw_text = (out.get("generated_answer_text") or [""])[0]
+    answer = (_ANSWER_RE.search(raw_text).group(1).strip()
+              if _ANSWER_RE.search(raw_text) else raw_text.strip())
+    reasoning_m = _THINK_RE.search(raw_text)
+    reasoning = reasoning_m.group(1).strip() if reasoning_m else None
+    text_bboxes = parse_text_bboxes(raw_text)
+
+    # Grounding head's refined bbox (the one the model is most confident about)
+    refined = out.get("grounding_outputs", {}).get("bbox_pred")
+    bbox_refined = _to_list(refined[0]) if refined is not None else [0.0, 0.0, 1.0, 1.0]
+    bbox_refined = [float(max(0.0, min(1.0, v))) for v in bbox_refined]
+
+    # CheXpert probabilities → top-5
+    chex_logits = out.get("chexpert_logits")
+    chex_top = {}
+    if chex_logits is not None:
+        probs = torch.sigmoid(chex_logits[0].float()).tolist()
+        chex_pairs = sorted(
+            zip(CHEXPERT_NAMES, probs), key=lambda kv: -kv[1]
+        )[:5]
+        chex_top = {n: round(p, 3) for n, p in chex_pairs}
+
+    # Scene graph: pull the dict produced by _sg_outputs_to_dicts
+    # (bboxes, entity_ids, region_ids, positiveness, relations, num_objects)
+    sg_objects: List[Dict[str, Any]] = []
+    sg_list = out.get("generated_scene_graphs") or []
+    if sg_list:
+        sg = sg_list[0]
+        n = int(sg.get("num_objects", 0))
+        bboxes = sg.get("bboxes", [])
+        ent_ids = sg.get("entity_ids", [])
+        reg_ids = sg.get("region_ids", [])
+        pos = sg.get("positiveness", [])
+        for i in range(n):
+            ent_idx = int(ent_ids[i]) if i < len(ent_ids) else -1
+            reg_idx = int(reg_ids[i]) if i < len(reg_ids) else -1
+            sg_objects.append({
+                "bbox": [float(max(0.0, min(1.0, v))) for v in _to_list(bboxes[i])],
+                "entity_id": ent_idx,
+                "entity": (entity_names[ent_idx] if 0 <= ent_idx < len(entity_names)
+                           else f"entity_{ent_idx}"),
+                "region_id": reg_idx,
+                "region": (region_names[reg_idx] if 0 <= reg_idx < len(region_names)
+                           else f"region_{reg_idx}"),
+                "positiveness": int(pos[i]) if i < len(pos) else 0,
+            })
+
+    return {
+        "question": question,
+        "answer": answer,
+        "reasoning": reasoning,
+        "bbox_refined": [round(v, 3) for v in bbox_refined],
+        "bboxes_from_text": [[round(v, 3) for v in b] for b in text_bboxes],
+        "scene_graph": {
+            "num_objects": len(sg_objects),
+            "objects": sg_objects,
+        },
+        "chexpert_top": chex_top,
+        "raw_generation": raw_text,
+        "inference_seconds": round(elapsed, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Drawing — overlay refined bbox + scene-graph objects + answer
+# ---------------------------------------------------------------------------
+
+_BBOX_COLORS = [
+    "#FF3B30", "#FF9500", "#FFCC00", "#34C759",
+    "#00C7BE", "#30B0C7", "#007AFF", "#AF52DE",
+]
+
+
+def _try_font(size: int) -> Optional[ImageFont.FreeTypeFont]:
+    for p in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+    ):
+        if Path(p).exists():
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                continue
+    return None
+
+
+def annotate_image(pil: Image.Image, pred: Dict[str, Any]) -> bytes:
+    """Draw the refined grounding bbox + scene-graph objects + answer overlay.
+    Returns PNG bytes."""
+    img = pil.copy().convert("RGB")
+    W, H = img.size
+    draw = ImageDraw.Draw(img, "RGBA")
+    lw = max(3, min(W, H) // 200)
+    font_label = _try_font(max(14, min(W, H) // 60))
+    font_ans = _try_font(max(14, min(W, H) // 70))
+
+    def draw_box(bbox, color, label):
+        x1, y1, x2, y2 = bbox
+        px1, py1, px2, py2 = int(x1 * W), int(y1 * H), int(x2 * W), int(y2 * H)
+        draw.rectangle([px1, py1, px2, py2], outline=color, width=lw)
+        if label:
+            if font_label:
+                tb = draw.textbbox((0, 0), label, font=font_label)
+                tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            else:
+                tw, th = max(8 * len(label), 20), 16
+            draw.rectangle([px1, py1 - th - 6, px1 + tw + 10, py1], fill=color)
+            kw = {"font": font_label} if font_label else {}
+            draw.text((px1 + 5, py1 - th - 4), label, fill="white", **kw)
+
+    # Refined grounding bbox: thick red box labelled "REFINED"
+    if pred.get("bbox_refined"):
+        draw_box(pred["bbox_refined"], "#FF3B30", "REFINED")
+
+    # Per-object scene-graph bboxes: cycle through palette, label with entity name
+    for i, obj in enumerate(pred["scene_graph"]["objects"][:8]):  # cap at 8 to keep image readable
+        color = _BBOX_COLORS[(i + 1) % len(_BBOX_COLORS)]
+        label = f"{obj['entity']} @ {obj['region']}"
+        draw_box(obj["bbox"], color, label)
+
+    # Any <box> the LM emitted in text
+    for i, bb in enumerate(pred.get("bboxes_from_text", [])):
+        draw_box(bb, "#AF52DE", f"LM#{i+1}")
+
+    # Answer overlay along the bottom (semi-transparent black bar)
+    ans = (pred.get("answer") or "")[:400]
+    if ans:
+        max_chars = max(40, W // 12)
+        words = ans.split()
+        lines, cur = [], ""
+        for w in words:
+            if len(cur) + len(w) + 1 <= max_chars:
+                cur = (cur + " " + w).strip()
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        line_h = (font_ans.size + 6) if font_ans else 20
+        box_h = line_h * len(lines) + 16
+        draw.rectangle([0, H - box_h, W, H], fill=(0, 0, 0, 180))
+        for j, line in enumerate(lines):
+            y = H - box_h + 8 + j * line_h
+            kw = {"font": font_ans} if font_ans else {}
+            draw.text((10, y), line, fill="white", **kw)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+
+HTML_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>SSG-VQA — Chest X-Ray QA</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         max-width: 920px; margin: 2rem auto; padding: 0 1rem; line-height: 1.45; }
+  h1 { margin-bottom: .25rem; }
+  .sub { color: #666; margin-top: 0; }
+  form { display: flex; flex-direction: column; gap: .75rem;
+         padding: 1rem; border: 1px solid #ccc; border-radius: 8px; }
+  label { font-weight: 600; }
+  textarea, input[type=file] { font-size: 1rem; padding: .5rem; width: 100%;
+         border: 1px solid #bbb; border-radius: 4px; font-family: inherit; }
+  textarea { min-height: 4rem; resize: vertical; }
+  button { padding: .75rem 1rem; font-size: 1.05rem; background: #007AFF;
+           color: white; border: 0; border-radius: 6px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: progress; }
+  #result { margin-top: 2rem; }
+  #result img { max-width: 100%; border: 1px solid #ccc; border-radius: 6px; }
+  pre { background: #f4f4f4; padding: .75rem; overflow-x: auto;
+        border-radius: 4px; font-size: .85rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #eee; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px;
+          background: #eee; font-size: .85rem; margin-right: 4px; }
+  details { margin-top: 1rem; }
+  summary { cursor: pointer; font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1a1a1a; color: #eee; }
+    form, pre { background: #2a2a2a; border-color: #444; }
+    th, td { border-bottom-color: #333; }
+    .pill { background: #333; }
+  }
+</style></head><body>
+<h1>SSG-VQA Demo</h1>
+<p class="sub">Upload a chest X-ray + ask a question. Server: Qwen3-VL-8B + SG generator + grounding head.</p>
+
+<form id="f">
+  <label>X-ray image <input type="file" name="image" accept="image/*" required></label>
+  <label>Question
+    <textarea name="question" required>Are there any abnormalities visible? If so, point them out.</textarea>
+  </label>
+  <button type="submit" id="go">Run inference</button>
+</form>
+
+<div id="result"></div>
+
+<script>
+const f = document.getElementById('f');
+const out = document.getElementById('result');
+const btn = document.getElementById('go');
+
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+f.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  btn.disabled = true;
+  out.innerHTML = '<p>Running inference… (first request may take ~15s for warm-up)</p>';
+  const fd = new FormData(f);
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/predict', { method: 'POST', body: fd });
+    const dt = ((performance.now()-t0)/1000).toFixed(2);
+    const j = await r.json();
+    if (!r.ok) {
+      out.innerHTML = '<p style="color:#FF3B30">Error: ' + esc(j.detail || JSON.stringify(j)) + '</p>';
+      return;
+    }
+    const sg = j.scene_graph;
+    const chex = Object.entries(j.chexpert_top || {})
+      .map(([k,v]) => `<tr><td>${esc(k)}</td><td>${v.toFixed(3)}</td></tr>`).join('');
+    const objs = (sg.objects || []).slice(0, 20).map((o,i) => `
+      <tr><td>${i+1}</td><td>${esc(o.entity)}</td><td>${esc(o.region)}</td>
+      <td>${o.positiveness}</td>
+      <td>[${o.bbox.map(v=>v.toFixed(2)).join(', ')}]</td></tr>`).join('');
+    out.innerHTML = `
+      <h2>Result <span class="pill">${dt}s wall</span>
+                  <span class="pill">${j.inference_seconds}s model</span></h2>
+      <img src="data:image/png;base64,${j.annotated_image_b64}">
+      <h3>Answer</h3>
+      <p>${esc(j.answer)}</p>
+      ${j.reasoning ? '<h3>Reasoning</h3><p>'+esc(j.reasoning)+'</p>' : ''}
+      <h3>Scene Graph (${sg.num_objects} objects detected)</h3>
+      ${sg.num_objects > 0 ? '<table><thead><tr><th>#</th><th>Entity</th><th>Region</th><th>Polarity</th><th>Bbox (x1,y1,x2,y2)</th></tr></thead><tbody>'+objs+'</tbody></table>' : '<p><i>No scene-graph objects detected for this image.</i></p>'}
+      <h3>CheXpert Top-5</h3>
+      ${chex ? '<table><thead><tr><th>Finding</th><th>Probability</th></tr></thead><tbody>'+chex+'</tbody></table>' : '<p><i>CheXpert head produced no output.</i></p>'}
+      <details>
+        <summary>Refined bbox + LM &lt;box&gt; tokens</summary>
+        <pre>refined: ${JSON.stringify(j.bbox_refined)}
+from_text: ${JSON.stringify(j.bboxes_from_text)}</pre>
+      </details>
+      <details>
+        <summary>Raw LM generation</summary>
+        <pre>${esc(j.raw_generation)}</pre>
+      </details>`;
+  } catch (err) {
+    out.innerHTML = '<p style="color:#FF3B30">Network error: ' + esc(err.message) + '</p>';
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body></html>
+"""
+
+
+def build_app(model, device, region_names, entity_names):
+    from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+    from fastapi.responses import HTMLResponse, JSONResponse
+
+    app = FastAPI(title="SSG-VQA Inference Server")
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index():
+        return HTML_PAGE
+
+    @app.get("/healthz")
+    async def healthz():
+        return {"status": "ok", "device": str(device)}
+
+    @app.post("/predict")
+    async def predict(image: UploadFile = File(...), question: str = Form(...)):
+        if not question.strip():
+            raise HTTPException(status_code=400, detail="question must be non-empty")
+        try:
+            raw = await image.read()
+            pil = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"could not decode image: {e}")
+
+        # Resize for the model (Qwen image processor cap is honoured downstream
+        # via QWEN_MAX_PIXELS env). 448 short-side is a good radiology default.
+        resized = pil.copy()
+        resized.thumbnail((448, 448), Image.LANCZOS)
+
+        try:
+            pred = run_inference(model, resized, question, region_names, entity_names)
+        except Exception as e:
+            log.exception("inference failed")
+            raise HTTPException(status_code=500, detail=f"inference error: {e}")
+
+        # Draw on the FULL-RESOLUTION original (looks better) and return base64
+        try:
+            png = annotate_image(pil, pred)
+            pred["annotated_image_b64"] = base64.b64encode(png).decode("ascii")
+        except Exception as e:
+            log.warning(f"annotation failed: {e}")
+            pred["annotated_image_b64"] = ""
+
+        return JSONResponse(pred)
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Optional ngrok tunnel — single function, easy to skip
+# ---------------------------------------------------------------------------
+
+def start_ngrok_tunnel(port: int) -> Optional[str]:
+    try:
+        from pyngrok import ngrok, conf
+    except ImportError:
+        log.error("pyngrok not installed. `pip install pyngrok` to enable --tunnel.")
+        return None
+    token = os.environ.get("NGROK_AUTHTOKEN")
+    if token:
+        conf.get_default().auth_token = token
+    try:
+        tunnel = ngrok.connect(port, "http")
+        log.info(f"ngrok public URL: {tunnel.public_url}  →  http://localhost:{port}")
+        return tunnel.public_url
+    except Exception as e:
+        log.error(
+            f"ngrok tunnel failed: {e}. Either set NGROK_AUTHTOKEN "
+            f"or run `ngrok config add-authtoken <token>` once."
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--model_id", default="Qwen/Qwen3-VL-8B-Instruct")
+    p.add_argument("--checkpoint", type=Path,
+                   default=Path("./checkpoints/stage4_finetune_qwen3vl8b_5k/best_model"),
+                   help="Path to a saved best_model dir. Use a Stage 1/2/3 dir to compare stages.")
+    p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--vocab", type=Path,
+                   default=Path("./data/mimic-ext-cxr-qba/metadata/dataset_info.json"),
+                   help="dataset_info.json for entity/region names.")
+    p.add_argument("--tunnel", action="store_true", help="Open a public ngrok tunnel.")
+    args = p.parse_args()
+
+    region_names, entity_names = load_vocab(args.vocab)
+    model, device, _ = build_model(args.model_id, args.gpu, args.checkpoint)
+
+    public_url = None
+    if args.tunnel:
+        public_url = start_ngrok_tunnel(args.port)
+
+    app = build_app(model, device, region_names, entity_names)
+
+    import uvicorn
+    log.info(f"serving on http://{args.host}:{args.port}")
+    if public_url:
+        log.info(f"PUBLIC URL: {public_url}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()
