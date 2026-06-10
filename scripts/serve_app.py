@@ -595,9 +595,13 @@ from_text: ${JSON.stringify(j.bboxes_from_text)}</pre>
 
 
 def build_app(model, device, region_names, entity_names):
-    from fastapi import FastAPI, HTTPException
+    # IMPORTANT: Request must come from `fastapi`, not `starlette.requests`.
+    # FastAPI 0.136 only recognises its own re-exported Request as the
+    # special "inject the raw request" annotation; the starlette one is
+    # treated as an ordinary query parameter and the endpoint returns
+    # HTTP 422 "Field required loc=['query', 'request']".
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse
-    from starlette.requests import Request
 
     app = FastAPI(title="SSG-VQA Inference Server")
 
