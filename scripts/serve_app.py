@@ -568,6 +568,10 @@ def annotate_image(pil: Image.Image, pred: Dict[str, Any]) -> bytes:
 
 HTML_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>SSG-VQA — Chest X-Ray QA</title>
+<!-- Scene-graph visualization is rendered with inline SVG (vanilla JS) —
+     no CDN, no Subresource Integrity to manage, no dependency to vendor.
+     The bipartite entity↔region layout is actually a better fit for our
+     data than a generic force-directed graph from vis-network. -->
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -594,11 +598,33 @@ HTML_PAGE = """<!doctype html>
           background: #eee; font-size: .85rem; margin-right: 4px; }
   details { margin-top: 1rem; }
   summary { cursor: pointer; font-weight: 600; }
+  #sg-graph { width: 100%; min-height: 360px;
+              border: 1px solid #ccc; border-radius: 6px;
+              background: #fafafa; overflow-x: auto; padding: 8px 0; }
+  #sg-graph svg { display: block; margin: 0 auto; }
+  #sg-graph .node-entity { fill: #007AFF; stroke: #003e80; }
+  #sg-graph .node-region { fill: #34C759; stroke: #1a6e2e; }
+  #sg-graph .node-label { fill: white; font-size: 12px; font-weight: 600;
+                          text-anchor: middle; dominant-baseline: middle;
+                          pointer-events: none; font-family: inherit; }
+  #sg-graph .edge { stroke: #888; fill: none; opacity: .55; }
+  #sg-graph .edge.pos { stroke: #FF3B30; }
+  #sg-graph .edge.neg { stroke: #888; }
+  #sg-graph .col-label { fill: #555; font-size: 11px; font-weight: 600;
+                         text-anchor: middle; text-transform: uppercase;
+                         letter-spacing: .05em; }
+  .legend { display: flex; gap: 1rem; font-size: .85rem; flex-wrap: wrap;
+            color: #666; margin: .5rem 0 .25rem; }
+  .legend .swatch { display: inline-block; width: 12px; height: 12px;
+                    border-radius: 3px; margin-right: 4px; vertical-align: middle; }
   @media (prefers-color-scheme: dark) {
     body { background: #1a1a1a; color: #eee; }
     form, pre { background: #2a2a2a; border-color: #444; }
     th, td { border-bottom-color: #333; }
     .pill { background: #333; }
+    #sg-graph { background: #2a2a2a; border-color: #444; }
+    #sg-graph .col-label { fill: #aaa; }
+    #sg-graph .edge { opacity: .7; }
   }
 </style></head><body>
 <h1>SSG-VQA Demo</h1>
@@ -620,6 +646,120 @@ const out = document.getElementById('result');
 const btn = document.getElementById('go');
 
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+// Bipartite SVG renderer for the scene graph.
+// Aggregates duplicate (entity, region, polarity) tuples into edge weights
+// instead of drawing them as separate nodes — much more readable when the
+// detector is mode-collapsed (20 of "body habitus/clothing @ thoracolumbar
+// spine" → 1 fat edge instead of 20 overlapping nodes).
+function renderSceneGraph(objects) {
+  if (!objects || objects.length === 0) {
+    return '<p><i>No scene-graph objects detected for this image.</i></p>';
+  }
+
+  // 1. Aggregate edges by (entity, region, polarity)
+  const edgeMap = new Map();
+  for (const o of objects) {
+    const key = `${o.entity}||${o.region}||${o.positiveness}`;
+    const e = edgeMap.get(key) || {
+      entity: o.entity, region: o.region,
+      positiveness: o.positiveness, count: 0,
+    };
+    e.count += 1;
+    edgeMap.set(key, e);
+  }
+  const edges = [...edgeMap.values()];
+
+  // 2. Build unique node lists (preserve appearance order)
+  const entityList = [], entitySeen = new Set();
+  const regionList = [], regionSeen = new Set();
+  for (const e of edges) {
+    if (!entitySeen.has(e.entity)) { entitySeen.add(e.entity); entityList.push(e.entity); }
+    if (!regionSeen.has(e.region)) { regionSeen.add(e.region); regionList.push(e.region); }
+  }
+
+  // 3. Layout: 2 columns, ~80px node spacing, fixed-width nodes
+  const W = 760, NODE_W = 220, NODE_H = 32, ROW_GAP = 12, COL_HEADER_H = 28;
+  const leftX = 20, rightX = W - 20 - NODE_W;
+  const nRows = Math.max(entityList.length, regionList.length);
+  const H = COL_HEADER_H + nRows * (NODE_H + ROW_GAP) + 20;
+
+  const entityIdx = new Map(entityList.map((e, i) => [e, i]));
+  const regionIdx = new Map(regionList.map((r, i) => [r, i]));
+  const ey = i => COL_HEADER_H + i * (NODE_H + ROW_GAP) + NODE_H / 2;
+  const ry = i => COL_HEADER_H + i * (NODE_H + ROW_GAP) + NODE_H / 2;
+
+  // 4. Build SVG
+  const parts = [];
+  parts.push(`<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg">`);
+
+  // Column headers
+  parts.push(`<text class="col-label" x="${leftX + NODE_W/2}" y="16">ENTITY (${entityList.length})</text>`);
+  parts.push(`<text class="col-label" x="${rightX + NODE_W/2}" y="16">REGION (${regionList.length})</text>`);
+
+  // Edges first (so nodes render on top)
+  const maxCount = Math.max(...edges.map(e => e.count));
+  for (const e of edges) {
+    const i = entityIdx.get(e.entity), j = regionIdx.get(e.region);
+    const x1 = leftX + NODE_W, y1 = ey(i);
+    const x2 = rightX,         y2 = ry(j);
+    // Bezier control points for a smooth curve
+    const cx1 = x1 + 80, cx2 = x2 - 80;
+    const strokeWidth = 1 + Math.round(4 * (e.count / maxCount));
+    const cls = (e.positiveness === 1) ? 'edge pos' : 'edge neg';
+    const title = `${e.entity} → ${e.region} (×${e.count}, ${e.positiveness === 1 ? 'positive' : 'negative'})`;
+    parts.push(
+      `<path class="${cls}" stroke-width="${strokeWidth}" ` +
+      `d="M ${x1} ${y1} C ${cx1} ${y1}, ${cx2} ${y2}, ${x2} ${y2}">` +
+      `<title>${esc(title)}</title></path>`
+    );
+    // Edge count label (small, near midpoint)
+    if (e.count > 1) {
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      parts.push(
+        `<circle cx="${mx}" cy="${my}" r="10" fill="#fff" stroke="#888" stroke-width="1"/>` +
+        `<text x="${mx}" y="${my}" text-anchor="middle" dominant-baseline="middle" ` +
+        `font-size="10" font-weight="700" fill="#333">${e.count}</text>`
+      );
+    }
+  }
+
+  // Entity nodes (left column)
+  for (let i = 0; i < entityList.length; i++) {
+    const y = COL_HEADER_H + i * (NODE_H + ROW_GAP);
+    parts.push(
+      `<rect class="node-entity" x="${leftX}" y="${y}" width="${NODE_W}" height="${NODE_H}" rx="6"/>` +
+      `<text class="node-label" x="${leftX + NODE_W/2}" y="${y + NODE_H/2}">` +
+      `${esc(entityList[i].length > 28 ? entityList[i].slice(0, 26) + '…' : entityList[i])}</text>` +
+      `<title>${esc(entityList[i])}</title>`
+    );
+  }
+
+  // Region nodes (right column)
+  for (let j = 0; j < regionList.length; j++) {
+    const y = COL_HEADER_H + j * (NODE_H + ROW_GAP);
+    parts.push(
+      `<rect class="node-region" x="${rightX}" y="${y}" width="${NODE_W}" height="${NODE_H}" rx="6"/>` +
+      `<text class="node-label" x="${rightX + NODE_W/2}" y="${y + NODE_H/2}">` +
+      `${esc(regionList[j].length > 28 ? regionList[j].slice(0, 26) + '…' : regionList[j])}</text>` +
+      `<title>${esc(regionList[j])}</title>`
+    );
+  }
+
+  parts.push('</svg>');
+
+  // Legend
+  const legend = `
+    <div class="legend">
+      <span><span class="swatch" style="background:#007AFF"></span>entity</span>
+      <span><span class="swatch" style="background:#34C759"></span>region</span>
+      <span><span class="swatch" style="background:#FF3B30"></span>positive finding</span>
+      <span><span class="swatch" style="background:#888"></span>negative/normal</span>
+      <span style="margin-left:auto;color:#999">${objects.length} object${objects.length>1?'s':''} → ${edges.length} unique edge${edges.length>1?'s':''}</span>
+    </div>`;
+
+  return `<div id="sg-graph">${parts.join('')}</div>${legend}`;
+}
 
 f.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -650,7 +790,8 @@ f.addEventListener('submit', async (e) => {
       <p>${esc(j.answer)}</p>
       ${j.reasoning ? '<h3>Reasoning</h3><p>'+esc(j.reasoning)+'</p>' : ''}
       <h3>Scene Graph (${sg.num_objects} objects detected)</h3>
-      ${sg.num_objects > 0 ? '<table><thead><tr><th>#</th><th>Entity</th><th>Region</th><th>Polarity</th><th>Bbox (x1,y1,x2,y2)</th></tr></thead><tbody>'+objs+'</tbody></table>' : '<p><i>No scene-graph objects detected for this image.</i></p>'}
+      ${renderSceneGraph(sg.objects || [])}
+      ${sg.num_objects > 0 ? '<details><summary>Raw scene-graph table</summary><table><thead><tr><th>#</th><th>Entity</th><th>Region</th><th>Polarity</th><th>Bbox (x1,y1,x2,y2)</th></tr></thead><tbody>'+objs+'</tbody></table></details>' : ''}
       <h3>CheXpert Top-5</h3>
       ${chex ? '<table><thead><tr><th>Finding</th><th>Probability</th></tr></thead><tbody>'+chex+'</tbody></table>' : '<p><i>CheXpert head produced no output.</i></p>'}
       <details>
