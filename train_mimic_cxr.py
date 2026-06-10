@@ -2258,7 +2258,15 @@ def main(args):
         print_training_info(config, world_size, model, device)
         
         if WANDB_AVAILABLE and config.wandb.enabled and config.wandb.watch_model:
-            wandb.watch(model, log="all", log_freq=config.wandb.watch_log_freq)
+            # log="parameters" (NOT "all" / "gradients") — wandb's gradient
+            # logging registers a per-param hook that calls .data on the grad
+            # tensor. When the model has dynamic per-sample routing (some
+            # heads only fire when their target is valid — finetune mode hits
+            # this), some params get grad=None on some iterations and the
+            # hook crashes with AttributeError: 'NoneType' object has no
+            # attribute 'data'. Parameter logging alone is enough for the
+            # weight distributions in the W&B UI.
+            wandb.watch(model, log="parameters", log_freq=config.wandb.watch_log_freq)
     
     # Training loop
     best_metric = 0.0
