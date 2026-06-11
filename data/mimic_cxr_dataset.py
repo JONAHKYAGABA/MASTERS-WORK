@@ -525,6 +525,7 @@ class MIMICCXRVQADataset(Dataset):
         force_rebuild_cache: bool = False,  # Force rebuild even if cache exists
         prebuilt_cache_path: Optional[str] = None,  # Optional: load samples from external prebuilt cache (.pkl)
         sg_cache_root: Optional[str] = None,  # Stage-3+ pre-generated SG cache (precompute_sg_cache.py)
+        one_question_per_image: bool = False,  # Dedupe to one sample per image (max image diversity per max_samples)
     ):
         self.mimic_cxr_path = Path(mimic_cxr_path)
         self.mimic_qa_path = Path(mimic_qa_path)
@@ -538,6 +539,7 @@ class MIMICCXRVQADataset(Dataset):
         self.use_cache = use_cache
         self.force_rebuild_cache = force_rebuild_cache
         self.prebuilt_cache_path = prebuilt_cache_path
+        self.one_question_per_image = bool(one_question_per_image)
         
         # Setup cache directory
         self.cache_dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
@@ -770,9 +772,32 @@ class MIMICCXRVQADataset(Dataset):
             f"view:{self.view_filter}|"
             f"qtypes:{sorted(self.question_types) if self.question_types else 'all'}|"
             f"max:{self.max_samples or 'none'}|"
-            f"exports:{self.use_exports}"
+            f"exports:{self.use_exports}|"
+            f"dedupe_img:{int(self.one_question_per_image)}"
         )
         return hashlib.md5(config_str.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _dedupe_by_image(samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep at most one sample per unique STUDY (= unique scene graph + unique image).
+
+        In MIMIC-Ext-CXR-QBA, scene graphs are per-STUDY (one .scene_graph.json per
+        study), so two samples that share study_id share the same SG even if they
+        use different frontal images. To guarantee "100K unique images AND 100K
+        unique scene graphs", we dedupe on study_id (with image_path fallback for
+        legacy caches that lack study_id).
+
+        Preserves order: first occurrence per study wins.
+        """
+        seen: set = set()
+        out: List[Dict[str, Any]] = []
+        for s in samples:
+            key = s.get('study_id') or s.get('scene_graph_path') or s.get('image_path') or s.get('dicom_id')
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+        return out
     
     def _get_cache_path(self) -> Path:
         """Get the cache file path for current configuration."""
@@ -806,7 +831,17 @@ class MIMICCXRVQADataset(Dataset):
                             with open(shard_path, 'rb') as f:
                                 samples = pickle.load(f)
                             logger.info(f"[Rank {rank}] Loaded {len(samples)} samples from shard")
-                            
+
+                            # ── Dedupe to one question per image (max image diversity) ──
+                            if self.one_question_per_image:
+                                pre = len(samples)
+                                samples = self._dedupe_by_image(samples)
+                                logger.info(
+                                    f"[Rank {rank}] one_question_per_image: "
+                                    f"{pre:,} → {len(samples):,} samples "
+                                    f"({len(samples)/max(1,pre):.1%} kept)"
+                                )
+
                             # ── Apply max_samples to shard ──────────────
                             if self.max_samples and len(samples) > self.max_samples:
                                 orig_len = len(samples)
@@ -859,6 +894,16 @@ class MIMICCXRVQADataset(Dataset):
                             "(not present in prebuilt cache). Proceeding without quality filtering."
                         )
 
+                    # Dedupe to one question per image (max image diversity for SG generator)
+                    if self.one_question_per_image:
+                        pre = len(samples)
+                        samples = self._dedupe_by_image(samples)
+                        logger.info(
+                            f"[Rank {rank}] one_question_per_image: "
+                            f"{pre:,} → {len(samples):,} samples "
+                            f"({len(samples)/max(1,pre):.1%} kept)"
+                        )
+
                     # Apply max_samples limit if needed
                     if self.max_samples and len(samples) > self.max_samples:
                         samples = samples[:self.max_samples]
@@ -905,7 +950,21 @@ class MIMICCXRVQADataset(Dataset):
                 logger.info(f"[Rank {rank}/{world_size}] Loading samples from cache: {cache_path}")
                 with open(cache_path, 'rb') as f:
                     samples = pickle.load(f)
-                
+
+                # Dedupe to one question per image (max image diversity for SG generator).
+                # Cache key already encodes self.one_question_per_image, so a cache file
+                # loaded here was built with the same flag — but apply defensively in case
+                # an old cache predates the flag.
+                if self.one_question_per_image:
+                    pre = len(samples)
+                    samples = self._dedupe_by_image(samples)
+                    if len(samples) != pre:
+                        logger.info(
+                            f"[Rank {rank}] one_question_per_image: "
+                            f"{pre:,} → {len(samples):,} samples "
+                            f"({len(samples)/max(1,pre):.1%} kept)"
+                        )
+
                 # Apply max_samples limit if needed
                 if self.max_samples and len(samples) > self.max_samples:
                     samples = samples[:self.max_samples]
@@ -1063,16 +1122,23 @@ class MIMICCXRVQADataset(Dataset):
         skipped_split = 0
         skipped_image = 0
         skipped_quality = 0
-        
+        skipped_dup_image = 0
+
+        # When one_question_per_image is set, we dedupe at the STUDY level so
+        # each kept sample has a UNIQUE scene graph (SGs are per-study in QBA)
+        # AND a unique image. max_samples then counts unique studies/images/SGs.
+        # Name kept as seen_image_paths for back-compat with downstream logging.
+        seen_image_paths: set = set() if self.one_question_per_image else None
+
         for p_group in p_groups:
             for patient_dir in p_group.iterdir():
                 if not patient_dir.is_dir() or not patient_dir.name.startswith('p'):
                     continue
-                
+
                 for qa_file in patient_dir.glob('s*.qa.json'):
                     files_scanned += 1
                     if files_scanned % 5000 == 0:
-                        logger.info(f"  [{files_scanned}] samples={len(samples)}, skip_split={skipped_split}, skip_img={skipped_image}, skip_qual={skipped_quality}")
+                        logger.info(f"  [{files_scanned}] samples={len(samples)}, skip_split={skipped_split}, skip_img={skipped_image}, skip_qual={skipped_quality}, skip_dup_img={skipped_dup_image}")
                     try:
                         # Parse IDs from path
                         # patient_dir.name = "p10000032" -> subject_id = 10000032
@@ -1080,17 +1146,24 @@ class MIMICCXRVQADataset(Dataset):
                         subject_id = int(patient_dir.name[1:])  # Remove 'p' prefix
                         study_id_str = qa_file.stem.split('.')[0]  # "s50414267"
                         study_id = int(study_id_str[1:])  # Remove 's' prefix
-                        
+
                         # Check if in valid split
                         if valid_studies and (subject_id, study_id) not in valid_studies:
                             skipped_split += 1
                             continue
-                        
+
                         # Load QA data
                         with open(qa_file) as f:
                             qa_data = json.load(f)
-                        
-                        # Find corresponding image
+
+                        # In one_question_per_image mode: skip studies we've
+                        # already added (each kept study contributes one sample
+                        # = one image + one unique scene graph).
+                        if seen_image_paths is not None and (subject_id, study_id) in seen_image_paths:
+                            skipped_dup_image += 1
+                            continue
+
+                        # Find corresponding image (best frontal view, PA > AP).
                         image_path, dicom_id = self._find_image(subject_id, study_id)
                         if image_path is None:
                             skipped_image += 1
@@ -1158,12 +1231,18 @@ class MIMICCXRVQADataset(Dataset):
                                 'question_strategy': q.get('question_strategy', ''),
                                 'question': q.get('question', ''),
                                 'answers': q.get('answers', []),
-                                'obs_ids': q.get('obs_ids', []),  # Scene graph observation IDs
+                                'obs_ids': q.get('obs_ids', []),
                             })
-                            
-                            # Check max samples
+
                             if self.max_samples and len(samples) >= self.max_samples:
                                 return samples
+
+                            # one_question_per_image: mark this study as taken
+                            # (= 1 unique image + 1 unique SG) and skip remaining
+                            # questions for it (they would reuse the same image+SG).
+                            if seen_image_paths is not None:
+                                seen_image_paths.add((subject_id, study_id))
+                                break
                                 
                     except Exception as e:
                         logger.debug(f"Error loading {qa_file}: {e}")

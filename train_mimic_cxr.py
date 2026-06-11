@@ -1687,6 +1687,7 @@ def main(args):
         cache_dir=cache_dir,
         use_cache=True,
         prebuilt_cache_path=args.prebuilt_cache_train,
+        one_question_per_image=args.one_question_per_image,
     )
     
     # Barrier to ensure all processes have loaded/cached train data
@@ -1707,6 +1708,7 @@ def main(args):
         cache_dir=cache_dir,
         use_cache=True,
         prebuilt_cache_path=args.prebuilt_cache_val,
+        one_question_per_image=args.one_question_per_image,
     )
     
     # Barrier to ensure all processes have loaded/cached val data
@@ -2549,6 +2551,13 @@ if __name__ == "__main__":
                        help='Path to prebuilt TRAIN samples .pkl (e.g., from scripts/prebuild_cache.py)')
     parser.add_argument('--prebuilt_cache_val', type=str, default=None,
                        help='Path to prebuilt VAL/VALIDATE samples .pkl (e.g., from scripts/prebuild_cache.py)')
+    parser.add_argument('--one_question_per_image', action='store_true',
+                       help='Dedupe samples to AT MOST one per STUDY. With this flag, --max_samples N '
+                            'gives N unique images AND N unique scene graphs (scene graphs are per-study '
+                            'in QBA — different studies = different SGs). Without it, ~82 questions share '
+                            'the same image+SG. Use for SG-generator training where image/SG diversity '
+                            'matters more than question text. Requires a fresh cache rebuild (cache key '
+                            'changes with the flag).')
     
     # Distributed training (per methodology Section 11)
     parser.add_argument('--use_deepspeed', action='store_true',
