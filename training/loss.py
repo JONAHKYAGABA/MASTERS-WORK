@@ -72,6 +72,15 @@ class MultiTaskLoss(nn.Module):
         label_smoothing: float = 0.0,
         use_giou: bool = True,
         pad_token_id: int = 0,
+        # ---- Class-weight files (produced by scripts/compute_class_weights.py).
+        # When supplied, the SG entity / region / polarity CE losses use
+        # per-class weights drawn from MIMIC-Ext-CXR-QBA's published
+        # frequency stats (study_observations.csv, study_regions.csv).
+        # That's the principled fix for the "predict the most common
+        # class for everything" mode collapse the model exhibited.
+        entity_weights_json: Optional[str] = None,
+        region_weights_json: Optional[str] = None,
+        polarity_weights_json: Optional[str] = None,
     ):
         super().__init__()
         
@@ -100,6 +109,54 @@ class MultiTaskLoss(nn.Module):
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, label_smoothing=label_smoothing)
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
         self.generation_ce_loss = nn.CrossEntropyLoss(ignore_index=pad_token_id, label_smoothing=label_smoothing)
+
+        # ---- Per-class CE losses for scene-graph heads (fixes mode collapse).
+        # Held as buffers (not Parameters) so they move with .to(device) but
+        # don't show up in optimizer state.
+        self.entity_ce_loss   = self._build_weighted_ce(
+            entity_weights_json, ignore_index, label_smoothing, "entity"
+        )
+        self.region_ce_loss   = self._build_weighted_ce(
+            region_weights_json, ignore_index, label_smoothing, "region"
+        )
+        self.polarity_ce_loss = self._build_weighted_ce(
+            polarity_weights_json, ignore_index, label_smoothing, "polarity"
+        )
+
+    def _build_weighted_ce(
+        self,
+        weights_json: Optional[str],
+        ignore_index: int,
+        label_smoothing: float,
+        name: str,
+    ) -> nn.CrossEntropyLoss:
+        """Build a CE loss with per-class weights from a JSON file.
+
+        Falls back to unweighted CE (same as self.ce_loss) when no path
+        is supplied. The JSON schema is the one produced by
+        scripts/compute_class_weights.py — a dict with a 'weights' list.
+        """
+        if not weights_json:
+            return nn.CrossEntropyLoss(
+                ignore_index=ignore_index, label_smoothing=label_smoothing,
+            )
+        import json as _json
+        from pathlib import Path as _Path
+        p = _Path(weights_json)
+        if not p.exists():
+            import warnings as _w
+            _w.warn(f"{name} weights file not found: {p} — falling back to "
+                    "unweighted CE.")
+            return nn.CrossEntropyLoss(
+                ignore_index=ignore_index, label_smoothing=label_smoothing,
+            )
+        payload = _json.loads(p.read_text())
+        w = torch.tensor(payload["weights"], dtype=torch.float32)
+        print(f"[loss] {name} CE: loaded {len(w)} per-class weights "
+              f"from {p} (min={w.min():.3f} max={w.max():.3f})")
+        return nn.CrossEntropyLoss(
+            weight=w, ignore_index=ignore_index, label_smoothing=label_smoothing,
+        )
     
     def forward(
         self,
@@ -330,7 +387,12 @@ class MultiTaskLoss(nn.Module):
                     torch.full_like(ent_target, self.ignore_index),
                 )
                 if (ent_target != -100).any():
-                    entity_loss = entity_loss + self.ce_loss(
+                    # Use per-class weighted CE if available (fixes mode collapse).
+                    # The .to() handles moving the weight buffer to the same
+                    # device as the logits at first call — cheap, idempotent.
+                    if self.entity_ce_loss.weight is not None:
+                        self.entity_ce_loss.weight = self.entity_ce_loss.weight.to(device)
+                    entity_loss = entity_loss + self.entity_ce_loss(
                         entity_logits[b, :K].float(), ent_target,
                     )
 
@@ -345,7 +407,9 @@ class MultiTaskLoss(nn.Module):
                     torch.full_like(reg_target, self.ignore_index),
                 )
                 if (reg_target != -100).any():
-                    region_loss = region_loss + self.ce_loss(
+                    if self.region_ce_loss.weight is not None:
+                        self.region_ce_loss.weight = self.region_ce_loss.weight.to(device)
+                    region_loss = region_loss + self.region_ce_loss(
                         region_logits[b, :K].float(), reg_target,
                     )
             

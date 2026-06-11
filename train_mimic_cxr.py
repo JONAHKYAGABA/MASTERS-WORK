@@ -2031,6 +2031,23 @@ def main(args):
     if training_mode not in ('sg_only', 'alignment', 'pretrain', 'finetune', 'rl', 'standard'):
         training_mode = 'standard'
     
+    # Resolve class-weight files for SG heads. Pass --class_weights_dir
+    # pointing at the output of scripts/compute_class_weights.py to
+    # enable inverse-frequency weighting (fixes mode collapse to common
+    # entities/regions). When the dir is missing, loss falls back to
+    # unweighted CE (same behaviour as before).
+    cw_dir = getattr(args, 'class_weights_dir', None)
+    if cw_dir:
+        cw_dir_path = Path(cw_dir)
+        ent_w = str(cw_dir_path / "entity_weights.json")   if (cw_dir_path / "entity_weights.json").exists()   else None
+        reg_w = str(cw_dir_path / "region_weights.json")   if (cw_dir_path / "region_weights.json").exists()   else None
+        pol_w = str(cw_dir_path / "polarity_weights.json") if (cw_dir_path / "polarity_weights.json").exists() else None
+        if is_main_process(local_rank):
+            logger.info(f"Class weights: dir={cw_dir} entity={'Y' if ent_w else 'N'} "
+                        f"region={'Y' if reg_w else 'N'} polarity={'Y' if pol_w else 'N'}")
+    else:
+        ent_w = reg_w = pol_w = None
+
     criterion = MultiTaskLoss(
         training_mode=training_mode,
         vqa_weight=config.training.vqa_loss_weight,
@@ -2042,6 +2059,9 @@ def main(args):
         category_weight=config.training.category_head_weight,
         region_weight=config.training.region_head_weight,
         severity_weight=config.training.severity_head_weight,
+        entity_weights_json=ent_w,
+        region_weights_json=reg_w,
+        polarity_weights_json=pol_w,
     )
     
     if is_main_process(local_rank):
@@ -2598,7 +2618,15 @@ if __name__ == "__main__":
     # FP16 override (required when CUDA toolkit is too old to compile DeepSpeed FP16 ops)
     parser.add_argument('--no_fp16', action='store_true',
                        help='Force disable FP16 mixed precision (use when CUDA toolkit cannot compile DeepSpeed ops)')
-    
+
+    # Class-weight directory (output of scripts/compute_class_weights.py).
+    # When supplied, SG entity / region / polarity CE losses use inverse-frequency
+    # per-class weights → fixes mode collapse to over-represented classes.
+    parser.add_argument('--class_weights_dir', type=str, default=None,
+                       help='Directory with {entity,region,polarity}_weights.json '
+                            'produced by scripts/compute_class_weights.py. '
+                            'Enables inverse-frequency weighting for SG losses.')
+
     args = parser.parse_args()
     
     # DeepSpeed adds local_rank argument automatically
