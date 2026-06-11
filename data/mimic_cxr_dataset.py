@@ -773,7 +773,8 @@ class MIMICCXRVQADataset(Dataset):
             f"qtypes:{sorted(self.question_types) if self.question_types else 'all'}|"
             f"max:{self.max_samples or 'none'}|"
             f"exports:{self.use_exports}|"
-            f"dedupe_img:{int(self.one_question_per_image)}"
+            f"dedupe_img:{int(self.one_question_per_image)}|"
+            f"scan_seed:{42 if self.one_question_per_image else 'noshuffle'}"
         )
         return hashlib.md5(config_str.encode()).hexdigest()[:16]
 
@@ -1117,7 +1118,7 @@ class MIMICCXRVQADataset(Dataset):
         # Structure: qa/p{XX}/p{subject_id}/s{study_id}.qa.json
         p_groups = sorted([p for p in qa_dir.iterdir() if p.is_dir() and p.name.startswith('p')])
         logger.info(f"Scanning {len(p_groups)} patient groups for QA files...")
-        
+
         files_scanned = 0
         skipped_split = 0
         skipped_image = 0
@@ -1130,123 +1131,145 @@ class MIMICCXRVQADataset(Dataset):
         # Name kept as seen_image_paths for back-compat with downstream logging.
         seen_image_paths: set = set() if self.one_question_per_image else None
 
+        # Build the iteration order. When dedupe_by_study is active, randomize
+        # study order so the first max_samples studies are sampled UNIFORMLY
+        # across the whole train split — otherwise the lex-ordered walk
+        # (p10 → p11 → ...) means the first 100K studies all come from a
+        # few low-numbered patient groups. Deterministic seed → reproducible
+        # subset across runs. Seed is folded into the cache key.
+        scan_seed = 42  # bump to invalidate caches if you want a different draw
+        flat_iter = []  # list of (subject_id, patient_dir, qa_file)
         for p_group in p_groups:
             for patient_dir in p_group.iterdir():
                 if not patient_dir.is_dir() or not patient_dir.name.startswith('p'):
                     continue
-
+                try:
+                    subject_id_int = int(patient_dir.name[1:])
+                except ValueError:
+                    continue
                 for qa_file in patient_dir.glob('s*.qa.json'):
-                    files_scanned += 1
-                    if files_scanned % 5000 == 0:
-                        logger.info(f"  [{files_scanned}] samples={len(samples)}, skip_split={skipped_split}, skip_img={skipped_image}, skip_qual={skipped_quality}, skip_dup_img={skipped_dup_image}")
-                    try:
-                        # Parse IDs from path
-                        # patient_dir.name = "p10000032" -> subject_id = 10000032
-                        # qa_file.stem = "s50414267.qa" -> study_id = 50414267
-                        subject_id = int(patient_dir.name[1:])  # Remove 'p' prefix
-                        study_id_str = qa_file.stem.split('.')[0]  # "s50414267"
-                        study_id = int(study_id_str[1:])  # Remove 's' prefix
+                    flat_iter.append((subject_id_int, patient_dir, qa_file))
 
-                        # Check if in valid split
-                        if valid_studies and (subject_id, study_id) not in valid_studies:
-                            skipped_split += 1
+        if self.one_question_per_image:
+            import random as _random
+            rng = _random.Random(scan_seed)
+            rng.shuffle(flat_iter)
+            logger.info(
+                f"one_question_per_image: shuffled {len(flat_iter):,} qa-files "
+                f"with seed={scan_seed} for uniform-across-cohort sampling"
+            )
+
+        for subject_id_int, patient_dir, qa_file in flat_iter:
+            files_scanned += 1
+            if files_scanned % 5000 == 0:
+                logger.info(f"  [{files_scanned}] samples={len(samples)}, skip_split={skipped_split}, skip_img={skipped_image}, skip_qual={skipped_quality}, skip_dup_img={skipped_dup_image}")
+            try:
+                # Parse IDs from path
+                # patient_dir.name = "p10000032" -> subject_id = 10000032
+                # qa_file.stem = "s50414267.qa" -> study_id = 50414267
+                subject_id = subject_id_int
+                study_id_str = qa_file.stem.split('.')[0]  # "s50414267"
+                study_id = int(study_id_str[1:])  # Remove 's' prefix
+
+                # Check if in valid split
+                if valid_studies and (subject_id, study_id) not in valid_studies:
+                    skipped_split += 1
+                    continue
+
+                # In one_question_per_image mode: skip studies we've already
+                # added (each kept study contributes one sample = one image +
+                # one unique scene graph). Checked BEFORE loading the JSON so
+                # we don't pay parse cost for studies we'll skip.
+                if seen_image_paths is not None and (subject_id, study_id) in seen_image_paths:
+                    skipped_dup_image += 1
+                    continue
+
+                # Load QA data
+                with open(qa_file) as f:
+                    qa_data = json.load(f)
+
+                # Find corresponding image (best frontal view, PA > AP).
+                image_path, dicom_id = self._find_image(subject_id, study_id)
+                if image_path is None:
+                    skipped_image += 1
+                    continue
+
+                # Find scene graph
+                sg_path = self._find_scene_graph(subject_id, study_id)
+
+                # Process each question
+                questions = qa_data.get('questions', [])
+
+                # Log first question structure once for debugging
+                if files_scanned == 1 and len(questions) > 0:
+                    first_q_keys = list(questions[0].keys())
+                    logger.info(f"  Sample question keys: {first_q_keys[:10]}")
+
+                for q in questions:
+                    # Quality filter (skip if quality_grade is empty/None/"all").
+                    # QBA stores quality at TWO independent keys:
+                    #   - extraction_quality: how reliably the question was
+                    #     extracted from the report (used for pretrain/finetune split)
+                    #   - question_img_localization_quality: bbox grounding quality
+                    #     (only meaningful for grounding-relevant questions)
+                    # Take the MIN of the two so 'A' = both are A or better.
+                    # Legacy 'question_quality' / 'quality' keys are kept as fallback
+                    # for older QBA dumps.
+                    if self.quality_grade and self.quality_grade.lower() not in ('', 'all', 'none'):
+                        ex_q = q.get('extraction_quality')
+                        loc_q = q.get('question_img_localization_quality')
+                        legacy = q.get('question_quality', q.get('quality'))
+                        def _to_grade(v):
+                            if isinstance(v, dict):
+                                return v.get('overall', v.get('grade', 'B'))
+                            if isinstance(v, str):
+                                return v
+                            return None
+                        grades = [g for g in (
+                            _to_grade(ex_q), _to_grade(loc_q), _to_grade(legacy)
+                        ) if g]
+                        if not grades:
+                            quality_rating = 'B'  # no quality info → assume B
+                        else:
+                            grade_order = {'A++': 5, 'A+': 4, 'A': 3, 'B': 2, 'C': 1, 'U': 0}
+                            quality_rating = min(grades, key=lambda g: grade_order.get(g, 0))
+
+                        if not self._meets_quality_grade(quality_rating, self.quality_grade):
+                            skipped_quality += 1
                             continue
 
-                        # Load QA data
-                        with open(qa_file) as f:
-                            qa_data = json.load(f)
-
-                        # In one_question_per_image mode: skip studies we've
-                        # already added (each kept study contributes one sample
-                        # = one image + one unique scene graph).
-                        if seen_image_paths is not None and (subject_id, study_id) in seen_image_paths:
-                            skipped_dup_image += 1
-                            continue
-
-                        # Find corresponding image (best frontal view, PA > AP).
-                        image_path, dicom_id = self._find_image(subject_id, study_id)
-                        if image_path is None:
-                            skipped_image += 1
-                            continue
-                        
-                        # Find scene graph
-                        sg_path = self._find_scene_graph(subject_id, study_id)
-                        
-                        # Process each question
-                        questions = qa_data.get('questions', [])
-                        
-                        # Log first question structure once for debugging
-                        if files_scanned == 1 and len(questions) > 0:
-                            first_q_keys = list(questions[0].keys())
-                            logger.info(f"  Sample question keys: {first_q_keys[:10]}")
-                        
-                        for q in questions:
-                            # Quality filter (skip if quality_grade is empty/None/"all").
-                            # QBA stores quality at TWO independent keys:
-                            #   - extraction_quality: how reliably the question was
-                            #     extracted from the report (used for pretrain/finetune split)
-                            #   - question_img_localization_quality: bbox grounding quality
-                            #     (only meaningful for grounding-relevant questions)
-                            # Take the MIN of the two so 'A' = both are A or better.
-                            # Legacy 'question_quality' / 'quality' keys are kept as fallback
-                            # for older QBA dumps.
-                            if self.quality_grade and self.quality_grade.lower() not in ('', 'all', 'none'):
-                                ex_q = q.get('extraction_quality')
-                                loc_q = q.get('question_img_localization_quality')
-                                legacy = q.get('question_quality', q.get('quality'))
-                                # Coerce each to a string grade
-                                def _to_grade(v):
-                                    if isinstance(v, dict):
-                                        return v.get('overall', v.get('grade', 'B'))
-                                    if isinstance(v, str):
-                                        return v
-                                    return None
-                                grades = [g for g in (
-                                    _to_grade(ex_q), _to_grade(loc_q), _to_grade(legacy)
-                                ) if g]
-                                if not grades:
-                                    quality_rating = 'B'  # no quality info → assume B
-                                else:
-                                    # Worst grade across signals (most conservative)
-                                    grade_order = {'A++': 5, 'A+': 4, 'A': 3, 'B': 2, 'C': 1, 'U': 0}
-                                    quality_rating = min(grades, key=lambda g: grade_order.get(g, 0))
-
-                                if not self._meets_quality_grade(quality_rating, self.quality_grade):
-                                    skipped_quality += 1
-                                    continue
-                            
-                            # Question type filter
-                            q_type = q.get('question_type', 'unknown')
-                            if self.question_types and q_type not in self.question_types:
-                                continue
-                            
-                            samples.append({
-                                'subject_id': subject_id,
-                                'study_id': study_id,
-                                'dicom_id': dicom_id,
-                                'image_path': str(image_path),
-                                'scene_graph_path': str(sg_path) if sg_path else None,
-                                'question_id': q.get('question_id', ''),
-                                'question_type': q_type,
-                                'question_strategy': q.get('question_strategy', ''),
-                                'question': q.get('question', ''),
-                                'answers': q.get('answers', []),
-                                'obs_ids': q.get('obs_ids', []),
-                            })
-
-                            if self.max_samples and len(samples) >= self.max_samples:
-                                return samples
-
-                            # one_question_per_image: mark this study as taken
-                            # (= 1 unique image + 1 unique SG) and skip remaining
-                            # questions for it (they would reuse the same image+SG).
-                            if seen_image_paths is not None:
-                                seen_image_paths.add((subject_id, study_id))
-                                break
-                                
-                    except Exception as e:
-                        logger.debug(f"Error loading {qa_file}: {e}")
+                    # Question type filter
+                    q_type = q.get('question_type', 'unknown')
+                    if self.question_types and q_type not in self.question_types:
                         continue
+
+                    samples.append({
+                        'subject_id': subject_id,
+                        'study_id': study_id,
+                        'dicom_id': dicom_id,
+                        'image_path': str(image_path),
+                        'scene_graph_path': str(sg_path) if sg_path else None,
+                        'question_id': q.get('question_id', ''),
+                        'question_type': q_type,
+                        'question_strategy': q.get('question_strategy', ''),
+                        'question': q.get('question', ''),
+                        'answers': q.get('answers', []),
+                        'obs_ids': q.get('obs_ids', []),
+                    })
+
+                    if self.max_samples and len(samples) >= self.max_samples:
+                        return samples
+
+                    # one_question_per_image: mark this study as taken
+                    # (= 1 unique image + 1 unique SG) and skip remaining
+                    # questions for it (they would reuse the same image+SG).
+                    if seen_image_paths is not None:
+                        seen_image_paths.add((subject_id, study_id))
+                        break
+
+            except Exception as e:
+                logger.debug(f"Error loading {qa_file}: {e}")
+                continue
         
         logger.info(f"Scan complete: {files_scanned} files, {len(samples)} samples")
         logger.info(f"  Skipped: split={skipped_split}, image={skipped_image}, quality={skipped_quality}")
