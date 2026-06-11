@@ -1673,6 +1673,13 @@ class SSGVQANetV2(nn.Module):
                 return_dict=True,
             )
             lm_loss = outputs.loss
+            # === REPORT LOSS: LM CE restricted to <think>...</think> tokens ===
+            # When use_reports is on (dataset side), the <think> block contains
+            # the radiologist's FINDINGS+IMPRESSION text and is the main "report
+            # generation" supervision target. Expose a separately-monitored
+            # report_loss so the training loop can log it independently from
+            # the full lm_loss (which also covers <box> and <answer>).
+            report_loss = self._compute_report_loss(outputs.logits, labels)
             last_hidden = outputs.hidden_states[-1]  # (B, L, D)
             last_hidden_mask = proc_inputs.get("attention_mask")  # matches prompt length
             generated_ids = proc_inputs["input_ids"]
@@ -1763,6 +1770,7 @@ class SSGVQANetV2(nn.Module):
             # would broadcast-mismatch against last_hidden.
             last_hidden_mask = attn_mask
             lm_loss = None
+            report_loss = None
 
         # ---- 6. Pool hidden states for aux heads & grounding -----------------
         # Each branch above set `last_hidden_mask` to the mask that matches
@@ -1849,6 +1857,7 @@ class SSGVQANetV2(nn.Module):
             "generated_answer_text": generated_text,
             "template_answer": template_answers,
             "lm_loss": lm_loss,  # Qwen-computed; preferred over manual CE
+            "report_loss": report_loss,  # LM CE restricted to <think> tokens (radiologist report)
             # Explainability (from grounding cross-attention)
             "attention_weights": {
                 "grounding_to_sg": grounding_out["spatial_attention"],
@@ -1927,6 +1936,81 @@ class SSGVQANetV2(nn.Module):
                     masked[b, -keep_n:] = labels[b, -keep_n:]
 
         return masked
+
+    def _compute_report_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """LM cross-entropy restricted to tokens INSIDE <think>...</think>.
+
+        The <think> block carries the radiologist FINDINGS+IMPRESSION when
+        use_reports is on in the dataset. Returning a dedicated `report_loss`
+        lets the trainer log report-generation quality separately from the
+        full lm_loss (which also weighs <box> and <answer>).
+
+        Returns None (not a tensor) if no <think> spans are present in this
+        batch — the trainer skips logging when None to avoid noisy zeros.
+        """
+        if logits is None or labels is None:
+            return None
+
+        # Lazily cache the tag token IDs (multi-token tag is handled by
+        # storing the FULL id sequence and matching as a subsequence).
+        if not hasattr(self, "_think_open_ids"):
+            tok = self.processor.tokenizer
+            self._think_open_ids = tok.encode("<think>", add_special_tokens=False)
+            self._think_close_ids = tok.encode("</think>", add_special_tokens=False)
+
+        open_ids = self._think_open_ids
+        close_ids = self._think_close_ids
+        if not open_ids or not close_ids:
+            return None
+
+        # Shift for causal LM: predict labels[t+1] from logits[t]
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+
+        # Build a (B, L-1) mask of positions inside any <think>...</think>
+        # span. We work in python over the cpu copy of label IDs — per-batch
+        # cost is ~B * L token comparisons, negligible vs the LM forward.
+        B, Lm1 = shift_labels.shape
+        device = shift_logits.device
+        ids_cpu = shift_labels.detach().cpu().tolist()
+        mask = torch.zeros((B, Lm1), dtype=torch.bool)
+
+        ol, cl = len(open_ids), len(close_ids)
+        for b in range(B):
+            row = ids_cpu[b]
+            i = 0
+            while i <= len(row) - ol:
+                if row[i : i + ol] == open_ids:
+                    # Find matching </think> after this opening tag
+                    j = i + ol
+                    while j <= len(row) - cl and row[j : j + cl] != close_ids:
+                        j += 1
+                    end_inner = j  # first index of </think>, or past-end
+                    # Mark INNER positions (after <think>, before </think>),
+                    # skipping any -100 (prompt-mask) positions.
+                    for k in range(i + ol, min(end_inner, Lm1)):
+                        if row[k] != -100:
+                            mask[b, k] = True
+                    i = max(end_inner + cl, i + 1)
+                else:
+                    i += 1
+
+        if not mask.any():
+            return None
+
+        mask = mask.to(device)
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+        per_token = loss_fct(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+        ).view(B, Lm1)
+
+        denom = mask.float().sum().clamp(min=1.0)
+        return (per_token * mask.float()).sum() / denom
 
     # ----------------------------------------------------------------------
     # Persistence

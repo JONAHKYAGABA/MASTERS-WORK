@@ -526,6 +526,7 @@ class MIMICCXRVQADataset(Dataset):
         prebuilt_cache_path: Optional[str] = None,  # Optional: load samples from external prebuilt cache (.pkl)
         sg_cache_root: Optional[str] = None,  # Stage-3+ pre-generated SG cache (precompute_sg_cache.py)
         one_question_per_image: bool = False,  # Dedupe to one sample per image (max image diversity per max_samples)
+        use_reports: bool = False,  # Inject radiologist INDICATION as input + FINDINGS/IMPRESSION as <think> target
     ):
         self.mimic_cxr_path = Path(mimic_cxr_path)
         self.mimic_qa_path = Path(mimic_qa_path)
@@ -540,7 +541,13 @@ class MIMICCXRVQADataset(Dataset):
         self.force_rebuild_cache = force_rebuild_cache
         self.prebuilt_cache_path = prebuilt_cache_path
         self.one_question_per_image = bool(one_question_per_image)
-        
+        self.use_reports = bool(use_reports)
+        # When use_reports is on, we prepend clinical-context ("Clinical context: ...")
+        # to the question text before tokenization. Indication is short (~30-80 tokens)
+        # so bump max_question_length so the question itself doesn't get truncated.
+        if self.use_reports and max_question_length < 256:
+            max_question_length = 256
+
         # Setup cache directory
         self.cache_dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -664,6 +671,81 @@ class MIMICCXRVQADataset(Dataset):
             logger.debug(f"SG cache load failed for s={study_id}: {e}")
             self._sg_cache_misses += 1
             return None
+
+    @staticmethod
+    def _extract_report_sections(scene_graph: Dict[str, Any]) -> Dict[str, str]:
+        """Pull original radiologist text out of an already-loaded scene_graph JSON.
+
+        QBA's `s*.scene_graph.json` embeds the full report text in two places:
+          1) `sentences`: a dict of per-sentence entries with `section_type` field
+             (FINDINGS, IMPRESSION, INDICATION, HISTORY, EXAM_TECHNIQUE, IGNORE)
+          2) `indication`: a structured block with `indication_summary`,
+             `indication`, `evaluation`, `patient_info`
+
+        Returns:
+            {
+              'indication_text': clinical context (model INPUT — what radiologist
+                                 knows BEFORE looking at the image),
+              'findings_impression': real radiologist FINDINGS + IMPRESSION
+                                     (model OUTPUT target — what to generate),
+            }
+        Both strings may be '' if the source report didn't have those sections.
+        """
+        out = {'indication_text': '', 'findings_impression': ''}
+        if not isinstance(scene_graph, dict):
+            return out
+
+        # Bucket sentences by section_type
+        by_section: Dict[str, List[str]] = {}
+        for s in (scene_graph.get('sentences') or {}).values():
+            if not isinstance(s, dict):
+                continue
+            sect = (s.get('section_type') or s.get('section') or '').upper()
+            text = (s.get('sentence') or '').strip()
+            if text:
+                by_section.setdefault(sect, []).append(text)
+
+        # === INPUT context: prefer structured indication_summary, fall back to raw sentences ===
+        bits: List[str] = []
+        ind_obj = scene_graph.get('indication')
+        if isinstance(ind_obj, dict):
+            summary = (ind_obj.get('indication_summary') or '').strip()
+            if summary:
+                bits.append(summary)
+            else:
+                patient = (ind_obj.get('patient_info') or '').strip()
+                indtxt = (ind_obj.get('indication') or '').strip()
+                evltxt = (ind_obj.get('evaluation') or '').strip()
+                if patient:
+                    bits.append(patient)
+                if indtxt:
+                    bits.append(f"Indication: {indtxt}")
+                if evltxt:
+                    bits.append(f"Evaluation: {evltxt}")
+        if not bits:
+            bits.extend(by_section.get('INDICATION', []))
+        # HISTORY and COMPARISON are also valid INPUT context — they're info
+        # the radiologist had BEFORE looking at the image (prior studies, clinical
+        # history). EXAM_TECHNIQUE is included if non-trivial.
+        bits.extend(by_section.get('HISTORY', []))
+        bits.extend(by_section.get('COMPARISON', []))
+        # EXAM_TECHNIQUE is usually just "FINAL REPORT" boilerplate; include only
+        # if it has substantive content (>30 chars after stripping the header).
+        for et in by_section.get('EXAM_TECHNIQUE', []):
+            if len(et) > 30 and 'final report' not in et.lower():
+                bits.append(et)
+        out['indication_text'] = ' '.join(bits).strip()
+
+        # === OUTPUT target: FINDINGS + IMPRESSION (what the radiologist wrote) ===
+        fi_parts: List[str] = []
+        findings = ' '.join(by_section.get('FINDINGS', [])).strip()
+        impression = ' '.join(by_section.get('IMPRESSION', [])).strip()
+        if findings:
+            fi_parts.append(f"FINDINGS: {findings}")
+        if impression:
+            fi_parts.append(f"IMPRESSION: {impression}")
+        out['findings_impression'] = '\n'.join(fi_parts).strip()
+        return out
 
     def get_sg_cache_stats(self) -> Dict[str, int]:
         """Snapshot of this dataset's hit/miss counters. Workers each maintain
@@ -1776,10 +1858,28 @@ class MIMICCXRVQADataset(Dataset):
         
         # Get tokenizer
         tokenizer = self._get_tokenizer()
-        
-        # Tokenize question
+
+        # === REPORT INJECTION (input side) ===
+        # When use_reports is on, pull INDICATION + HISTORY from the scene_graph
+        # JSON and prepend as clinical context to the question. This mirrors what
+        # a radiologist receives before reading the X-ray. No leakage because
+        # FINDINGS/IMPRESSION (what the report SAYS about the image) are kept
+        # separate and only used as an OUTPUT target — see structured_answer_text
+        # construction below.
+        report_sections = {'indication_text': '', 'findings_impression': ''}
+        if self.use_reports:
+            report_sections = self._extract_report_sections(scene_graph)
+        if report_sections['indication_text']:
+            question_text_for_model = (
+                f"Clinical context: {report_sections['indication_text']}\n\n"
+                f"Question: {sample['question']}"
+            )
+        else:
+            question_text_for_model = sample['question']
+
+        # Tokenize question (with optional clinical context prepended)
         question_inputs = tokenizer(
-            sample['question'],
+            question_text_for_model,
             padding='max_length',
             truncation=True,
             max_length=self.max_question_length,
@@ -1898,14 +1998,23 @@ class MIMICCXRVQADataset(Dataset):
         else:
             _bx = [0.0, 0.0, 1.0, 1.0]  # whole-image fallback
         _box_str = f"{_bx[0]:.3f},{_bx[1]:.3f},{_bx[2]:.3f},{_bx[3]:.3f}"
-        _cot_bits: List[str] = []
-        if answer_regions:
-            _cot_bits.append(f"Region(s) of interest: {', '.join(map(str, answer_regions))}.")
-        if answer_entities:
-            _cot_bits.append(f"Observed: {', '.join(map(str, answer_entities))}.")
-        if answer_positiveness:
-            _cot_bits.append(f"Positiveness: {answer_positiveness}.")
-        _cot = " ".join(_cot_bits) if _cot_bits else "Reviewing the chest radiograph."
+        # === REPORT INJECTION (output side) ===
+        # When use_reports is on and FINDINGS/IMPRESSION are present in the SG
+        # JSON, use the radiologist's ACTUAL writing as the <think> CoT target.
+        # The model learns to generate report-style reasoning from the image
+        # alone (it doesn't SEE these strings at inference). Falls back to the
+        # rule-generated CoT when the report sections are missing (~5% of studies).
+        if self.use_reports and report_sections['findings_impression']:
+            _cot = report_sections['findings_impression']
+        else:
+            _cot_bits: List[str] = []
+            if answer_regions:
+                _cot_bits.append(f"Region(s) of interest: {', '.join(map(str, answer_regions))}.")
+            if answer_entities:
+                _cot_bits.append(f"Observed: {', '.join(map(str, answer_entities))}.")
+            if answer_positiveness:
+                _cot_bits.append(f"Positiveness: {answer_positiveness}.")
+            _cot = " ".join(_cot_bits) if _cot_bits else "Reviewing the chest radiograph."
         structured_answer_text = (
             f"<think>{_cot}</think>"
             f"<box>{_box_str}</box>"
@@ -1922,8 +2031,15 @@ class MIMICCXRVQADataset(Dataset):
 
             # === V2 INPUTS (raw text + raw PIL image for Qwen processor) ===
             'pil_image': image,                 # PIL.Image.Image (pre-transform RGB)
-            'question_text': sample['question'],  # raw question string
+            'question_text': question_text_for_model,  # question, with clinical context prepended when use_reports=True
             'structured_answer_text': structured_answer_text,  # <think><box><answer> format
+
+            # === REPORT TARGET (for dedicated report_loss in loss.py) ===
+            # Raw FINDINGS+IMPRESSION text without any tag wrapping. The loss
+            # module can tokenize this and compute a separately-monitored CE
+            # against the model's <think>-portion output. Empty string when
+            # use_reports=False or the source study had no report sections.
+            'report_target_text': report_sections['findings_impression'],
             
             # === ROUTING ===
             'question_types': sample['question_type'],

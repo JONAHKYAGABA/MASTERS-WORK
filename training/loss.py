@@ -256,6 +256,14 @@ class MultiTaskLoss(nn.Module):
         if precomputed_lm_loss is not None and torch.is_tensor(precomputed_lm_loss):
             generation_loss = precomputed_lm_loss
             loss_dict['generation_loss'] = generation_loss
+            # Surface the report-only loss (LM CE restricted to <think>...</think>
+            # tokens — see SSGVQANetV2._compute_report_loss). This is a MONITORED
+            # metric only: it is NOT added to total_loss because the underlying
+            # tokens are already supervised by generation_loss above. Showing it
+            # separately lets the trainer/wandb plot report-generation quality.
+            precomputed_report_loss = outputs.get('report_loss') if isinstance(outputs, dict) else None
+            if precomputed_report_loss is not None and torch.is_tensor(precomputed_report_loss):
+                loss_dict['report_loss'] = precomputed_report_loss
         elif generation_logits is not None and answer_ids is not None:
             # Shift logits and labels for causal LM
             # logits: (B, T, V), answer_ids: (B, T)

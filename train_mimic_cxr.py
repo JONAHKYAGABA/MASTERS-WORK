@@ -1688,6 +1688,7 @@ def main(args):
         use_cache=True,
         prebuilt_cache_path=args.prebuilt_cache_train,
         one_question_per_image=args.one_question_per_image,
+        use_reports=args.use_reports,
     )
     
     # Barrier to ensure all processes have loaded/cached train data
@@ -1709,6 +1710,7 @@ def main(args):
         use_cache=True,
         prebuilt_cache_path=args.prebuilt_cache_val,
         one_question_per_image=args.one_question_per_image,
+        use_reports=args.use_reports,
     )
     
     # Barrier to ensure all processes have loaded/cached val data
@@ -2558,6 +2560,14 @@ if __name__ == "__main__":
                             'the same image+SG. Use for SG-generator training where image/SG diversity '
                             'matters more than question text. Requires a fresh cache rebuild (cache key '
                             'changes with the flag).')
+    parser.add_argument('--use_reports', action='store_true',
+                       help='Inject the radiologist report into training: INDICATION+HISTORY is '
+                            'prepended to the question as clinical context (model INPUT), and '
+                            'FINDINGS+IMPRESSION replaces the rule-generated <think> CoT (model '
+                            'OUTPUT target). The report text is sourced from the scene_graph.json '
+                            'files (no external download required). Bumps max_question_length to '
+                            '256 to fit the context. Does NOT invalidate the sample cache (report '
+                            'is loaded per-item from SG JSON inside __getitem__).')
     
     # Distributed training (per methodology Section 11)
     parser.add_argument('--use_deepspeed', action='store_true',
