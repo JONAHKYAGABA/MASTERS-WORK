@@ -757,6 +757,13 @@ class AuxiliaryHeads(nn.Module):
             pdtype = pooled.dtype
         if pooled.dtype != pdtype:
             pooled = pooled.to(dtype=pdtype)
+        # Defensive: scrub NaN/Inf at the boundary BEFORE the MLPs propagate
+        # them into all four head outputs. Without this, a single NaN element
+        # in Qwen's pooled hidden state (rare but observed on Turing fp16)
+        # contaminates the softmax over all classes, silently producing bad
+        # gradients that slowly destabilize the optimizer over ~1000 steps.
+        if not torch.isfinite(pooled).all():
+            pooled = torch.nan_to_num(pooled, nan=0.0, posinf=1e4, neginf=-1e4)
         chexpert_logits = self.chexpert(pooled)
         vqa_logits = {
             "binary": self.binary(pooled),

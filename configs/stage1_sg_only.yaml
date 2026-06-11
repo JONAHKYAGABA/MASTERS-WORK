@@ -1,0 +1,132 @@
+# MIMIC-CXR VQA Stage 1 — SG-only training
+# ============================================
+# This is the FIRST stage of the 4-stage curriculum.
+# Goal: train the scene-graph generator to reliably localize 237 entities
+# across 310 anatomical regions from raw images, with minimal interference
+# from the VQA/answer-generation heads.
+#
+# Loss recipe: sg=1.0 PRIMARY, others heavily downweighted so that the
+# total gradient is dominated by the SG signal. Without this, sg_loss
+# plateaus at ~9.7 (random anatomy detection) because VQA/gen losses
+# converge fast on easy correlations and starve the SG path.
+#
+# Usage:
+#   torchrun --nproc_per_node=2 train_mimic_cxr.py \
+#     --config configs/stage1_sg_only.yaml \
+#     ...
+
+model:
+  visual_backbone: "convnext_base"
+  text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
+  visual_feature_dim: 512
+  scene_graph_dim: 134
+  visual_embedding_dim: 646
+  hidden_size: 768
+  intermediate_size: 3072
+  num_hidden_layers: 6
+  num_attention_heads: 12
+  hidden_dropout_prob: 0.1
+  attention_probs_dropout_prob: 0.1
+  sim_layers: 2
+
+  num_regions: 310
+  num_entities: 237
+  region_embedding_dim: 64
+  entity_embedding_dim: 64
+
+  num_binary_classes: 2
+  num_category_classes: 14
+  num_region_classes: 26
+  num_severity_classes: 4
+
+  max_question_length: 128
+  vocab_size: 30522
+
+data:
+  mimic_cxr_jpg_path: "/root/code/MASTERS-WORK/data/mimic-cxr-jpg"
+  mimic_ext_cxr_qba_path: "/root/code/MASTERS-WORK/data/mimic-ext-cxr-qba"
+  chexpert_labels_path: ""
+
+  # Stage 1 uses B-grade pool (per user's curriculum: grade B for pretraining)
+  quality_grade: "B"
+  view_filter: "frontal_only"
+  question_types: null
+
+  use_exports: true
+  export_grade: "B_frontal"
+
+  cache_dir: ".cache/dataset_samples"
+
+  image_size: 224
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]
+
+training:
+  output_dir: "./checkpoints/mimic-cxr-vqa-stage1-sg-only"
+
+  # CRITICAL: this is what selects the sg_only loss recipe inside the model.
+  # See train_mimic_cxr.py:2074 — getattr(config.training, 'phase', 'standard').
+  phase: "sg_only"
+
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 4
+
+  num_epochs: 3
+
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+
+  fp16: true
+  gradient_checkpointing: false  # mHC reentrant-checkpoint issue — keep off
+
+  # =====================================================
+  # STAGE 1 LOSS WEIGHTS — SG IS PRIMARY
+  # =====================================================
+  # sg=1.0 is the dominant signal. Other losses are kept at 0.05-0.1 so the
+  # heads don't completely die (which would make Stage 2 harder to warm up),
+  # but they cannot drown out the SG gradient.
+  vqa_loss_weight: 0.05
+  generation_loss_weight: 0.05
+  chexpert_loss_weight: 0.05
+  scene_graph_loss_weight: 1.0      # PRIMARY
+  grounding_loss_weight: 0.05
+
+  # Per-head VQA weights — kept low across the board for Stage 1
+  binary_head_weight: 0.1
+  category_head_weight: 0.05
+  region_head_weight: 0.05
+  severity_head_weight: 0.05
+
+  logging_steps: 100
+  save_steps: 5000
+  save_total_limit: 3
+  eval_steps: 2000
+
+  dataloader_num_workers: 2
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+  hub_model_id: "KYAGABA/mimic-cxr-vqa-stage1-sg-only"
+  hub_private_repo: true
+  push_to_hub_strategy: "checkpoint"
+
+  seed: 42
+
+wandb:
+  enabled: true
+  project: "mimic-cxr-vqa"
+  entity: "kyagabajonah"
+  name: "stage1-sg-only"
+  group: "curriculum"
+  tags: ["ssg-vqa", "mimic-cxr", "stage1", "sg-only", "b-grade"]
+  notes: "Stage 1: SG generator training (sg=1.0 primary). 4-stage curriculum."
+  watch_model: false
+  watch_log_freq: 1000
+  log_model: true
+
+deepspeed:
+  enabled: false   # DDP only — DeepSpeed paths broken on this branch
+  config_path: "configs/deepspeed_config.json"
+  stage: 2
