@@ -1944,19 +1944,27 @@ class SSGVQANetV2(nn.Module):
     ) -> Optional[torch.Tensor]:
         """LM cross-entropy restricted to tokens INSIDE <think>...</think>.
 
-        The <think> block carries the radiologist FINDINGS+IMPRESSION when
-        use_reports is on in the dataset. Returning a dedicated `report_loss`
-        lets the trainer log report-generation quality separately from the
-        full lm_loss (which also weighs <box> and <answer>).
+        Memory-conscious implementation:
+          1) Find <think>...</think> spans on CPU (cheap, no GPU alloc).
+          2) Index-select ONLY those positions from logits before CE
+             (typically ~50-500 tokens instead of full ~3000-seq length).
+          3) Wrap in torch.no_grad() — report_loss is MONITORED ONLY,
+             not added to total_loss (see training/loss.py), so we can
+             skip storing activations entirely.
 
-        Returns None (not a tensor) if no <think> spans are present in this
-        batch — the trainer skips logging when None to avoid noisy zeros.
+        This avoids the OOM that the naive (B,L,V)-wide CE would cause on
+        Turing 48GB with QLoRA — Qwen3 vocab is ~150k tokens, so the full
+        per-token CE intermediate would be ~B*L*V floats (>1 GiB at B=4,
+        L=3k, V=150k).
+
+        Returns None when no <think> spans exist in this batch (the
+        trainer skips logging on None to avoid plotting noise).
         """
         if logits is None or labels is None:
             return None
 
-        # Lazily cache the tag token IDs (multi-token tag is handled by
-        # storing the FULL id sequence and matching as a subsequence).
+        # Lazily cache the tag token IDs (multi-token tag handled as a
+        # full subsequence match, not single-token-special).
         if not hasattr(self, "_think_open_ids"):
             tok = self.processor.tokenizer
             self._think_open_ids = tok.encode("<think>", add_special_tokens=False)
@@ -1967,50 +1975,51 @@ class SSGVQANetV2(nn.Module):
         if not open_ids or not close_ids:
             return None
 
-        # Shift for causal LM: predict labels[t+1] from logits[t]
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
+        with torch.no_grad():
+            # Shift for causal LM: predict labels[t+1] from logits[t]
+            shift_labels = labels[:, 1:]
+            B, Lm1 = shift_labels.shape
+            ids_cpu = shift_labels.detach().cpu().tolist()
 
-        # Build a (B, L-1) mask of positions inside any <think>...</think>
-        # span. We work in python over the cpu copy of label IDs — per-batch
-        # cost is ~B * L token comparisons, negligible vs the LM forward.
-        B, Lm1 = shift_labels.shape
-        device = shift_logits.device
-        ids_cpu = shift_labels.detach().cpu().tolist()
-        mask = torch.zeros((B, Lm1), dtype=torch.bool)
+            # Collect (batch_idx, time_idx) pairs that fall inside any
+            # <think>...</think> span and are not prompt-masked (-100).
+            batch_idx: List[int] = []
+            time_idx: List[int] = []
+            ol, cl = len(open_ids), len(close_ids)
+            for b in range(B):
+                row = ids_cpu[b]
+                i = 0
+                while i <= len(row) - ol:
+                    if row[i : i + ol] == open_ids:
+                        j = i + ol
+                        while j <= len(row) - cl and row[j : j + cl] != close_ids:
+                            j += 1
+                        end_inner = j
+                        for k in range(i + ol, min(end_inner, Lm1)):
+                            if row[k] != -100:
+                                batch_idx.append(b)
+                                time_idx.append(k)
+                        i = max(end_inner + cl, i + 1)
+                    else:
+                        i += 1
 
-        ol, cl = len(open_ids), len(close_ids)
-        for b in range(B):
-            row = ids_cpu[b]
-            i = 0
-            while i <= len(row) - ol:
-                if row[i : i + ol] == open_ids:
-                    # Find matching </think> after this opening tag
-                    j = i + ol
-                    while j <= len(row) - cl and row[j : j + cl] != close_ids:
-                        j += 1
-                    end_inner = j  # first index of </think>, or past-end
-                    # Mark INNER positions (after <think>, before </think>),
-                    # skipping any -100 (prompt-mask) positions.
-                    for k in range(i + ol, min(end_inner, Lm1)):
-                        if row[k] != -100:
-                            mask[b, k] = True
-                    i = max(end_inner + cl, i + 1)
-                else:
-                    i += 1
+            if not batch_idx:
+                return None
 
-        if not mask.any():
-            return None
+            device = logits.device
+            b_idx_t = torch.tensor(batch_idx, device=device, dtype=torch.long)
+            t_idx_t = torch.tensor(time_idx, device=device, dtype=torch.long)
 
-        mask = mask.to(device)
-        loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
-        per_token = loss_fct(
-            shift_logits.reshape(-1, shift_logits.size(-1)),
-            shift_labels.reshape(-1),
-        ).view(B, Lm1)
+            # Index-select ONLY the (N,) report positions from the
+            # logits (N, V) and labels (N,). N is typically 100-500,
+            # not the full ~3000-token sequence — keeps memory low.
+            # logits indexing: shift = logits[:, :-1, :], select pos t
+            # is equivalent to selecting from raw logits at position t.
+            selected_logits = logits[b_idx_t, t_idx_t, :].float()  # (N, V)
+            selected_labels = shift_labels[b_idx_t, t_idx_t].long()  # (N,)
 
-        denom = mask.float().sum().clamp(min=1.0)
-        return (per_token * mask.float()).sum() / denom
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+            return loss_fct(selected_logits, selected_labels).detach()
 
     # ----------------------------------------------------------------------
     # Persistence
