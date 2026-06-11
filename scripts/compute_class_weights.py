@@ -102,12 +102,22 @@ def freq_to_weights(
 
 
 def compute_entity_weights(entity_to_idx, args) -> List[float]:
-    """Read study_observations.csv and produce entity weights."""
+    """Read study_observations.csv and produce entity weights.
+
+    IMPORTANT — vocab/model mismatch handling:
+      - dataset_info.json defines 232 entity names
+      - SSGVQANetV2 default num_entities=237 (5 extra slots for padding /
+        unknown / special tokens reserved in the classifier head)
+      - PyTorch CE requires weight tensor size == logits class count
+    So we PAD to args.num_entities (default 237) with neutral weight 1.0
+    for the unused slots. Same idea for regions (vocab=311, model=310 —
+    we truncate to match the model in that direction).
+    """
     import pandas as pd
     df = pd.read_csv(STATS_DIR / "study_observations.csv")
     log.info(f"entities CSV: shape={df.shape}, columns={list(df.columns)}")
 
-    n_classes = max(entity_to_idx.values()) + 1
+    vocab_n_classes = max(entity_to_idx.values()) + 1
     counts: Dict[int, int] = {}
     not_in_vocab = 0
     for _, row in df.iterrows():
@@ -125,16 +135,17 @@ def compute_entity_weights(entity_to_idx, args) -> List[float]:
              f"max={max(counts.values()) if counts else 0} "
              f"mean={sum(counts.values())/max(1,len(counts)):.0f}")
 
-    return freq_to_weights(counts, n_classes, power=args.power,
-                            min_count=args.min_count,
-                            clip_min=args.clip_min, clip_max=args.clip_max)
+    weights = freq_to_weights(counts, vocab_n_classes, power=args.power,
+                              min_count=args.min_count,
+                              clip_min=args.clip_min, clip_max=args.clip_max)
+    return _pad_or_truncate(weights, args.num_entities, "entity")
 
 
 def compute_region_weights(region_to_idx, args) -> List[float]:
     import pandas as pd
     df = pd.read_csv(STATS_DIR / "study_regions.csv")
     log.info(f"regions CSV: shape={df.shape}, columns={list(df.columns)}")
-    n_classes = max(region_to_idx.values()) + 1
+    vocab_n_classes = max(region_to_idx.values()) + 1
     counts: Dict[int, int] = {}
     not_in_vocab = 0
     for _, row in df.iterrows():
@@ -147,9 +158,31 @@ def compute_region_weights(region_to_idx, args) -> List[float]:
         counts[rid] = counts.get(rid, 0) + c
     log.info(f"  matched {len(counts):,}/{len(df):,} region rows to vocab "
              f"({not_in_vocab} not in vocab — fine)")
-    return freq_to_weights(counts, n_classes, power=args.power,
-                            min_count=args.min_count,
-                            clip_min=args.clip_min, clip_max=args.clip_max)
+    weights = freq_to_weights(counts, vocab_n_classes, power=args.power,
+                              min_count=args.min_count,
+                              clip_min=args.clip_min, clip_max=args.clip_max)
+    return _pad_or_truncate(weights, args.num_regions, "region")
+
+
+def _pad_or_truncate(weights: List[float], target_n: int, name: str) -> List[float]:
+    """Pad with 1.0 (neutral) or truncate to match the model's expected class count.
+    PyTorch CE requires the weight tensor size to equal the logits' class dim
+    exactly — this avoids the "weight tensor should be defined either for all
+    N classes or no classes" RuntimeError."""
+    cur_n = len(weights)
+    if cur_n == target_n:
+        return weights
+    if cur_n < target_n:
+        # Pad with neutral weight (1.0) — unused classes get no special signal
+        pad = [1.0] * (target_n - cur_n)
+        log.info(f"  {name}: PADDING {cur_n} → {target_n} weights with 1.0 "
+                 f"(extra {target_n - cur_n} slots are model-reserved "
+                 "padding/special-token classes)")
+        return weights + pad
+    # Truncate — keep first target_n classes (model uses fewer than vocab defines)
+    log.info(f"  {name}: TRUNCATING {cur_n} → {target_n} weights "
+             f"(model classifier head uses fewer classes than vocab defines)")
+    return weights[:target_n]
 
 
 def compute_polarity_weights() -> List[float]:
@@ -181,6 +214,18 @@ def main():
     ap.add_argument("--positive_only", action="store_true",
                     help="Use only pos_mention (not total). Best if most loss "
                          "comes from positive-finding samples.")
+    # Must match the model's classifier head dimensions exactly (CE weight tensor
+    # size has to equal logits class count). SSGVQANetV2 defaults are
+    # num_entities=237, num_regions=310 — those are the right numbers for our
+    # current trainer. If you ever change SSGVQANetV2.__init__ defaults, bump
+    # these to match or you'll get the "weight tensor should be defined either
+    # for all N classes or no classes" runtime error.
+    ap.add_argument("--num_entities", type=int, default=237,
+                    help="Pad/truncate entity weights to this length (model's "
+                         "classifier dim — default 237 matches SSGVQANetV2).")
+    ap.add_argument("--num_regions",  type=int, default=310,
+                    help="Pad/truncate region weights to this length (model's "
+                         "classifier dim — default 310 matches SSGVQANetV2).")
     ap.add_argument("--output_dir", type=Path, default=OUT_DIR)
     args = ap.parse_args()
 
