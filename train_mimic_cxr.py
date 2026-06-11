@@ -1716,7 +1716,51 @@ def main(args):
     # Barrier to ensure all processes have loaded/cached val data
     if is_distributed:
         dist.barrier()
-    
+
+    # ------------------------------------------------------------------
+    # OPTIONAL: carve N samples off the end of train as an INTERNAL VAL.
+    #
+    # MIMIC-Ext-CXR-QBA's official val split has only 1,805 studies (vs
+    # 222K train) — comparable to other published baselines but too small
+    # for reliable per-epoch val_loss tracking on the noisy B-grade pool.
+    # When --val_from_train N is set, we slice the LAST N samples from the
+    # already-shuffled-and-deduped train cache and replace val_dataset's
+    # samples with them. Train sees the FIRST (len-N) samples.
+    #
+    # Determinism: seed-42 shuffle in the cache means the slice is stable
+    # across runs. No leakage because the slice is disjoint from train.
+    # Official val (1,805 studies) is preserved on-disk for FINAL test-set
+    # comparisons in your paper; we just don't use it during training.
+    # ------------------------------------------------------------------
+    if getattr(args, 'val_from_train', 0) and args.val_from_train > 0:
+        per_rank_n = args.val_from_train // max(1, int(os.environ.get('WORLD_SIZE', 1)))
+        if per_rank_n <= 0:
+            if is_main_process(local_rank):
+                logger.warning(
+                    f"--val_from_train={args.val_from_train} too small for "
+                    f"world_size={os.environ.get('WORLD_SIZE','1')}; ignoring"
+                )
+        elif per_rank_n >= len(train_dataset.samples):
+            if is_main_process(local_rank):
+                logger.warning(
+                    f"--val_from_train={args.val_from_train} >= train size "
+                    f"({len(train_dataset.samples) * max(1, int(os.environ.get('WORLD_SIZE','1')))}); ignoring"
+                )
+        else:
+            train_size_before = len(train_dataset.samples)
+            val_size_before = len(val_dataset.samples)
+            # Carve last per_rank_n samples off train; they become the new val.
+            val_dataset.samples = train_dataset.samples[-per_rank_n:]
+            train_dataset.samples = train_dataset.samples[:-per_rank_n]
+            if is_main_process(local_rank):
+                logger.info(
+                    f"--val_from_train={args.val_from_train}: carved last "
+                    f"{per_rank_n:,}/rank from train. "
+                    f"Train: {train_size_before:,} -> {len(train_dataset.samples):,} per rank. "
+                    f"Val: {val_size_before:,} -> {len(val_dataset.samples):,} per rank "
+                    f"(official PhysioNet val preserved on disk for final reporting)."
+                )
+
     # ------------------------------------------------------------------
     # Reclaim memory after dataset loading.  The pickle.load() creates
     # all 2M dicts, then we truncate to max_samples.  The freed dicts
@@ -2560,6 +2604,15 @@ if __name__ == "__main__":
                             'the same image+SG. Use for SG-generator training where image/SG diversity '
                             'matters more than question text. Requires a fresh cache rebuild (cache key '
                             'changes with the flag).')
+    parser.add_argument('--val_from_train', type=int, default=0,
+                       help='Carve this many TOTAL samples off the end of the (shuffled, deduped) '
+                            'train cache and use them as the validation set during training. '
+                            'Replaces the small official PhysioNet val (1,805 studies) which is too '
+                            'tiny for reliable per-epoch tracking. Recommended: 10000-20000. '
+                            'Determinism: the seed-42 shuffle in the train cache means the carve-out '
+                            'is reproducible across runs. The official val/test stay on disk for '
+                            'final paper-grade reporting; this flag only changes what the trainer '
+                            'uses for per-epoch val_loss/val_metrics during the run.')
     parser.add_argument('--use_reports', action='store_true',
                        help='Inject the radiologist report into training: INDICATION+HISTORY is '
                             'prepended to the question as clinical context (model INPUT), and '
