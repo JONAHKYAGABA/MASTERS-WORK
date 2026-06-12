@@ -1865,6 +1865,19 @@ def main(args):
                 "Forcing QLoRA (4-bit NF4) for memory safety."
             )
 
+    # freeze_sg_generator controls whether the ViT and SG generator forward
+    # under torch.no_grad(). Default is True (correct for Stages 2-4 which
+    # CONSUME frozen pre-computed SGs). In Stage 1 (sg_only) the whole
+    # POINT is to train the SG generator — leaving freeze=True means
+    # sg_loss gradients flow into a no_grad() block and the generator
+    # never updates (sg_loss plateaus at random-init entropy ~9.5).
+    _freeze_sg = (_phase != 'sg_only')
+    if is_main_process(local_rank):
+        logger.info(
+            f"SG generator: {'FROZEN' if _freeze_sg else 'TRAINABLE'} "
+            f"(phase={_phase})"
+        )
+
     model = SSGVQANetV2(
         qwen_model_id=_qwen_id,
         use_quantization=_use_quant or _force_qlora,
@@ -1878,6 +1891,7 @@ def main(args):
         num_severity=config.model.num_severity_classes,
         training_mode=_phase if _phase in {'sg_only', 'alignment', 'pretrain', 'finetune', 'rl'} else 'pretrain',
         torch_dtype=_qwen_dtype,
+        freeze_sg_generator=_freeze_sg,
     )
 
     # Dtype consistency: Qwen runs in fp16 (or bf16 on Ampere+) but the v2
