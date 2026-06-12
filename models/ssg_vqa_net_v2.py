@@ -2639,22 +2639,27 @@ class SceneGraphGenerator(nn.Module):
         # no GPU→CPU syncs.
         from torchvision.ops import roi_align as _roi_align
         N = self.max_objects
-        # boxes are normalised to [0,1] — scale to feature-map pixel coords
-        boxes_pixel = boxes.clone()
-        boxes_pixel[..., 0] = boxes_pixel[..., 0] * float(W)
-        boxes_pixel[..., 1] = boxes_pixel[..., 1] * float(H)
-        boxes_pixel[..., 2] = boxes_pixel[..., 2] * float(W)
-        boxes_pixel[..., 3] = boxes_pixel[..., 3] * float(H)
-        # Defensively ensure x2>x1 and y2>y1 (at least 1px) so roi_align
-        # doesn't crash on degenerate boxes
-        eps = 1.0  # 1 feature-map pixel
-        boxes_pixel[..., 2] = torch.maximum(boxes_pixel[..., 2], boxes_pixel[..., 0] + eps)
-        boxes_pixel[..., 3] = torch.maximum(boxes_pixel[..., 3], boxes_pixel[..., 1] + eps)
-        # roi_align expects (K, 5) = [batch_idx, x1, y1, x2, y2]
-        batch_idx = torch.arange(B, device=device, dtype=param_dtype).unsqueeze(1).expand(-1, N).reshape(-1, 1)
-        boxes_flat_5 = boxes_pixel.reshape(B * N, 4)
-        rois = torch.cat([batch_idx, boxes_flat_5], dim=1)  # (B*N, 5)
-        # roi_align prefers fp32 for the input feature map; cast then back
+        # Build pixel-coord boxes FUNCTIONALLY — no inplace ops, otherwise
+        # autograd version-counter bumps on the gradient-tracked `boxes`
+        # tensor cause "modified by an inplace operation" RuntimeError on
+        # backward.
+        boxes_x1 = boxes[..., 0:1] * float(W)
+        boxes_y1 = boxes[..., 1:2] * float(H)
+        boxes_x2 = boxes[..., 2:3] * float(W)
+        boxes_y2 = boxes[..., 3:4] * float(H)
+        # Ensure x2 > x1 and y2 > y1 by at least 1 pixel (degenerate-box
+        # guard for roi_align). functional ops — no inplace.
+        boxes_x2 = torch.maximum(boxes_x2, boxes_x1 + 1.0)
+        boxes_y2 = torch.maximum(boxes_y2, boxes_y1 + 1.0)
+        boxes_pixel = torch.cat([boxes_x1, boxes_y1, boxes_x2, boxes_y2], dim=-1)  # (B, N, 4)
+
+        # roi_align expects rois as (K, 5) = [batch_idx, x1, y1, x2, y2]
+        batch_idx = torch.arange(B, device=device, dtype=boxes_pixel.dtype).view(B, 1, 1).expand(B, N, 1)
+        rois_5 = torch.cat([batch_idx, boxes_pixel], dim=-1)  # (B, N, 5)
+        rois = rois_5.reshape(B * N, 5)
+        # roi_align prefers fp32 for the input feature map; cast then back.
+        # NOTE: gradients still flow through the box coords (they are NOT
+        # detached by the .float() cast on the feature map).
         pooled = _roi_align(
             visual_features.float(),
             rois.float(),
