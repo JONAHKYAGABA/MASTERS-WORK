@@ -332,6 +332,96 @@ class MultiTaskLoss(nn.Module):
         
         return total_loss, loss_dict
     
+    # -------------- DETR-style helpers (cost matrix + focal BCE) --------------
+
+    @staticmethod
+    def _pairwise_l1_cost(pred_np, gt_np):
+        """(N, M) L1 distance between (x1,y1,x2,y2) predictions and GTs."""
+        import numpy as np
+        if pred_np.shape[0] == 0 or gt_np.shape[0] == 0:
+            return np.zeros((pred_np.shape[0], gt_np.shape[0]), dtype=np.float32)
+        diff = np.abs(pred_np[:, None, :] - gt_np[None, :, :]).sum(axis=-1)  # (N, M)
+        return diff.astype(np.float32)
+
+    @staticmethod
+    def _pairwise_giou_cost(pred_np, gt_np):
+        """(N, M) GIoU loss (= 1 - GIoU). Penalises bad localisation more
+        smoothly than IoU when boxes don't overlap (covers the cold-start
+        case where IoU is 0 everywhere but L1 still has a gradient)."""
+        import numpy as np
+        if pred_np.shape[0] == 0 or gt_np.shape[0] == 0:
+            return np.zeros((pred_np.shape[0], gt_np.shape[0]), dtype=np.float32)
+        a = pred_np[:, None, :].astype(np.float32)
+        b = gt_np[None, :, :].astype(np.float32)
+        # Intersection box
+        ix1 = np.maximum(a[..., 0], b[..., 0])
+        iy1 = np.maximum(a[..., 1], b[..., 1])
+        ix2 = np.minimum(a[..., 2], b[..., 2])
+        iy2 = np.minimum(a[..., 3], b[..., 3])
+        iw = np.clip(ix2 - ix1, 0, None)
+        ih = np.clip(iy2 - iy1, 0, None)
+        inter = iw * ih
+        area_a = np.clip(a[..., 2] - a[..., 0], 0, None) * np.clip(a[..., 3] - a[..., 1], 0, None)
+        area_b = np.clip(b[..., 2] - b[..., 0], 0, None) * np.clip(b[..., 3] - b[..., 1], 0, None)
+        union = area_a + area_b - inter
+        iou = inter / (union + 1e-8)
+        # Smallest enclosing box
+        ex1 = np.minimum(a[..., 0], b[..., 0])
+        ey1 = np.minimum(a[..., 1], b[..., 1])
+        ex2 = np.maximum(a[..., 2], b[..., 2])
+        ey2 = np.maximum(a[..., 3], b[..., 3])
+        enc = np.clip(ex2 - ex1, 0, None) * np.clip(ey2 - ey1, 0, None)
+        giou = iou - (enc - union) / (enc + 1e-8)
+        return (1.0 - giou).astype(np.float32)
+
+    @staticmethod
+    def _pairwise_class_cost(entity_logits_b, region_logits_b, ent_target, reg_target,
+                             num_ent, num_reg, ignore_index=-100):
+        """(N, M) cost = -log p(gt_class | pred_logits) summed over entity+region.
+        Computed in numpy on detached softmax probs — used only for matching."""
+        import numpy as np
+        import torch
+        N = entity_logits_b.shape[0]
+        M = ent_target.shape[0] if ent_target is not None else 0
+        if N == 0 or M == 0:
+            return np.zeros((N, M), dtype=np.float32)
+        # Softmax probs (detached, fp32)
+        ent_p = torch.softmax(entity_logits_b.detach().float(), dim=-1).cpu().numpy()  # (N, num_ent)
+        reg_p = torch.softmax(region_logits_b.detach().float(), dim=-1).cpu().numpy()  # (N, num_reg)
+        ent_t = ent_target.detach().cpu().numpy() if ent_target is not None else None  # (M,)
+        reg_t = reg_target.detach().cpu().numpy() if reg_target is not None else None  # (M,)
+        cost = np.zeros((N, M), dtype=np.float32)
+        eps = 1e-8
+        for m in range(M):
+            if ent_t is not None:
+                e = int(ent_t[m])
+                if 0 <= e < num_ent:
+                    cost[:, m] += -np.log(ent_p[:, e] + eps)
+            if reg_t is not None:
+                r = int(reg_t[m])
+                if 0 <= r < num_reg:
+                    cost[:, m] += -np.log(reg_p[:, r] + eps)
+        return cost
+
+    @staticmethod
+    def _focal_bce_with_logits(logits, targets, alpha=0.25, gamma=2.0):
+        """Focal-BCE for objectness imbalance (N=300 queries, M~10 positives).
+
+        Reference: Lin et al. (2017) "Focal Loss for Dense Object Detection".
+        With α=0.25, γ=2.0 (RetinaNet defaults): negatives get heavy down-
+        weighting once the model is confident they're negative, so the small
+        positive set drives the gradient even when 95% of queries are
+        background.
+        """
+        logits = logits.float()
+        targets = targets.float()
+        p = torch.sigmoid(logits)
+        p_t = p * targets + (1.0 - p) * (1.0 - targets)
+        alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+        focal = alpha_t * (1.0 - p_t) ** gamma * ce
+        return focal.mean()
+
     def _compute_scene_graph_loss(
         self,
         sg_outputs: Dict[str, torch.Tensor],
@@ -340,54 +430,126 @@ class MultiTaskLoss(nn.Module):
         gt_regions: Optional[List[torch.Tensor]],
         device: torch.device
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute scene graph generation loss."""
+        """DETR-style scene graph loss with three upgrades:
+
+          1) COMBINED HUNGARIAN COST (was: IoU only).
+             cost = w_iou * (1 - IoU) + w_l1 * L1 + w_giou * (1 - GIoU)
+                  + w_class * (-log p(gt_class | pred_logits))
+             Default weights mirror DETR: w_l1=5, w_giou=2, w_iou=2, w_class=1.
+             Even at init when IoU is 0 everywhere, L1 + class probability
+             still provide a smooth cost surface, so Hungarian picks
+             non-random assignments from step 1.
+
+          2) FOCAL BCE for objectness (was: plain BCE).
+             N=300 queries, M~10 positives → 96.6% background; focal loss
+             (α=0.25, γ=2) prevents the positive gradient signal from being
+             drowned in the negative mean.
+
+          3) BBOX SIGMOID + CLAMP for cold-start stability.
+             The SG generator emits raw (x1,y1,x2,y2) which can be outside
+             [0,1] at init, making IoU degenerate and L1 unbounded. We
+             apply sigmoid (no-op on already-normalised values up to a soft
+             squash; aligned with DETR's bbox_embed.sigmoid()) and clamp
+             coords to [0,1] before matching and bbox loss. This stabilises
+             the first ~50 steps when bbox regression hasn't warmed up.
+        """
+        from .metrics import pairwise_iou, hungarian_match
+
         loss_dict = {}
-        
-        bbox_preds = sg_outputs['bbox_preds']
-        entity_logits = sg_outputs['entity_logits']
-        region_logits = sg_outputs['region_logits']
-        objectness = sg_outputs['objectness_scores']
-        
+
+        bbox_preds_raw = sg_outputs['bbox_preds']    # (B, N, 4)
+        entity_logits = sg_outputs['entity_logits']  # (B, N, num_entities)
+        region_logits = sg_outputs['region_logits']  # (B, N, num_regions)
+        objectness = sg_outputs['objectness_scores'] # (B, N)
+
+        # === FIX 3: stable bbox range via sigmoid + clamp ===
+        # sigmoid maps any real value into (0, 1); clamp tightens to [0, 1]
+        # exactly. Loss + matching both use these stabilised predictions.
+        bbox_preds = torch.sigmoid(bbox_preds_raw).clamp(0.0, 1.0)
+
         B, N = bbox_preds.shape[:2]
-        
+
         entity_loss = torch.tensor(0.0, device=device)
         region_loss = torch.tensor(0.0, device=device)
         bbox_loss = torch.tensor(0.0, device=device)
         obj_loss = torch.tensor(0.0, device=device)
         num_valid = 0
-        
+        total_matched_pairs = 0
+
         if gt_bboxes is None:
             return torch.tensor(0.0, device=device), {}
-        
-        # Get model output dtype for target matching (DeepSpeed FP16)
+
+        # === FIX 1: DETR matching cost weights ===
+        W_IOU = 2.0
+        W_L1 = 5.0
+        W_GIOU = 2.0
+        W_CLASS = 1.0
+
         model_dt = bbox_preds.dtype
-        
+
         for b in range(B):
             if b >= len(gt_bboxes) or gt_bboxes[b] is None:
                 continue
-            
-            gt_box = gt_bboxes[b].to(device=device, dtype=model_dt)
+
+            gt_box = gt_bboxes[b].to(device=device, dtype=model_dt).clamp(0.0, 1.0)
             M = gt_box.shape[0]
             if M == 0:
                 continue
-            
-            K = min(N, M)
-            pred_box = bbox_preds[b, :K]
-            gt_box_matched = gt_box[:K]
-            
-            # Bbox loss (float32 for numerical safety)
-            if self.use_giou:
-                bbox_loss = bbox_loss + self._giou_loss(pred_box, gt_box_matched).mean()
-            else:
-                bbox_loss = bbox_loss + F.smooth_l1_loss(pred_box.float(), gt_box_matched.float())
-            
-            # Entity loss
-            # QBA scene graphs occasionally contain entity IDs >= num_entities
-            # (legacy/expanded vocab vs the trained head). Mask those out with
-            # ignore_index=-100 instead of clamping (clamping would teach the
-            # head to predict class 0 for unknown entities, which is worse).
+
+            pred_np = bbox_preds[b].detach().float().cpu().numpy()  # (N, 4)
+            gt_np = gt_box.detach().float().cpu().numpy()           # (M, 4)
+
+            # === FIX 1: combined cost matrix (not IoU-only) ===
+            iou_mat = pairwise_iou(pred_np, gt_np)                  # (N, M)
+            l1_cost = self._pairwise_l1_cost(pred_np, gt_np)        # (N, M)
+            giou_cost = self._pairwise_giou_cost(pred_np, gt_np)    # (N, M)
+            # Class cost depends on this batch's entity/region GTs
+            ent_t_for_cost = None
             if gt_entities is not None and b < len(gt_entities) and gt_entities[b] is not None:
-                ent_target = gt_entities[b].to(device)[:K].long()
+                ent_t_for_cost = gt_entities[b].to(device).long()
+            reg_t_for_cost = None
+            if gt_regions is not None and b < len(gt_regions) and gt_regions[b] is not None:
+                reg_t_for_cost = gt_regions[b].to(device).long()
+            class_cost = self._pairwise_class_cost(
+                entity_logits[b], region_logits[b],
+                ent_t_for_cost, reg_t_for_cost,
+                entity_logits.shape[-1], region_logits.shape[-1],
+                self.ignore_index,
+            )
+            # Hungarian on -IoU (minimise cost). Combine:
+            total_cost = (
+                W_IOU * (1.0 - iou_mat)
+                + W_L1 * l1_cost
+                + W_GIOU * giou_cost
+                + W_CLASS * class_cost
+            )
+            # hungarian_match expects an iou-like matrix to MAXIMISE — we
+            # pass -total_cost so the lsa picks lowest cost = highest score.
+            pairs = hungarian_match(-total_cost)
+            if not pairs:
+                continue
+
+            pred_idx_list = [p[0] for p in pairs]
+            gt_idx_list = [p[1] for p in pairs]
+            pred_idx = torch.tensor(pred_idx_list, device=device, dtype=torch.long)
+            gt_idx = torch.tensor(gt_idx_list, device=device, dtype=torch.long)
+            P = pred_idx.shape[0]
+            total_matched_pairs += P
+
+            # === Bbox loss on matched pairs (uses sigmoid+clamped preds) ===
+            matched_pred_box = bbox_preds[b, pred_idx]    # (P, 4)
+            matched_gt_box = gt_box[gt_idx]                # (P, 4)
+            if self.use_giou:
+                bbox_loss = bbox_loss + self._giou_loss(matched_pred_box, matched_gt_box).mean()
+            else:
+                bbox_loss = bbox_loss + F.smooth_l1_loss(
+                    matched_pred_box.float(), matched_gt_box.float()
+                )
+
+            # === Entity loss on matched pairs ===
+            if ent_t_for_cost is not None:
+                safe_gt_idx = gt_idx.clamp(max=ent_t_for_cost.shape[0] - 1) if ent_t_for_cost.numel() else gt_idx
+                ent_target = ent_t_for_cost[safe_gt_idx] if ent_t_for_cost.numel() else torch.full((P,), self.ignore_index, device=device, dtype=torch.long)
                 num_ent = entity_logits.shape[-1]
                 ent_target = torch.where(
                     (ent_target >= 0) & (ent_target < num_ent),
@@ -395,19 +557,16 @@ class MultiTaskLoss(nn.Module):
                     torch.full_like(ent_target, self.ignore_index),
                 )
                 if (ent_target != -100).any():
-                    # Use per-class weighted CE if available (fixes mode collapse).
-                    # The .to() handles moving the weight buffer to the same
-                    # device as the logits at first call — cheap, idempotent.
                     if self.entity_ce_loss.weight is not None:
                         self.entity_ce_loss.weight = self.entity_ce_loss.weight.to(device)
                     entity_loss = entity_loss + self.entity_ce_loss(
-                        entity_logits[b, :K].float(), ent_target,
+                        entity_logits[b, pred_idx].float(), ent_target,
                     )
 
-            # Region loss — same clamp pattern (this was the failing site:
-            #   training/loss.py:304 → t >= n_classes assertion)
-            if gt_regions is not None and b < len(gt_regions) and gt_regions[b] is not None:
-                reg_target = gt_regions[b].to(device)[:K].long()
+            # === Region loss on matched pairs ===
+            if reg_t_for_cost is not None:
+                safe_gt_idx_r = gt_idx.clamp(max=reg_t_for_cost.shape[0] - 1) if reg_t_for_cost.numel() else gt_idx
+                reg_target = reg_t_for_cost[safe_gt_idx_r] if reg_t_for_cost.numel() else torch.full((P,), self.ignore_index, device=device, dtype=torch.long)
                 num_reg = region_logits.shape[-1]
                 reg_target = torch.where(
                     (reg_target >= 0) & (reg_target < num_reg),
@@ -418,27 +577,32 @@ class MultiTaskLoss(nn.Module):
                     if self.region_ce_loss.weight is not None:
                         self.region_ce_loss.weight = self.region_ce_loss.weight.to(device)
                     region_loss = region_loss + self.region_ce_loss(
-                        region_logits[b, :K].float(), reg_target,
+                        region_logits[b, pred_idx].float(), reg_target,
                     )
-            
-            # Objectness loss (float32 — bce_with_logits can overflow in FP16)
+
+            # === FIX 2: focal BCE for objectness (was: plain BCE) ===
             obj_target = torch.zeros(N, dtype=torch.float32, device=device)
-            obj_target[:K] = 1.0
-            obj_loss = obj_loss + F.binary_cross_entropy_with_logits(objectness[b].float(), obj_target)
-            
+            obj_target[pred_idx] = 1.0
+            obj_loss = obj_loss + self._focal_bce_with_logits(
+                objectness[b], obj_target, alpha=0.25, gamma=2.0,
+            )
+
             num_valid += 1
-        
+
         if num_valid > 0:
             entity_loss = entity_loss / num_valid
             region_loss = region_loss / num_valid
             bbox_loss = bbox_loss / num_valid
             obj_loss = obj_loss / num_valid
-        
+
         loss_dict['sg_entity_loss'] = entity_loss
         loss_dict['sg_region_loss'] = region_loss
         loss_dict['sg_bbox_loss'] = bbox_loss
         loss_dict['sg_objectness_loss'] = obj_loss
-        
+        loss_dict['sg_matched_pairs_per_batch'] = torch.tensor(
+            float(total_matched_pairs) / max(1, num_valid), device=device
+        )
+
         total = entity_loss + 0.5 * region_loss + bbox_loss + 0.5 * obj_loss
         return total, loss_dict
     
