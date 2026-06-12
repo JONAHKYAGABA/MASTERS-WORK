@@ -457,15 +457,18 @@ class MultiTaskLoss(nn.Module):
 
         loss_dict = {}
 
-        bbox_preds_raw = sg_outputs['bbox_preds']    # (B, N, 4)
+        bbox_preds_raw = sg_outputs['bbox_preds']    # (B, N, 4) — ALREADY sigmoid'd
+                                                     # in SceneGraphGenerator.forward (line 2625)
         entity_logits = sg_outputs['entity_logits']  # (B, N, num_entities)
         region_logits = sg_outputs['region_logits']  # (B, N, num_regions)
         objectness = sg_outputs['objectness_scores'] # (B, N)
 
-        # === FIX 3: stable bbox range via sigmoid + clamp ===
-        # sigmoid maps any real value into (0, 1); clamp tightens to [0, 1]
-        # exactly. Loss + matching both use these stabilised predictions.
-        bbox_preds = torch.sigmoid(bbox_preds_raw).clamp(0.0, 1.0)
+        # === FIX 3 (corrected): clamp ONLY — DO NOT sigmoid again ===
+        # SceneGraphGenerator already applies torch.sigmoid() to its bbox
+        # output at L2625. A second sigmoid here would map [0,1] → [0.5,0.73],
+        # crushing the box-movement signal and stalling bbox_loss. We just
+        # clamp defensively in case of fp16 over/underflow at the boundaries.
+        bbox_preds = bbox_preds_raw.clamp(0.0, 1.0)
 
         B, N = bbox_preds.shape[:2]
 
