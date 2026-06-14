@@ -549,7 +549,16 @@ class MultiTaskLoss(nn.Module):
                     matched_pred_box.float(), matched_gt_box.float()
                 )
 
-            # === Entity loss on matched pairs ===
+            # === Entity loss on matched pairs (PER-PAIR CLAMP) ===
+            # Why: nn.CrossEntropyLoss(reduction='mean') with class weights is
+            # bounded by max_weight × log(C), but in practice a single
+            # confidently-wrong rare-class prediction gives per-pair CE of
+            # 20-45 (log(p≈1e-13) ≈ 30) and the WEIGHTED MEAN inherits that.
+            # On batches dominated by such pairs, sg_loss can spike to 80+
+            # even with capped weights. Per-pair clamp to max=10.0 bounds each
+            # pair's contribution. The clamp does NOT affect gradients on
+            # well-predicted pairs (their loss is < 10 anyway), only the
+            # extreme outliers that destabilise the optimizer.
             if ent_t_for_cost is not None:
                 safe_gt_idx = gt_idx.clamp(max=ent_t_for_cost.shape[0] - 1) if ent_t_for_cost.numel() else gt_idx
                 ent_target = ent_t_for_cost[safe_gt_idx] if ent_t_for_cost.numel() else torch.full((P,), self.ignore_index, device=device, dtype=torch.long)
@@ -560,13 +569,25 @@ class MultiTaskLoss(nn.Module):
                     torch.full_like(ent_target, self.ignore_index),
                 )
                 if (ent_target != -100).any():
-                    if self.entity_ce_loss.weight is not None:
-                        self.entity_ce_loss.weight = self.entity_ce_loss.weight.to(device)
-                    entity_loss = entity_loss + self.entity_ce_loss(
-                        entity_logits[b, pred_idx].float(), ent_target,
-                    )
+                    ent_weight = self.entity_ce_loss.weight
+                    if ent_weight is not None:
+                        ent_weight = ent_weight.to(device)
+                    ent_per_pair = F.cross_entropy(
+                        entity_logits[b, pred_idx].float(),
+                        ent_target,
+                        weight=ent_weight,
+                        ignore_index=self.ignore_index,
+                        label_smoothing=getattr(self.entity_ce_loss, 'label_smoothing', 0.0),
+                        reduction='none',
+                    )  # (P,)
+                    ent_per_pair_clipped = ent_per_pair.clamp(max=10.0)
+                    # MEAN only over non-ignored pairs (matches behaviour of
+                    # reduction='mean' for CE with ignore_index)
+                    valid = (ent_target != self.ignore_index)
+                    denom = valid.float().sum().clamp(min=1.0)
+                    entity_loss = entity_loss + (ent_per_pair_clipped * valid.float()).sum() / denom
 
-            # === Region loss on matched pairs ===
+            # === Region loss on matched pairs (PER-PAIR CLAMP) ===
             if reg_t_for_cost is not None:
                 safe_gt_idx_r = gt_idx.clamp(max=reg_t_for_cost.shape[0] - 1) if reg_t_for_cost.numel() else gt_idx
                 reg_target = reg_t_for_cost[safe_gt_idx_r] if reg_t_for_cost.numel() else torch.full((P,), self.ignore_index, device=device, dtype=torch.long)
@@ -577,11 +598,21 @@ class MultiTaskLoss(nn.Module):
                     torch.full_like(reg_target, self.ignore_index),
                 )
                 if (reg_target != -100).any():
-                    if self.region_ce_loss.weight is not None:
-                        self.region_ce_loss.weight = self.region_ce_loss.weight.to(device)
-                    region_loss = region_loss + self.region_ce_loss(
-                        region_logits[b, pred_idx].float(), reg_target,
-                    )
+                    reg_weight = self.region_ce_loss.weight
+                    if reg_weight is not None:
+                        reg_weight = reg_weight.to(device)
+                    reg_per_pair = F.cross_entropy(
+                        region_logits[b, pred_idx].float(),
+                        reg_target,
+                        weight=reg_weight,
+                        ignore_index=self.ignore_index,
+                        label_smoothing=getattr(self.region_ce_loss, 'label_smoothing', 0.0),
+                        reduction='none',
+                    )  # (P,)
+                    reg_per_pair_clipped = reg_per_pair.clamp(max=10.0)
+                    valid = (reg_target != self.ignore_index)
+                    denom = valid.float().sum().clamp(min=1.0)
+                    region_loss = region_loss + (reg_per_pair_clipped * valid.float()).sum() / denom
 
             # === FIX 2: focal BCE for objectness (was: plain BCE) ===
             obj_target = torch.zeros(N, dtype=torch.float32, device=device)
