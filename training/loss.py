@@ -526,6 +526,16 @@ class MultiTaskLoss(nn.Module):
                 + W_GIOU * giou_cost
                 + W_CLASS * class_cost
             )
+            # Sanitize: class_cost = -log(softmax_prob) yields +inf when a
+            # probability underflows to 0 in fp16. Any NaN/Inf in the cost
+            # matrix makes scipy.linear_sum_assignment raise
+            # "ValueError: matrix contains invalid numeric entries". Clamp
+            # to a large finite value so Hungarian can still pick a valid
+            # pairing — the bad cell just becomes "very high cost, avoid".
+            import numpy as _np
+            total_cost = _np.nan_to_num(
+                total_cost, nan=1e6, posinf=1e6, neginf=-1e6,
+            )
             # hungarian_match expects an iou-like matrix to MAXIMISE — we
             # pass -total_cost so the lsa picks lowest cost = highest score.
             pairs = hungarian_match(-total_cost)
