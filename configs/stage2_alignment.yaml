@@ -1,0 +1,140 @@
+# MIMIC-CXR VQA Stage 2 — SG-LLM Alignment
+# ============================================
+# Stage 2 of the 4-stage curriculum.
+# Goal: teach the Qwen LM to attend to and use the SG tokens produced by
+# the FROZEN Stage 1 generator. The SG generator does NOT train here —
+# only Qwen's LoRA adapters + the SG projector (the bridge from
+# SceneGraphEncoderV2 output → Qwen embedding space) update.
+#
+# Loss recipe (from MultiTaskLoss.MODE_WEIGHTS['alignment']):
+#   generation=1.0 (PRIMARY — Qwen autoregressive LM loss)
+#   chexpert=0.05 (aux)
+#   sg=0.0 (frozen, no gradient)
+#   vqa=0.0, grounding=0.0
+#
+# Resume from Stage 1's best_model (Val IoU 0.32, Val Accuracy 0.048).
+#
+# Usage:
+#   torchrun --nproc_per_node=2 train_mimic_cxr.py \
+#     --config configs/stage2_alignment.yaml \
+#     --resume_from_checkpoint checkpoints/mimic-cxr-vqa/best_model
+
+model:
+  visual_backbone: "convnext_base"
+  text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
+  visual_feature_dim: 512
+  scene_graph_dim: 134
+  visual_embedding_dim: 646
+  hidden_size: 768
+  intermediate_size: 3072
+  num_hidden_layers: 6
+  num_attention_heads: 12
+  hidden_dropout_prob: 0.1
+  attention_probs_dropout_prob: 0.1
+  sim_layers: 2
+
+  num_regions: 310
+  num_entities: 237
+  region_embedding_dim: 64
+  entity_embedding_dim: 64
+
+  num_binary_classes: 2
+  num_category_classes: 14
+  num_region_classes: 26
+  num_severity_classes: 4
+
+  max_question_length: 128
+  vocab_size: 30522
+
+data:
+  mimic_cxr_jpg_path: "/root/code/MASTERS-WORK/data/mimic-cxr-jpg"
+  mimic_ext_cxr_qba_path: "/root/code/MASTERS-WORK/data/mimic-ext-cxr-qba"
+  chexpert_labels_path: ""
+
+  # Stage 2 still uses B-grade pool (per curriculum: grade B for pretrain stages)
+  quality_grade: "B"
+  view_filter: "frontal_only"
+  question_types: null
+
+  use_exports: true
+  export_grade: "B_frontal"
+
+  cache_dir: ".cache/dataset_samples"
+
+  image_size: 224
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]
+
+training:
+  output_dir: "./checkpoints/mimic-cxr-vqa-stage2-alignment"
+
+  # CRITICAL: selects alignment loss recipe inside MultiTaskLoss.
+  # Also triggers freeze_sg_generator=True in trainer (Stage 2 consumes
+  # Stage 1's frozen SG outputs — does NOT retrain the generator).
+  phase: "alignment"
+
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 4
+
+  # Alignment is faster than Stage 1: only Qwen LoRA + SG projector train,
+  # SG generator is frozen. 2 epochs is enough to teach the LM to use SG
+  # tokens; more risks overfitting on B-grade noise.
+  num_epochs: 2
+
+  # Higher LR than Stage 1's 5e-6: alignment trains Qwen LoRA adapters which
+  # are randomly initialized at start and need more learning rate to actually
+  # adapt. 5e-5 is the standard QLoRA finetuning rate on Qwen3-VL-8B.
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+
+  fp16: true
+  gradient_checkpointing: false  # mHC reentrant issue — keep off
+
+  # =====================================================
+  # STAGE 2 LOSS WEIGHTS — generation is PRIMARY
+  # =====================================================
+  # Resolved automatically by phase="alignment" in MultiTaskLoss.MODE_WEIGHTS,
+  # but we set them here explicitly for clarity/visibility in the config dump.
+  vqa_loss_weight: 0.0
+  generation_loss_weight: 1.0       # PRIMARY — Qwen LM loss on structured_answer_text
+  chexpert_loss_weight: 0.05
+  scene_graph_loss_weight: 0.0      # SG generator is frozen; no gradient anyway
+  grounding_loss_weight: 0.0
+  binary_head_weight: 0.0
+  category_head_weight: 0.0
+  region_head_weight: 0.0
+  severity_head_weight: 0.0
+
+  logging_steps: 100
+  save_steps: 5000
+  save_total_limit: 3
+  eval_steps: 2000
+
+  dataloader_num_workers: 2
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+  hub_model_id: "KYAGABA/mimic-cxr-vqa-stage2-alignment"
+  hub_private_repo: true
+  push_to_hub_strategy: "checkpoint"
+
+  seed: 42
+
+wandb:
+  enabled: true
+  project: "mimic-cxr-vqa"
+  entity: "kyagabajonah"
+  name: "stage2-alignment"
+  group: "curriculum"
+  tags: ["ssg-vqa", "mimic-cxr", "stage2", "alignment", "b-grade"]
+  notes: "Stage 2: SG-LLM alignment (gen=1.0 primary, SG frozen). Resumes from Stage 1 best_model."
+  watch_model: false
+  watch_log_freq: 1000
+  log_model: true
+
+deepspeed:
+  enabled: false
+  config_path: "configs/deepspeed_config.json"
+  stage: 2

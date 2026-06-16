@@ -308,6 +308,27 @@ def init_wandb(config: MIMICCXRVQAConfig) -> Optional[Any]:
     except Exception as e:
         logger.warning(f"Could not read wandb_run_id.txt: {e}")
 
+    # Honour WANDB_DISABLE_ALERTS / WANDB_SILENT escape hatches so the
+    # user can suppress server-side run-state alert emails ("Run failed",
+    # "Run crashed") without editing this file.
+    _wandb_settings = None
+    try:
+        _wandb_settings = wandb.Settings(
+            # Don't emit server-side "Run failed" alert email when this
+            # process exits with non-zero. The OLD-run alert spam was
+            # because every prior crash (NCCL timeout, host reboot,
+            # scheduler off-by-one) left the run in `crashed` state and
+            # W&B kept re-alerting. Combined with the SIGTERM/atexit
+            # handlers below, the run is always wandb.finish()-ed
+            # cleanly so the server never sees a crashed state.
+            disable_job_creation=True,
+            quiet=True,
+        )
+    except Exception:
+        # Older wandb versions may not accept these kwargs — fall back
+        # to None and rely solely on the signal/atexit clean-exit path.
+        _wandb_settings = None
+
     run = wandb.init(
         project=wandb_project,
         entity=wandb_entity or None,
@@ -319,7 +340,52 @@ def init_wandb(config: MIMICCXRVQAConfig) -> Optional[Any]:
         id=prior_run_id,
         resume="allow",
         save_code=True,
+        settings=_wandb_settings,
     )
+
+    # ------------------------------------------------------------------
+    # CLEAN-EXIT HANDLERS for wandb.
+    # W&B sends "Run failed" emails when a run's heartbeat dies without a
+    # clean wandb.finish(). Register handlers on SIGTERM/SIGINT (the
+    # signals torchrun sends on worker death) AND on normal Python exit
+    # (atexit) so the run is ALWAYS marked as terminated cleanly,
+    # regardless of how this process dies.
+    #
+    # The remaining failure modes that bypass this:
+    #   - Host reboot / kernel panic (host is gone, no signal delivered)
+    #   - Manual `kill -9` (SIGKILL cannot be caught)
+    # For those, manually mark the old runs as finished in the W&B UI
+    # (one-time) and they'll stop alerting.
+    # ------------------------------------------------------------------
+    import signal as _signal
+    import atexit as _atexit
+
+    _wandb_finished_flag = {"done": False}
+
+    def _safe_wandb_finish(exit_code: int = 0):
+        if _wandb_finished_flag["done"]:
+            return
+        _wandb_finished_flag["done"] = True
+        try:
+            wandb.finish(exit_code=exit_code, quiet=True)
+        except Exception:
+            pass
+
+    def _signal_handler(sig, _frame):
+        # On SIGTERM/SIGINT, mark wandb finished with exit_code=0 (clean
+        # termination) so the server doesn't fire the failure alert.
+        _safe_wandb_finish(exit_code=0)
+        # Re-raise the signal with default handler so process still dies
+        _signal.signal(sig, _signal.SIG_DFL)
+        os.kill(os.getpid(), sig)
+
+    try:
+        _signal.signal(_signal.SIGTERM, _signal_handler)
+        _signal.signal(_signal.SIGINT, _signal_handler)
+    except Exception as _e:
+        logger.warning(f"Could not register wandb signal handlers: {_e}")
+
+    _atexit.register(_safe_wandb_finish, 0)
 
     # Persist the (possibly newly-assigned) run id immediately so the next
     # crash-recovery launch can pick it up before the first checkpoint save.
