@@ -2344,12 +2344,25 @@ def main(args):
             except Exception as e:
                 logger.warning(f"Could not restore optimizer state: {e}")
         if resume_scheduler_state is not None and scheduler is not None:
-            try:
-                scheduler.load_state_dict(resume_scheduler_state)
+            if getattr(args, 'reset_scheduler', False):
+                # User requested a fresh scheduler — common when crossing
+                # curriculum-stage boundaries (e.g. Stage 1 → Stage 2 → Stage 3)
+                # where each stage has its own num_epochs / total_steps target.
+                # OneCycleLR caps at exactly its configured total_steps and will
+                # raise "Tried to step N times. The specified number of total
+                # steps is M" if we inherit Stage K's schedule into Stage K+1.
                 if is_main_process(local_rank):
-                    logger.info("Restored scheduler state from checkpoint")
-            except Exception as e:
-                logger.warning(f"Could not restore scheduler state: {e}")
+                    logger.info(
+                        "--reset_scheduler set: SKIPPING scheduler restore. "
+                        "LR ramp will start fresh for this stage's total_steps."
+                    )
+            else:
+                try:
+                    scheduler.load_state_dict(resume_scheduler_state)
+                    if is_main_process(local_rank):
+                        logger.info("Restored scheduler state from checkpoint")
+                except Exception as e:
+                    logger.warning(f"Could not restore scheduler state: {e}")
         if resume_rng_state is not None:
             try:
                 import random as _random
@@ -2693,6 +2706,15 @@ if __name__ == "__main__":
                             'is reproducible across runs. The official val/test stay on disk for '
                             'final paper-grade reporting; this flag only changes what the trainer '
                             'uses for per-epoch val_loss/val_metrics during the run.')
+    parser.add_argument('--reset_scheduler', action='store_true',
+                       help='Skip restoring the scheduler state when resuming from a '
+                            'checkpoint. Required when crossing curriculum-stage '
+                            'boundaries because OneCycleLR is one-shot (it caps at the '
+                            "stage's configured total_steps and refuses to continue). "
+                            'Without this flag, Stage K+1 inherits Stage K\'s LR ramp '
+                            "and aborts with 'Tried to step N+1 times' after consuming "
+                            "K's remaining steps. Use whenever --resume_from_checkpoint "
+                            'points at a checkpoint from a DIFFERENT phase/config.')
     parser.add_argument('--use_reports', action='store_true',
                        help='Inject the radiologist report into training: INDICATION+HISTORY is '
                             'prepended to the question as clinical context (model INPUT), and '
