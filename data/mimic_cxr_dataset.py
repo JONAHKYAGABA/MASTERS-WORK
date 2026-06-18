@@ -31,6 +31,133 @@ logger = logging.getLogger(__name__)
 DEFAULT_CACHE_DIR = Path('.cache/dataset_samples')
 
 
+# =============================================================================
+# QBA QUALITY CRITERION → LETTER GRADE
+# =============================================================================
+# Per MIMIC-Ext-CXR-QBA spec (Section 3a, Methods). The dataset stores
+# extraction_quality / question_img_localization_quality / etc. as DICTS of
+# criterion-level states (e.g. {"region_quality": "RESOLVED_REGIONS_ONLY",
+# "entity_quality": "RESOLVED_ENTITIES_ONLY", ...}) — NOT pre-computed
+# letter grades. Per the QBA paper, the overall grade for a question is the
+# MIN (worst) letter grade across all criteria in all of its quality dicts.
+#
+# The mapping below is taken verbatim from the QBA paper tables for both
+# scene-graph extraction criteria (Section 3a) and QA evaluation criteria
+# (LLM-as-judge entailment/relevance/completeness/clarity).
+#
+# Without this mapping, the old code's `v.get('overall', v.get('grade', 'B'))`
+# defaulted to 'B' for every dict (no 'overall' or 'grade' key exists in
+# QBA's per-criterion structure) — so every question got rated B and the
+# A-grade filter rejected ALL 7M+ questions.
+# =============================================================================
+QBA_CRITERION_GRADE: Dict[str, str] = {
+    # --- region_quality ---
+    'NO_REGIONS': 'B',
+    'DEFAULT_REGIONS_ONLY': 'B',
+    'CONTAINS_DEFAULT_REGIONS': 'A',
+    'CONTAINS_NON_RESOLVED_REGIONS': 'A',
+    'RESOLVED_REGIONS_ONLY': 'A++',
+    # --- entity_quality ---
+    'NO_ENTITIES': 'B',
+    'CONTAINS_NON_RESOLVED_ENTITIES': 'A',
+    'RESOLVED_ENTITIES_ONLY': 'A++',
+    # --- sentence_name_quality / change_quality / issue_level (NO_ISSUES shared) ---
+    'NO_ISSUES': 'A++',
+    'CHANGE_IN_SENTENCE_OR_NAME': 'B',
+    'UNDERSCORES_IN_SENTENCE_OR_NAME': 'A',
+    # --- change_quality ---
+    'CHANGE_SENTENCE_REMOVED': 'B',
+    'UNDERSCORES_IN_CHANGE_SENTENCE': 'A',
+    'CONTAINS_NON_RESOLVED_CHANGES': 'A',
+    # --- issue_level ---
+    'DISCARDED': 'D',
+    'NON_INTERPRETABLE': 'C',
+    'MOSTLY_INTERPRETABLE': 'B',
+    'IGNORABLE': 'A',
+    'FIXABLE': 'A+',
+    # --- localization_quality (scene-graph extraction) ---
+    'NO_LOCALIZATION': 'B',
+    'FALLBACK_LOCALIZATION': 'B',
+    'INCOMPLETE_LOCALIZATION': 'A',
+    'BBOX_LOCALIZATION': 'A++',
+    'BBOX_AND_MASK_LOCALIZATION': 'A++',
+    # === QA evaluation criteria (LLM-as-judge) ===
+    # --- Entailment ---
+    'ALIGNED_MENTIONED': 'A++',
+    'ALIGNED_INFERABLE': 'A++',
+    'ALIGNED_NEGATIVE_NOT_MENTIONED': 'A',
+    'ALIGNED_GENERAL_STATEMENT': 'A',
+    'NON_ALIGNED_NON_INFERABLE': 'B',
+    'NON_ALIGNED_MISLEADING': 'C',
+    'NON_ALIGNED_CONTRADICTING': 'D',
+    # --- Relevance ---
+    'RELEVANT_MAIN_ANSWER': 'A++',
+    'RELATED_INFO': 'A++',
+    'REDUNDANT_INFO': 'A',
+    'IRRELEVANT_INFO': 'A',
+    # --- Completeness ---
+    'FULLY_COMPLETE': 'A++',
+    'DETAILS_MISSING': 'A+',
+    'NOT_ANSWERED': 'B',
+    'INCOMPLETE_NON_MISLEADING': 'B',
+    'INCOMPLETE_MISLEADING': 'C',
+    # --- Question / Answer clarity ---
+    'OPTIMAL': 'A++',
+    'UNUSUAL_SENTENCE_STRUCTURE': 'A',
+    'GRAMMATICAL_ERRORS': 'A',
+    'UNCLEAR_QUESTION': 'B',
+    'UNRELATED_TO_CHEST_XRAY': 'B',
+    'UNANSWERABLE': 'C',
+    'UNCLEAR_ANSWER': 'B',
+    'NOT_UNDERSTANDABLE': 'C',
+}
+
+QBA_GRADE_ORDER: Dict[str, int] = {
+    'A++': 5, 'A+': 4, 'A': 3, 'B': 2, 'C': 1, 'D': 0, 'U': 0,
+}
+
+
+def _qba_dict_to_grade(d: Any) -> Optional[str]:
+    """Compute the worst letter grade across all criteria in a QBA quality dict.
+
+    Handles:
+      - Pre-computed grades: {'overall': 'A'} or {'grade': 'A++'} (older QBA dumps)
+      - Per-criterion dicts: {'region_quality': 'RESOLVED_REGIONS_ONLY', ...}
+      - Nested lists of states (rare)
+
+    Returns the letter grade string, or None if nothing parseable.
+    """
+    if not isinstance(d, dict):
+        return None
+    # Fast path: pre-computed grade keys (legacy / convenience)
+    if isinstance(d.get('overall'), str):
+        return d['overall']
+    if isinstance(d.get('grade'), str):
+        return d['grade']
+    # Aggregate path: scan all criterion values, map each to a grade,
+    # return the worst (per QBA spec).
+    grades: List[str] = []
+    for v in d.values():
+        if isinstance(v, str):
+            g = QBA_CRITERION_GRADE.get(v)
+            if g is not None:
+                grades.append(g)
+        elif isinstance(v, list):
+            for item in v:
+                if isinstance(item, str):
+                    g = QBA_CRITERION_GRADE.get(item)
+                    if g is not None:
+                        grades.append(g)
+        elif isinstance(v, dict):
+            # Recurse one level (some QBA fields nest a dict per sub-area)
+            sub = _qba_dict_to_grade(v)
+            if sub is not None:
+                grades.append(sub)
+    if not grades:
+        return None
+    return min(grades, key=lambda g: QBA_GRADE_ORDER.get(g, 0))
+
+
 # CheXpert categories
 CHEXPERT_CATEGORIES = [
     'Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema',
@@ -1298,23 +1425,24 @@ class MIMICCXRVQADataset(Dataset):
                     # Legacy 'question_quality' / 'quality' keys are kept as fallback
                     # for older QBA dumps.
                     if self.quality_grade and self.quality_grade.lower() not in ('', 'all', 'none'):
-                        ex_q = q.get('extraction_quality')
-                        loc_q = q.get('question_img_localization_quality')
-                        legacy = q.get('question_quality', q.get('quality'))
-                        def _to_grade(v):
-                            if isinstance(v, dict):
-                                return v.get('overall', v.get('grade', 'B'))
-                            if isinstance(v, str):
-                                return v
-                            return None
-                        grades = [g for g in (
-                            _to_grade(ex_q), _to_grade(loc_q), _to_grade(legacy)
-                        ) if g]
+                        # FIXED: QBA stores quality as per-criterion dicts (not
+                        # letter grades). _qba_dict_to_grade properly aggregates
+                        # criterion-level states via the QBA spec lookup table
+                        # and returns the worst letter grade. Old code defaulted
+                        # everything to 'B' because there's no 'overall' key.
+                        ex_q   = _qba_dict_to_grade(q.get('extraction_quality'))
+                        loc_q  = _qba_dict_to_grade(q.get('question_img_localization_quality'))
+                        # Legacy field for older QBA dumps — may be a plain string
+                        legacy_raw = q.get('question_quality', q.get('quality'))
+                        if isinstance(legacy_raw, str):
+                            legacy = legacy_raw
+                        else:
+                            legacy = _qba_dict_to_grade(legacy_raw)
+                        grades = [g for g in (ex_q, loc_q, legacy) if g]
                         if not grades:
                             quality_rating = 'B'  # no quality info → assume B
                         else:
-                            grade_order = {'A++': 5, 'A+': 4, 'A': 3, 'B': 2, 'C': 1, 'U': 0}
-                            quality_rating = min(grades, key=lambda g: grade_order.get(g, 0))
+                            quality_rating = min(grades, key=lambda g: QBA_GRADE_ORDER.get(g, 0))
 
                         if not self._meets_quality_grade(quality_rating, self.quality_grade):
                             skipped_quality += 1
