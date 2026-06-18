@@ -117,15 +117,48 @@ QBA_GRADE_ORDER: Dict[str, int] = {
 }
 
 
+# QBA stores per-criterion quality as INTEGERS (positional index into each
+# criterion's ordered enum, worst → best). Map int → letter grade per
+# criterion. Key names below MATCH the actual JSON keys in the dump on disk
+# (verified by dumping s55433201.qa.json from the QBA scene_data tree).
+QBA_CRITERION_INT_GRADES: Dict[str, List[str]] = {
+    # 5 levels: NO_REGIONS, DEFAULT_REGIONS_ONLY, CONTAINS_DEFAULT_REGIONS,
+    #          CONTAINS_NON_RESOLVED_REGIONS, RESOLVED_REGIONS_ONLY
+    'region_extract_quality': ['B', 'B', 'A', 'A', 'A++'],
+    # 3 levels: NO_ENTITIES, CONTAINS_NON_RESOLVED_ENTITIES, RESOLVED_ENTITIES_ONLY
+    'entity_extract_quality': ['B', 'A', 'A++'],
+    # 3 levels: CHANGE_IN_SENTENCE_OR_NAME, UNDERSCORES_IN_SENTENCE_OR_NAME, NO_ISSUES
+    'sentence_name_quality': ['B', 'A', 'A++'],
+    # 4 levels: CHANGE_SENTENCE_REMOVED, UNDERSCORES_IN_CHANGE_SENTENCE,
+    #          CONTAINS_NON_RESOLVED_CHANGES, NO_ISSUES
+    'change_quality': ['B', 'A', 'A', 'A++'],
+    # 6 levels: DISCARDED, NON_INTERPRETABLE, MOSTLY_INTERPRETABLE,
+    #          IGNORABLE, FIXABLE, NO_ISSUES
+    'general_issue_level': ['D', 'C', 'B', 'A', 'A+', 'A++'],
+    # 5 levels: NO_LOCALIZATION, FALLBACK_LOCALIZATION, INCOMPLETE_LOCALIZATION,
+    #          BBOX_LOCALIZATION, BBOX_AND_MASK_LOCALIZATION
+    'localization_quality': ['B', 'B', 'A', 'A++', 'A++'],
+    # Legacy alias for older dumps that used the paper's exact key names
+    'region_quality': ['B', 'B', 'A', 'A', 'A++'],
+    'entity_quality': ['B', 'A', 'A++'],
+    'issue_level': ['D', 'C', 'B', 'A', 'A+', 'A++'],
+}
+
+
 def _qba_dict_to_grade(d: Any) -> Optional[str]:
     """Compute the worst letter grade across all criteria in a QBA quality dict.
 
-    Handles:
-      - Pre-computed grades: {'overall': 'A'} or {'grade': 'A++'} (older QBA dumps)
-      - Per-criterion dicts: {'region_quality': 'RESOLVED_REGIONS_ONLY', ...}
-      - Nested lists of states (rare)
+    Handles THREE storage formats observed across QBA dumps:
+      1. Per-criterion INTEGERS (current MIMIC-Ext-CXR-QBA v1.0 dump):
+         {'region_extract_quality': 4, 'localization_quality': 1, ...}
+         Integer is positional index into criterion's ordered enum.
+         Mapped via QBA_CRITERION_INT_GRADES[<criterion_key>][<int>].
+      2. Per-criterion STRINGS (paper spec / older dumps):
+         {'region_quality': 'RESOLVED_REGIONS_ONLY', ...}
+         Mapped via QBA_CRITERION_GRADE[<string>].
+      3. Pre-computed legacy: {'overall': 'A'} or {'grade': 'A++'}.
 
-    Returns the letter grade string, or None if nothing parseable.
+    Returns the worst letter grade, or None if nothing parseable.
     """
     if not isinstance(d, dict):
         return None
@@ -134,11 +167,16 @@ def _qba_dict_to_grade(d: Any) -> Optional[str]:
         return d['overall']
     if isinstance(d.get('grade'), str):
         return d['grade']
-    # Aggregate path: scan all criterion values, map each to a grade,
-    # return the worst (per QBA spec).
+    # Aggregate path: scan each criterion and map to a letter grade
     grades: List[str] = []
-    for v in d.values():
-        if isinstance(v, str):
+    for k, v in d.items():
+        if isinstance(v, int) and not isinstance(v, bool):
+            # Per-criterion integer (current QBA format)
+            enum = QBA_CRITERION_INT_GRADES.get(k)
+            if enum is not None and 0 <= v < len(enum):
+                grades.append(enum[v])
+        elif isinstance(v, str):
+            # Per-criterion string (paper spec / older format)
             g = QBA_CRITERION_GRADE.get(v)
             if g is not None:
                 grades.append(g)
@@ -149,7 +187,6 @@ def _qba_dict_to_grade(d: Any) -> Optional[str]:
                     if g is not None:
                         grades.append(g)
         elif isinstance(v, dict):
-            # Recurse one level (some QBA fields nest a dict per sub-area)
             sub = _qba_dict_to_grade(v)
             if sub is not None:
                 grades.append(sub)
@@ -1425,20 +1462,26 @@ class MIMICCXRVQADataset(Dataset):
                     # Legacy 'question_quality' / 'quality' keys are kept as fallback
                     # for older QBA dumps.
                     if self.quality_grade and self.quality_grade.lower() not in ('', 'all', 'none'):
-                        # FIXED: QBA stores quality as per-criterion dicts (not
-                        # letter grades). _qba_dict_to_grade properly aggregates
-                        # criterion-level states via the QBA spec lookup table
-                        # and returns the worst letter grade. Old code defaulted
-                        # everything to 'B' because there's no 'overall' key.
-                        ex_q   = _qba_dict_to_grade(q.get('extraction_quality'))
-                        loc_q  = _qba_dict_to_grade(q.get('question_img_localization_quality'))
-                        # Legacy field for older QBA dumps — may be a plain string
+                        # FIXED: QBA stores quality as per-criterion INT dicts
+                        # ({'region_extract_quality': 4, 'localization_quality': 1, ...})
+                        # — _qba_dict_to_grade maps each int to a letter grade
+                        # via the per-criterion enum (QBA_CRITERION_INT_GRADES)
+                        # and returns the worst.
+                        #
+                        # NOTE on question_img_localization_quality: it's a per-IMAGE
+                        # dict ({dicom_id: int}) with a different semantic — the
+                        # values were 0 across all observed samples even on
+                        # otherwise-A-grade questions, which would always fail
+                        # A-grade filter. Drop it from quality aggregation; use
+                        # ONLY extraction_quality + legacy_quality (per QBA paper
+                        # which defines fine-tuning grade by extraction quality).
+                        ex_q = _qba_dict_to_grade(q.get('extraction_quality'))
                         legacy_raw = q.get('question_quality', q.get('quality'))
                         if isinstance(legacy_raw, str):
                             legacy = legacy_raw
                         else:
                             legacy = _qba_dict_to_grade(legacy_raw)
-                        grades = [g for g in (ex_q, loc_q, legacy) if g]
+                        grades = [g for g in (ex_q, legacy) if g]
                         if not grades:
                             quality_rating = 'B'  # no quality info → assume B
                         else:
