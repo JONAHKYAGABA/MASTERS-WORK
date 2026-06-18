@@ -1,0 +1,139 @@
+# MIMIC-CXR VQA Stage 4 — A-grade Finetune
+# ============================================
+# FINAL stage of the 4-stage curriculum.
+# Goal: polish the model on the clean A-grade subset (~7.5M QA pairs)
+# with grounding pushed to 3.0× weight for sharper bbox localization.
+#
+# Loss recipe (from MultiTaskLoss.MODE_WEIGHTS['finetune']):
+#   generation=1.0
+#   grounding=3.0 (PRIMARY — boosted from Stage 3's 2.0)
+#   vqa=0.05 (aux)
+#   chexpert=0.05 (aux)
+#   sg=0.0 (frozen)
+#
+# Resume from Stage 3's best_model (pretrain/best_model from Jun 18).
+# Use --reset_scheduler so Stage 3's OneCycleLR cap doesn't terminate
+# Stage 4 prematurely.
+#
+# A-grade pool (per curriculum: grade A for finetuning).
+#
+# Usage:
+#   torchrun --nproc_per_node=2 train_mimic_cxr.py \
+#     --config configs/stage4_finetune.yaml \
+#     --reset_scheduler \
+#     --resume_from_checkpoint checkpoints/mimic-cxr-vqa/pretrain/best_model
+
+model:
+  visual_backbone: "convnext_base"
+  text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
+  visual_feature_dim: 512
+  scene_graph_dim: 134
+  visual_embedding_dim: 646
+  hidden_size: 768
+  intermediate_size: 3072
+  num_hidden_layers: 6
+  num_attention_heads: 12
+  hidden_dropout_prob: 0.1
+  attention_probs_dropout_prob: 0.1
+  sim_layers: 2
+
+  num_regions: 310
+  num_entities: 237
+  region_embedding_dim: 64
+  entity_embedding_dim: 64
+
+  num_binary_classes: 2
+  num_category_classes: 14
+  num_region_classes: 26
+  num_severity_classes: 4
+
+  max_question_length: 128
+  vocab_size: 30522
+
+data:
+  mimic_cxr_jpg_path: "/root/code/MASTERS-WORK/data/mimic-cxr-jpg"
+  mimic_ext_cxr_qba_path: "/root/code/MASTERS-WORK/data/mimic-ext-cxr-qba"
+  chexpert_labels_path: ""
+
+  # A-grade ONLY (per curriculum: grade A for finetuning)
+  quality_grade: "A"
+  view_filter: "frontal_only"
+  question_types: null
+
+  use_exports: true
+  export_grade: "A_frontal"
+
+  cache_dir: ".cache/dataset_samples"
+
+  image_size: 224
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]
+
+training:
+  output_dir: "./checkpoints/mimic-cxr-vqa-stage4-finetune"
+
+  # CRITICAL: selects finetune loss recipe (gen=1.0, grd=3.0, vqa=0.05, chex=0.05)
+  # Also makes the trainer's freeze_sg_generator logic kick in.
+  phase: "finetune"
+
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 4
+
+  # 2 epochs on the A-grade subset (~76K samples after dedup) — much smaller
+  # than B-grade's ~192K, so each epoch is ~3-4h instead of 10h.
+  num_epochs: 2
+
+  # Lower than Stage 3's 2e-5: A-grade is cleaner so smaller updates suffice;
+  # also reduces risk of unlearning what Stage 3 established.
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+
+  fp16: true
+  gradient_checkpointing: false
+
+  # =====================================================
+  # STAGE 4 LOSS WEIGHTS — finetune (grd boosted to 3.0)
+  # =====================================================
+  vqa_loss_weight: 0.05
+  generation_loss_weight: 1.0
+  chexpert_loss_weight: 0.05
+  scene_graph_loss_weight: 0.0      # SG frozen
+  grounding_loss_weight: 3.0        # PRIMARY — boosted from Stage 3's 2.0
+  binary_head_weight: 0.1
+  category_head_weight: 0.1
+  region_head_weight: 0.1
+  severity_head_weight: 0.1
+
+  logging_steps: 100
+  save_steps: 3000   # smaller A-grade pool → save more frequently to track best
+  save_total_limit: 3
+  eval_steps: 1500
+
+  dataloader_num_workers: 2
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+
+  hub_model_id: "KYAGABA/mimic-cxr-vqa-stage4-finetune"
+  hub_private_repo: true
+  push_to_hub_strategy: "checkpoint"
+
+  seed: 42
+
+wandb:
+  enabled: true
+  project: "mimic-cxr-vqa"
+  entity: "kyagabajonah"
+  name: "stage4-finetune"
+  group: "curriculum"
+  tags: ["ssg-vqa", "mimic-cxr", "stage4", "finetune", "a-grade", "final"]
+  notes: "Stage 4 FINAL: A-grade finetune (gen=1, grd=3 primary). Resumes from Stage 3 pretrain/best_model."
+  watch_model: false
+  watch_log_freq: 1000
+  log_model: true
+
+deepspeed:
+  enabled: false
+  config_path: "configs/deepspeed_config.json"
+  stage: 2
