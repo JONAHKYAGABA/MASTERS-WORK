@@ -29,7 +29,6 @@ Usage (on marconi):
 from __future__ import annotations
 import argparse
 import json
-import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -158,45 +157,27 @@ def _scan_questions(
     jpg_root: Path,
     n: int,
     quality: Optional[str],
-    seed: int = 42,
 ) -> List[Dict[str, Any]]:
-    """Walk `qa/p**/p*/s*.qa.json` and collect N samples that satisfy the
-    filters AND have both an image and a scene graph on disk.
-
-    MIMIC-Ext-CXR-QBA actual layout (matches the training loader):
-      qa/p10/p10000032/s50414267.qa.json
-      scene_data/p10/p10000032/s50414267.scene_graph.json
-    """
+    """Walk `qa/p**/p*/s*.qa.json` in lex order and return the first N
+    studies whose image + scene graph exist and whose first matching question
+    passes the quality filter. Stops as soon as N is reached."""
     q_root = qba_root / "qa"
     if not q_root.exists():
         raise SystemExit(f"qa root not found: {q_root}")
-    rng = random.Random(seed)
-    # Use iterator instead of materialising the full list (it's ~377K files)
-    # — shuffle a randomised view by sampling p-groups + patients in random
-    # order, but stop as soon as we have enough hits.
-    p_groups = sorted([p for p in q_root.iterdir()
-                       if p.is_dir() and p.name.startswith("p")])
-    rng.shuffle(p_groups)
     out = []
-    scanned = 0
-    for p_group in p_groups:
-        patients = [p for p in p_group.iterdir()
-                    if p.is_dir() and p.name.startswith("p")]
-        rng.shuffle(patients)
-        for patient_dir in patients:
-            qa_files = list(patient_dir.glob("s*.qa.json"))
-            rng.shuffle(qa_files)
-            for qa_file in qa_files:
-                scanned += 1
+    for p_group in sorted(q_root.iterdir()):
+        if not (p_group.is_dir() and p_group.name.startswith("p")):
+            continue
+        for patient_dir in sorted(p_group.iterdir()):
+            if not (patient_dir.is_dir() and patient_dir.name.startswith("p")):
+                continue
+            try:
+                subject_id = int(patient_dir.name[1:])
+            except ValueError:
+                continue
+            for qa_file in sorted(patient_dir.glob("s*.qa.json")):
                 try:
-                    subject_id = int(patient_dir.name[1:])
-                    # stem is "s50414267.qa" -> first split is "s50414267"
                     study_id = int(qa_file.stem.split(".")[0][1:])
-                except Exception:
-                    continue
-                try:
-                    with open(qa_file) as f:
-                        qa_data = json.load(f)
                 except Exception:
                     continue
                 img_path = _find_image(jpg_root, subject_id, study_id)
@@ -205,6 +186,8 @@ def _scan_questions(
                 sg_path = _find_scene_graph(qba_root, subject_id, study_id)
                 if sg_path is None:
                     continue
+                with open(qa_file) as f:
+                    qa_data = json.load(f)
                 for q in qa_data.get("questions", []):
                     qg = None
                     if quality:
@@ -228,12 +211,12 @@ def _scan_questions(
                         "quality": qg,
                         "obs_ids": q.get("obs_ids", []),
                     })
-                    break  # one question per study
+                    print(f"[hit {len(out):>2d}/{n}] subj={subject_id} "
+                          f"study={study_id} qtype={q.get('question_type', '?')} "
+                          f"grade={qg or '-'}", flush=True)
+                    break
                 if len(out) >= n:
-                    print(f"scanned {scanned} qa files, collected {len(out)}",
-                          file=sys.stderr)
                     return out
-    print(f"scanned {scanned} qa files, collected {len(out)}", file=sys.stderr)
     return out
 
 
@@ -440,14 +423,13 @@ def main():
     p.add_argument("--n", type=int, default=10)
     p.add_argument("--quality", default="A",
                    help="Minimum grade (A++, A+, A, B+, B, C, D, or 'none')")
-    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=Path, default=Path("dataset_samples"))
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
     quality = None if args.quality.lower() in ("none", "", "all") else args.quality
 
-    samples = _scan_questions(args.qba_root, args.jpg_root, args.n, quality, args.seed)
+    samples = _scan_questions(args.qba_root, args.jpg_root, args.n, quality)
     if not samples:
         raise SystemExit("no samples matched filters")
 
@@ -456,7 +438,8 @@ def main():
         try:
             _render_sample(s, args.out, i)
             base = f"sample_{i:02d}"
-            print(f"wrote {base}_image.png, {base}_scenegraph.png, {base}.txt")
+            print(f"[render {i:>2d}/{len(samples)}] wrote {base}_image.png, "
+                  f"{base}_scenegraph.png, {base}.txt", flush=True)
             index.append({
                 "id": i,
                 "image_png": f"{base}_image.png",
