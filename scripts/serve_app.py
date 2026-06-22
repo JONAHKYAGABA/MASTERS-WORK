@@ -473,131 +473,293 @@ def _encode_png(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def annotate_image(pil: Image.Image, pred: Dict[str, Any]) -> bytes:
-    """Draw the refined grounding bbox + scene-graph objects + answer overlay.
+def _iou_xyxy(a, b):
+    """IoU on (x1,y1,x2,y2) tuples in any unit (we normalise to 0-1)."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
 
-    Bulletproof: each box draw is wrapped in its own try/except, so one bad
-    box can't kill the whole image. Degenerate bboxes (width or height < 4px
-    after scaling, or out-of-order coords) are filtered out — they're a
-    symptom of an undertrained SG generator (mode collapse to a single tiny
-    region near the image centre). Always returns valid PNG bytes; falls
-    back to the original image if any drawing fails catastrophically.
+
+def _dedupe_sg_objects(objects, iou_thresh=0.7):
+    """Merge near-identical scene-graph proposals.
+
+    The undertrained / mode-collapsed SG generator emits the same anatomy
+    20+ times with bboxes within ~0.02 of each other. Drawing all 20 makes
+    the image unreadable. Group by (entity, region) and merge when bbox IoU
+    is high — keep the median box, attach a ``count`` so the legend can
+    show "lungs x20".
+    """
+    groups = []  # each: {entity, region, bbox, count, bboxes}
+    for o in objects:
+        bb = o.get("bbox")
+        if not bb or len(bb) != 4:
+            continue
+        ent = (o.get("entity") or "?").strip()
+        reg = (o.get("region") or "?").strip()
+        matched = None
+        for g in groups:
+            if g["entity"] == ent and g["region"] == reg:
+                if _iou_xyxy(bb, g["bbox"]) > iou_thresh:
+                    matched = g
+                    break
+        if matched is None:
+            groups.append({"entity": ent, "region": reg, "bbox": list(bb),
+                           "count": 1, "bboxes": [list(bb)]})
+        else:
+            matched["count"] += 1
+            matched["bboxes"].append(list(bb))
+            # update to the median box (more stable than first-occurrence)
+            n = len(matched["bboxes"])
+            if n >= 3 and n % 2 == 1:  # only re-median on odd counts to avoid jitter
+                xs1 = sorted(b[0] for b in matched["bboxes"])
+                ys1 = sorted(b[1] for b in matched["bboxes"])
+                xs2 = sorted(b[2] for b in matched["bboxes"])
+                ys2 = sorted(b[3] for b in matched["bboxes"])
+                matched["bbox"] = [xs1[n // 2], ys1[n // 2],
+                                   xs2[n // 2], ys2[n // 2]]
+    return groups
+
+
+def annotate_image(pil: Image.Image, pred: Dict[str, Any]) -> bytes:
+    """Draw refined bbox + deduped scene-graph with labels OUTSIDE the X-ray.
+
+    DESIGN:
+      * Canvas is extended with a right sidebar (legend) and a bottom strip
+        (answer). The X-ray itself only receives thin bbox outlines + tiny
+        numeric tags (1, 2, 3, R for refined) at each box's top-left corner.
+        Nothing larger than a single digit ever sits on top of the image.
+      * Boxes are deduped (IoU > 0.7) so 20 identical proposals collapse
+        to one entry showing "x20" in the legend.
+      * Capped at 5 distinct scene-graph boxes.
+    Always returns valid PNG bytes.
     """
     try:
-        img = pil.copy().convert("RGB")
+        xray = pil.copy().convert("RGB")
     except Exception as e:
         log.warning(f"could not copy/convert PIL image: {e}")
-        # Return a tiny placeholder so the response always has SOMETHING
         return _encode_png(Image.new("RGB", (64, 64), (60, 60, 60)))
 
-    W, H = img.size
-    draw = ImageDraw.Draw(img, "RGBA")
-    lw = max(3, min(W, H) // 200)
-    font_label = _try_font(max(14, min(W, H) // 60))
-    font_ans = _try_font(max(14, min(W, H) // 70))
-    MIN_PX = 4   # below this, a "box" is just a smudge — skip
+    W, H = xray.size
+    short_side = min(W, H)
+
+    # Sidebar / bottom-strip sizes — proportional to the image but capped
+    sidebar_w = max(180, min(320, W // 2))
+    bottom_h = max(70, min(160, H // 4))
+
+    # Font sizes (all text lives in sidebar/bottom, never on the X-ray)
+    fs_legend = 13
+    fs_legend_title = 12
+    fs_ans = 14
+    fs_tag = max(9, min(13, short_side // 80))  # tiny digit tags on boxes
+    font_legend = _try_font(fs_legend)
+    font_legend_title = _try_font(fs_legend_title)
+    font_ans = _try_font(fs_ans)
+    font_tag = _try_font(fs_tag)
+
+    # ------------------------------------------------------------------
+    # Pass 1: collect deduped boxes + assign 1-based numeric tags
+    # ------------------------------------------------------------------
+    sg_objects = pred.get("scene_graph", {}).get("objects", []) or []
+    deduped = _dedupe_sg_objects(sg_objects, iou_thresh=0.7)[:5]
+
+    items = []  # each: {tag, color, bbox, label, count}
+    for i, g in enumerate(deduped):
+        color = _BBOX_COLORS[(i + 1) % len(_BBOX_COLORS)]
+        items.append({
+            "tag": str(i + 1),
+            "color": color,
+            "bbox": g["bbox"],
+            "entity": g["entity"],
+            "region": g["region"],
+            "count": g["count"],
+            "kind": "sg",
+        })
+    for i, bb in enumerate(pred.get("bboxes_from_text", [])[:3]):
+        items.append({
+            "tag": f"L{i+1}",
+            "color": "#AF52DE",
+            "bbox": bb,
+            "entity": "LM bbox",
+            "region": "from text",
+            "count": 1,
+            "kind": "lm",
+        })
+    if pred.get("bbox_refined"):
+        items.append({
+            "tag": "R",
+            "color": "#FF3B30",
+            "bbox": pred["bbox_refined"],
+            "entity": "refined grounding",
+            "region": "answer bbox",
+            "count": 1,
+            "kind": "refined",
+        })
+
+    # ------------------------------------------------------------------
+    # Pass 2: draw thin outlines + tiny corner digit tags on the X-ray
+    # ------------------------------------------------------------------
+    draw_x = ImageDraw.Draw(xray, "RGBA")
+    lw = max(1, short_side // 400)
+    MIN_PX = 4
+    skipped = 0
 
     def _normalise(bbox):
-        """Returns (x1, y1, x2, y2) in pixel space, sorted, clamped to image.
-        Raises ValueError if degenerate after normalisation."""
         if not bbox or len(bbox) != 4:
-            raise ValueError(f"bbox needs 4 floats, got {bbox!r}")
+            raise ValueError("need 4 floats")
         x1, y1, x2, y2 = (float(v) for v in bbox)
-        # Sort coords (the SG generator sometimes emits x2<x1)
-        x1, x2 = sorted((x1, x2))
-        y1, y2 = sorted((y1, y2))
+        x1, x2 = sorted((x1, x2)); y1, y2 = sorted((y1, y2))
         px1 = max(0, min(W - 1, int(x1 * W)))
         py1 = max(0, min(H - 1, int(y1 * H)))
         px2 = max(0, min(W,     int(x2 * W)))
         py2 = max(0, min(H,     int(y2 * H)))
         if (px2 - px1) < MIN_PX or (py2 - py1) < MIN_PX:
-            raise ValueError(f"degenerate (pixels: {px2-px1}x{py2-py1})")
+            raise ValueError("degenerate")
         return px1, py1, px2, py2
 
-    skipped = 0
-
-    def draw_box(bbox, color, label):
-        nonlocal skipped
+    for it in items:
         try:
-            px1, py1, px2, py2 = _normalise(bbox)
+            px1, py1, px2, py2 = _normalise(it["bbox"])
         except ValueError:
             skipped += 1
-            return
+            it["_drawn"] = False
+            continue
+        # outline only — no fill, no label-on-image
+        draw_x.rectangle([px1, py1, px2, py2], outline=it["color"], width=lw)
+        # tiny tag at top-left, ~16 px square, sits at box corner (or just
+        # outside if the box is at the very top edge of the image)
         try:
-            draw.rectangle([px1, py1, px2, py2], outline=color, width=lw)
-            if label:
-                if font_label:
-                    tb = draw.textbbox((0, 0), label, font=font_label)
-                    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-                else:
-                    tw, th = max(8 * len(label), 20), 16
-                # Clamp label box to image (don't draw past edges)
-                lbl_y_top = max(0, py1 - th - 6)
-                draw.rectangle(
-                    [px1, lbl_y_top, min(W, px1 + tw + 10), py1],
-                    fill=color,
-                )
-                kw = {"font": font_label} if font_label else {}
-                draw.text((px1 + 5, lbl_y_top + 2), label, fill="white", **kw)
+            tag = it["tag"]
+            if font_tag:
+                tb = draw_x.textbbox((0, 0), tag, font=font_tag)
+                tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            else:
+                tw, th = 8, 10
+            pad = 2
+            chip_w = tw + 2 * pad
+            chip_h = th + 2 * pad
+            # default: just inside box top-left
+            cx1, cy1 = px1, py1
+            cx2, cy2 = cx1 + chip_w, cy1 + chip_h
+            # if box hugs the top of the image, push tag down inside the box
+            if py1 < chip_h + 2:
+                cy1 = py1
+                cy2 = cy1 + chip_h
+            draw_x.rectangle([cx1, cy1, cx2, cy2], fill=it["color"])
+            kw = {"font": font_tag} if font_tag else {}
+            draw_x.text((cx1 + pad, cy1 + pad - 1), tag, fill="white", **kw)
         except Exception as e:
-            log.debug(f"draw_box failed for {bbox} label={label!r}: {e}")
-            skipped += 1
-
-    # Refined grounding bbox first (it's the most trustworthy signal)
-    if pred.get("bbox_refined"):
-        draw_box(pred["bbox_refined"], "#FF3B30", "REFINED")
-
-    # Scene-graph proposals (cap to keep image readable)
-    for i, obj in enumerate(pred.get("scene_graph", {}).get("objects", [])[:8]):
-        color = _BBOX_COLORS[(i + 1) % len(_BBOX_COLORS)]
-        try:
-            label = f"{obj.get('entity', '?')} @ {obj.get('region', '?')}"
-        except Exception:
-            label = f"obj_{i}"
-        draw_box(obj.get("bbox"), color, label)
-
-    # LM-emitted <box> coords (often whole-image, but draw them for transparency)
-    for i, bb in enumerate(pred.get("bboxes_from_text", [])):
-        draw_box(bb, "#AF52DE", f"LM#{i+1}")
+            log.debug(f"tag draw failed: {e}")
+        it["_drawn"] = True
 
     if skipped:
-        log.info(
-            f"annotate_image: skipped {skipped} degenerate bboxes "
-            f"(width<{MIN_PX}px or height<{MIN_PX}px or out-of-order). "
-            "Symptom of undertrained SG generator — bboxes mode-collapsed."
-        )
+        log.info(f"annotate_image: skipped {skipped} degenerate bboxes")
 
-    # Answer overlay along the bottom (semi-transparent black bar)
+    # ------------------------------------------------------------------
+    # Pass 3: build extended canvas (X-ray + sidebar + bottom strip)
+    # ------------------------------------------------------------------
+    canvas_w = W + sidebar_w
+    canvas_h = H + bottom_h
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (24, 24, 24))
+    canvas.paste(xray, (0, 0))
+    draw = ImageDraw.Draw(canvas, "RGBA")
+
+    # Subtle divider lines so the panels feel intentional
+    draw.line([(W, 0), (W, canvas_h)], fill=(80, 80, 80), width=1)
+    draw.line([(0, H), (canvas_w, H)], fill=(80, 80, 80), width=1)
+
+    # ---- LEGEND in the right sidebar ----
     try:
-        ans = (pred.get("answer") or "")[:400]
-        if ans:
-            max_chars = max(40, W // 12)
-            words, lines, cur = ans.split(), [], ""
-            for w in words:
-                if len(cur) + len(w) + 1 <= max_chars:
-                    cur = (cur + " " + w).strip()
+        if items and font_legend:
+            x0 = W + 10
+            y = 12
+            if font_legend_title:
+                draw.text((x0, y), "Detections", fill=(220, 220, 220),
+                          font=font_legend_title)
+                y += fs_legend_title + 8
+            line_h = fs_legend + 6
+            max_text_w = sidebar_w - 30  # text region width
+            for it in items:
+                if not it.get("_drawn"):
+                    continue
+                # colored chip with the tag
+                chip = 16
+                draw.rectangle([x0, y, x0 + chip, y + chip], fill=it["color"])
+                if font_tag:
+                    tb = draw.textbbox((0, 0), it["tag"], font=font_tag)
+                    tx = x0 + (chip - (tb[2] - tb[0])) // 2
+                    ty = y + (chip - (tb[3] - tb[1])) // 2 - 1
+                    draw.text((tx, ty), it["tag"], fill="white", font=font_tag)
+                # entity + region text wrapped to fit the sidebar
+                tx0 = x0 + chip + 6
+                ent = it["entity"]
+                reg = it["region"]
+                count_suffix = f"  x{it['count']}" if it["count"] > 1 else ""
+                line1 = ent + count_suffix
+                line2 = f"@ {reg}" if reg and reg != "?" else ""
+                # truncate each line to fit
+                def _fit(s, max_w, f):
+                    if not s or not f:
+                        return s
+                    tb = draw.textbbox((0, 0), s, font=f)
+                    if tb[2] - tb[0] <= max_w:
+                        return s
+                    while s and (draw.textbbox((0, 0), s + ".", font=f)[2]
+                                 - draw.textbbox((0, 0), s + ".", font=f)[0]
+                                 > max_w):
+                        s = s[:-1]
+                    return s + "."
+                line1 = _fit(line1, max_text_w - chip - 6, font_legend)
+                line2 = _fit(line2, max_text_w - chip - 6, font_legend)
+                draw.text((tx0, y), line1, fill=(240, 240, 240),
+                          font=font_legend)
+                if line2:
+                    draw.text((tx0, y + line_h - 2), line2,
+                              fill=(170, 170, 170), font=font_legend)
+                    y += 2 * line_h + 4
                 else:
-                    lines.append(cur)
+                    y += line_h + 6
+                if y > canvas_h - 20:
+                    break
+    except Exception as e:
+        log.debug(f"legend draw failed: {e}")
+
+    # ---- ANSWER in the bottom strip ----
+    try:
+        ans = (pred.get("answer") or "").strip()
+        if ans and font_ans:
+            avail_w = canvas_w - 20
+            # naive word-wrap by pixel width
+            words = ans.split()
+            lines, cur = [], ""
+            for w in words:
+                trial = (cur + " " + w).strip()
+                tb = draw.textbbox((0, 0), trial, font=font_ans)
+                if tb[2] - tb[0] <= avail_w:
+                    cur = trial
+                else:
+                    if cur:
+                        lines.append(cur)
                     cur = w
             if cur:
                 lines.append(cur)
-            line_h = (font_ans.size + 6) if font_ans else 20
-            box_h = line_h * len(lines) + 16
-            draw.rectangle([0, H - box_h, W, H], fill=(0, 0, 0, 180))
+            line_h = fs_ans + 4
+            max_lines = max(1, (bottom_h - 16) // line_h)
+            lines = lines[:max_lines]
             for j, line in enumerate(lines):
-                y = H - box_h + 8 + j * line_h
-                kw = {"font": font_ans} if font_ans else {}
-                draw.text((10, y), line, fill="white", **kw)
+                draw.text((10, H + 8 + j * line_h), line,
+                          fill=(240, 240, 240), font=font_ans)
     except Exception as e:
         log.debug(f"answer overlay failed: {e}")
 
-    # Always return PNG bytes — even if everything above silently failed,
-    # we still have the original (unmarked) image.
     try:
-        return _encode_png(img)
+        return _encode_png(canvas)
     except Exception as e:
-        log.warning(f"PNG encode of annotated image failed: {e}; "
-                    "falling back to unmodified original")
+        log.warning(f"PNG encode failed: {e}; falling back to original")
         return _encode_png(pil.convert("RGB"))
 
 
