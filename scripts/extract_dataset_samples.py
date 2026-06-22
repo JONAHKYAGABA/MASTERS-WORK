@@ -604,20 +604,28 @@ def main():
                         "regardless of grade — fastest, guaranteed to find N.")
     p.add_argument("--out", type=Path, default=Path("dataset_samples"))
     p.add_argument("--chexpert_csv", type=Path, default=None,
-                   help="Path to mimic-cxr-2.0.0-chexpert.csv(.gz). "
-                        "If omitted, CheXpert dashboard shows '(not provided)'.")
+                   help="Override path to mimic-cxr-2.0.0-chexpert.csv(.gz). "
+                        "If omitted, looks for <jpg_root>/mimic-cxr-2.0.0-chexpert.csv.gz "
+                        "(same default as the training loader).")
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
     quality = None if args.quality.lower() in ("none", "", "all") else args.quality
 
-    chexpert = {}
-    if args.chexpert_csv:
-        chexpert = _load_chexpert(args.chexpert_csv)
-        print(f"[chexpert] loaded {len(chexpert)} studies from {args.chexpert_csv}",
+    # Resolve CheXpert CSV using the same fallback as data/mimic_cxr_dataset.py
+    chexpert_path = args.chexpert_csv
+    if chexpert_path is None:
+        for candidate in (args.jpg_root / "mimic-cxr-2.0.0-chexpert.csv.gz",
+                          args.jpg_root / "mimic-cxr-2.0.0-chexpert.csv"):
+            if candidate.exists():
+                chexpert_path = candidate
+                break
+    chexpert = _load_chexpert(chexpert_path) if chexpert_path else {}
+    if chexpert:
+        print(f"[chexpert] loaded {len(chexpert)} studies from {chexpert_path}",
               flush=True)
     else:
-        print("[chexpert] no --chexpert_csv provided, dashboards will be empty",
+        print("[chexpert] no CSV found, dashboards will say '(not provided)'",
               flush=True)
 
     samples = _scan_questions(args.qba_root, args.jpg_root, args.n, quality)
