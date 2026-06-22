@@ -160,59 +160,80 @@ def _scan_questions(
     quality: Optional[str],
     seed: int = 42,
 ) -> List[Dict[str, Any]]:
-    """Walk `questions/p**/p*/s*.json` and collect N samples that
-    satisfy the filters AND have both an image and a scene graph on disk."""
-    q_root = qba_root / "questions"
+    """Walk `qa/p**/p*/s*.qa.json` and collect N samples that satisfy the
+    filters AND have both an image and a scene graph on disk.
+
+    MIMIC-Ext-CXR-QBA actual layout (matches the training loader):
+      qa/p10/p10000032/s50414267.qa.json
+      scene_data/p10/p10000032/s50414267.scene_graph.json
+    """
+    q_root = qba_root / "qa"
     if not q_root.exists():
-        raise SystemExit(f"questions root not found: {q_root}")
-    # Use deterministic shuffle so re-runs give the same 10
+        raise SystemExit(f"qa root not found: {q_root}")
     rng = random.Random(seed)
-    all_q_files = list(q_root.glob("p*/p*/s*.json"))
-    rng.shuffle(all_q_files)
+    # Use iterator instead of materialising the full list (it's ~377K files)
+    # — shuffle a randomised view by sampling p-groups + patients in random
+    # order, but stop as soon as we have enough hits.
+    p_groups = sorted([p for p in q_root.iterdir()
+                       if p.is_dir() and p.name.startswith("p")])
+    rng.shuffle(p_groups)
     out = []
     scanned = 0
-    for qa_file in all_q_files:
-        scanned += 1
-        try:
-            study_id = int(qa_file.stem.lstrip("s"))
-            subject_id = int(qa_file.parent.name.lstrip("p"))
-        except Exception:
-            continue
-        try:
-            with open(qa_file) as f:
-                qa_data = json.load(f)
-        except Exception:
-            continue
-        img_path = _find_image(jpg_root, subject_id, study_id)
-        if img_path is None:
-            continue
-        sg_path = _find_scene_graph(qba_root, subject_id, study_id)
-        if sg_path is None:
-            continue
-        for q in qa_data.get("questions", []):
-            if quality:
-                ex_q = _qba_int_to_grade(q.get("extraction_quality"))
-                legacy = _qba_int_to_grade(q.get("question_quality", q.get("quality")))
-                grades = [g for g in (ex_q, legacy) if g]
-                qg = min(grades, key=lambda g: _GRADE_ORDER.get(g, 0)) if grades else "B"
-                if _GRADE_ORDER.get(qg, 0) < _GRADE_ORDER.get(quality, 0):
+    for p_group in p_groups:
+        patients = [p for p in p_group.iterdir()
+                    if p.is_dir() and p.name.startswith("p")]
+        rng.shuffle(patients)
+        for patient_dir in patients:
+            qa_files = list(patient_dir.glob("s*.qa.json"))
+            rng.shuffle(qa_files)
+            for qa_file in qa_files:
+                scanned += 1
+                try:
+                    subject_id = int(patient_dir.name[1:])
+                    # stem is "s50414267.qa" -> first split is "s50414267"
+                    study_id = int(qa_file.stem.split(".")[0][1:])
+                except Exception:
                     continue
-            out.append({
-                "subject_id": subject_id,
-                "study_id": study_id,
-                "image_path": img_path,
-                "scene_graph_path": sg_path,
-                "question_id": q.get("question_id", ""),
-                "question": q.get("question", ""),
-                "question_type": q.get("question_type", "?"),
-                "answers": q.get("answers", []),
-                "quality": qg if quality else None,
-                "obs_ids": q.get("obs_ids", []),
-            })
-            break  # one question per study
-        if len(out) >= n:
-            break
-    print(f"scanned {scanned} files, collected {len(out)} samples", file=sys.stderr)
+                try:
+                    with open(qa_file) as f:
+                        qa_data = json.load(f)
+                except Exception:
+                    continue
+                img_path = _find_image(jpg_root, subject_id, study_id)
+                if img_path is None:
+                    continue
+                sg_path = _find_scene_graph(qba_root, subject_id, study_id)
+                if sg_path is None:
+                    continue
+                for q in qa_data.get("questions", []):
+                    qg = None
+                    if quality:
+                        ex_q = _qba_int_to_grade(q.get("extraction_quality"))
+                        legacy = _qba_int_to_grade(
+                            q.get("question_quality", q.get("quality")))
+                        grades = [g for g in (ex_q, legacy) if g]
+                        qg = (min(grades, key=lambda g: _GRADE_ORDER.get(g, 0))
+                              if grades else "B")
+                        if _GRADE_ORDER.get(qg, 0) < _GRADE_ORDER.get(quality, 0):
+                            continue
+                    out.append({
+                        "subject_id": subject_id,
+                        "study_id": study_id,
+                        "image_path": img_path,
+                        "scene_graph_path": sg_path,
+                        "question_id": q.get("question_id", ""),
+                        "question": q.get("question", ""),
+                        "question_type": q.get("question_type", "?"),
+                        "answers": q.get("answers", []),
+                        "quality": qg,
+                        "obs_ids": q.get("obs_ids", []),
+                    })
+                    break  # one question per study
+                if len(out) >= n:
+                    print(f"scanned {scanned} qa files, collected {len(out)}",
+                          file=sys.stderr)
+                    return out
+    print(f"scanned {scanned} qa files, collected {len(out)}", file=sys.stderr)
     return out
 
 
