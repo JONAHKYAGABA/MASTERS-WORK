@@ -43,6 +43,24 @@ _COLORS = [
 
 _GRADE_ORDER = {"A++": 5, "A+": 4, "A": 3, "B+": 2, "B": 1, "C": 0, "D": -1}
 
+# Per-criterion int -> letter grade mapping. Copied verbatim from
+# data/mimic_cxr_dataset.py (QBA_CRITERION_INT_GRADES) so this script is
+# self-contained. QBA stores quality as positional ints into each
+# criterion's ordered enum, and the scale differs PER criterion -- a flat
+# {0:D, 1:C, ...} mapping is wrong and rejects all A-grade samples.
+_QBA_INT_GRADES = {
+    'region_extract_quality': ['B', 'B', 'A', 'A', 'A++'],
+    'entity_extract_quality': ['B', 'A', 'A++'],
+    'sentence_name_quality':  ['B', 'A', 'A++'],
+    'change_quality':         ['B', 'A', 'A', 'A++'],
+    'general_issue_level':    ['D', 'C', 'B', 'A', 'A+', 'A++'],
+    'localization_quality':   ['B', 'B', 'A', 'A++', 'A++'],
+    # legacy aliases for older dumps
+    'region_quality':         ['B', 'B', 'A', 'A', 'A++'],
+    'entity_quality':         ['B', 'A', 'A++'],
+    'issue_level':            ['D', 'C', 'B', 'A', 'A+', 'A++'],
+}
+
 
 def _try_font(size: int) -> Optional[ImageFont.FreeTypeFont]:
     for p in (
@@ -59,26 +77,34 @@ def _try_font(size: int) -> Optional[ImageFont.FreeTypeFont]:
     return None
 
 
-def _qba_int_to_grade(v: Any) -> Optional[str]:
-    """QBA stores per-criterion quality as int 0-4.  Pick the worst across
-    all criteria and map to a letter grade.  Returns None if v is empty or
-    can't be interpreted."""
-    if v is None:
+def _qba_dict_to_grade(d: Any) -> Optional[str]:
+    """Map a QBA quality dict (per-criterion ints OR strings) to the worst
+    letter grade across criteria. Returns None if nothing parseable."""
+    if isinstance(d, str):
+        return d if d in _GRADE_ORDER else None
+    if not isinstance(d, dict):
         return None
-    if isinstance(v, str):
-        return v if v in _GRADE_ORDER else None
-    if isinstance(v, int):
-        return ["D", "C", "B", "A", "A++"][max(0, min(4, v))]
-    if isinstance(v, dict):
-        grades = []
-        for cv in v.values():
-            g = _qba_int_to_grade(cv)
-            if g:
-                grades.append(g)
-        if not grades:
-            return None
-        return min(grades, key=lambda g: _GRADE_ORDER.get(g, 0))
-    return None
+    if isinstance(d.get('overall'), str):
+        return d['overall']
+    if isinstance(d.get('grade'), str):
+        return d['grade']
+    grades: List[str] = []
+    for k, v in d.items():
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, int):
+            enum = _QBA_INT_GRADES.get(k)
+            if enum and 0 <= v < len(enum):
+                grades.append(enum[v])
+        elif isinstance(v, str) and v in _GRADE_ORDER:
+            grades.append(v)
+        elif isinstance(v, dict):
+            sub = _qba_dict_to_grade(v)
+            if sub:
+                grades.append(sub)
+    if not grades:
+        return None
+    return min(grades, key=lambda g: _GRADE_ORDER.get(g, 0))
 
 
 def _find_image(jpg_root: Path, subject_id: int, study_id: int) -> Optional[Path]:
@@ -191,8 +217,8 @@ def _scan_questions(
                 for q in qa_data.get("questions", []):
                     qg = None
                     if quality:
-                        ex_q = _qba_int_to_grade(q.get("extraction_quality"))
-                        legacy = _qba_int_to_grade(
+                        ex_q = _qba_dict_to_grade(q.get("extraction_quality"))
+                        legacy = _qba_dict_to_grade(
                             q.get("question_quality", q.get("quality")))
                         grades = [g for g in (ex_q, legacy) if g]
                         qg = (min(grades, key=lambda g: _GRADE_ORDER.get(g, 0))
@@ -421,8 +447,10 @@ def main():
     p.add_argument("--jpg_root", required=True, type=Path,
                    help="data/mimic-cxr-jpg")
     p.add_argument("--n", type=int, default=10)
-    p.add_argument("--quality", default="A",
-                   help="Minimum grade (A++, A+, A, B+, B, C, D, or 'none')")
+    p.add_argument("--quality", default="none",
+                   help="Minimum grade (A++, A+, A, B+, B, C, D, or 'none'). "
+                        "Default 'none' = take first N studies in lex order "
+                        "regardless of grade — fastest, guaranteed to find N.")
     p.add_argument("--out", type=Path, default=Path("dataset_samples"))
     args = p.parse_args()
 
