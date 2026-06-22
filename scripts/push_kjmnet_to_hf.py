@@ -24,7 +24,7 @@ from pathlib import Path
 from huggingface_hub import HfApi, create_repo, login
 
 
-REPO_ID = "KYAGABA/kjmnet"
+REPO_ID = "kyagabajonah352/kjmnet"
 REPO_TYPE = "model"
 
 # (local checkpoint dir, sub-folder name in the HF repo, short description)
@@ -99,11 +99,11 @@ def main() -> int:
     api = HfApi(token=token)
 
     # Create repo if absent (idempotent — exist_ok=True)
-    print(f"\nCreating / verifying repo {REPO_ID} (public)...")
+    print(f"\nCreating / verifying repo {REPO_ID} (PRIVATE)...")
     create_repo(
         repo_id=REPO_ID,
         repo_type=REPO_TYPE,
-        private=False,
+        private=True,
         exist_ok=True,
         token=token,
     )
