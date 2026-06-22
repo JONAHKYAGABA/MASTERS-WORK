@@ -132,14 +132,15 @@ def _extract_gt_observations(
     image_h: int,
     dicom_id: Optional[str],
 ) -> List[Dict[str, Any]]:
-    """Pull (entity, region, bbox_normalised, positiveness) per observation.
-    Skips observations without a real localisation bbox so the visualisation
-    only shows boxes that were actually grounded."""
+    """Pull (entity, region, bbox_normalised, raw_bbox, positiveness) per
+    observation.  Skips observations without a real localisation bbox so the
+    visualisation only shows boxes that were actually grounded."""
     observations = scene_graph.get("observations", {})
     out = []
     for obs_id, obs in observations.items():
         loc = obs.get("localization") or {}
         bbox = None
+        raw_bbox = None
         if isinstance(loc, dict) and loc:
             img_loc = loc.get(dicom_id) if dicom_id and dicom_id in loc else next(iter(loc.values()), {})
             if isinstance(img_loc, dict):
@@ -147,7 +148,8 @@ def _extract_gt_observations(
                 if bboxes:
                     raw = bboxes[0]
                     if len(raw) == 4:
-                        x1, y1, x2, y2 = (float(v) for v in raw)
+                        raw_bbox = [float(v) for v in raw]
+                        x1, y1, x2, y2 = raw_bbox
                         x1, x2 = sorted((x1, x2))
                         y1, y2 = sorted((y1, y2))
                         if image_w > 0 and image_h > 0:
@@ -173,9 +175,67 @@ def _extract_gt_observations(
             "entity": str(entity),
             "region": str(region),
             "bbox": bbox,
+            "raw_bbox": raw_bbox,
             "positiveness": obs.get("positiveness", "?"),
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# CheXpert labels (separate from scene graph -- per-study CSV).
+# CSV columns: subject_id, study_id, then 14 finding columns with values:
+#   1.0 = positive, 0.0 = negative (mentioned as absent),
+#   -1.0 = uncertain, NaN/empty = not mentioned in report.
+# ---------------------------------------------------------------------------
+CHEXPERT_CATEGORIES = [
+    "Atelectasis", "Cardiomegaly", "Consolidation", "Edema",
+    "Enlarged Cardiomediastinum", "Fracture", "Lung Lesion", "Lung Opacity",
+    "No Finding", "Pleural Effusion", "Pleural Other", "Pneumonia",
+    "Pneumothorax", "Support Devices",
+]
+
+
+def _load_chexpert(csv_path: Path) -> Dict[Tuple[int, int], Dict[str, float]]:
+    """Load CheXpert CSV into {(subject_id, study_id): {category: value}}.
+    Returns empty dict if file is missing or unreadable."""
+    if not csv_path or not csv_path.exists():
+        return {}
+    import csv
+    import gzip
+    opener = gzip.open if str(csv_path).endswith(".gz") else open
+    out: Dict[Tuple[int, int], Dict[str, float]] = {}
+    with opener(csv_path, "rt") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                key = (int(row["subject_id"]), int(row["study_id"]))
+            except (KeyError, ValueError):
+                continue
+            vals: Dict[str, float] = {}
+            for cat in CHEXPERT_CATEGORIES:
+                v = row.get(cat, "").strip()
+                if v == "" or v.lower() == "nan":
+                    vals[cat] = float("nan")
+                else:
+                    try:
+                        vals[cat] = float(v)
+                    except ValueError:
+                        vals[cat] = float("nan")
+            out[key] = vals
+    return out
+
+
+def _chexpert_value_label(v: float) -> Tuple[str, Tuple[int, int, int]]:
+    """Render a CheXpert value as (text, RGB color)."""
+    if v != v:  # NaN
+        return ("not mentioned", (110, 110, 110))
+    if v == 1.0:
+        return ("POSITIVE", (220, 60, 60))
+    if v == 0.0:
+        return ("negative", (60, 160, 70))
+    if v == -1.0:
+        return ("uncertain", (220, 170, 40))
+    return (f"{v}", (180, 180, 180))
 
 
 def _scan_questions(
@@ -353,9 +413,10 @@ def _render_scene_graph(sample: Dict[str, Any], observations: List[Dict[str, Any
 
 def _write_text_bundle(sample: Dict[str, Any],
                        observations: List[Dict[str, Any]],
+                       chexpert_row: Optional[Dict[str, float]],
                        out_path: Path) -> None:
-    """Write question, answer, metadata, and the full observation list to a
-    plain-text file readable in any editor."""
+    """Write question, answer, metadata, observations, CheXpert labels.
+    Plain text, readable in any editor."""
     ans_text = _main_answer_text(sample["answers"])
     lines = [
         f"sample id           : {sample.get('_idx', '?')}",
@@ -399,6 +460,11 @@ def _write_text_bundle(sample: Dict[str, Any],
         "=" * 70,
         f"OBSERVATIONS (ground-truth scene graph) — {len(observations)} localised",
         "=" * 70,
+        "raw_bbox is what's literally in scene_graph.json (pixel coords).",
+        "normalised is raw_bbox / image_size, used to draw on the viz.",
+        "Imprecise placements come from QBA's localization_quality<3 entries",
+        "(NO_LOCALIZATION / FALLBACK / INCOMPLETE) — not a viz bug.",
+        "",
     ]
     if not observations:
         lines.append("(no observations with localisation bboxes)")
@@ -408,17 +474,98 @@ def _write_text_bundle(sample: Dict[str, Any],
             f"  [{i}] entity={obs['entity']!r}  region={obs['region']!r}  "
             f"positiveness={obs['positiveness']!r}"
         )
+        if obs.get("raw_bbox"):
+            r = obs["raw_bbox"]
+            lines.append(
+                f"       raw_bbox(px xyxy)       = "
+                f"[{r[0]:.1f}, {r[1]:.1f}, {r[2]:.1f}, {r[3]:.1f}]"
+            )
         lines.append(
-            f"       bbox(normalised xyxy) = "
+            f"       bbox(normalised xyxy)   = "
             f"[{x1:.3f}, {y1:.3f}, {x2:.3f}, {y2:.3f}]"
         )
+
+    # CheXpert section
+    lines += [
+        "",
+        "=" * 70,
+        "CHEXPERT LABELS (per-study, from mimic-cxr-2.0.0-chexpert.csv)",
+        "=" * 70,
+        "Values: 1.0 = positive, 0.0 = negative (mentioned absent),",
+        "       -1.0 = uncertain, NaN/empty = not mentioned in report.",
+        "",
+    ]
+    if chexpert_row is None:
+        lines.append("(no CheXpert CSV provided OR study not found in CSV)")
+    else:
+        for cat in CHEXPERT_CATEGORIES:
+            v = chexpert_row.get(cat, float("nan"))
+            label, _ = _chexpert_value_label(v)
+            lines.append(f"  {cat:<30s} {v!s:>6s}   {label}")
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _render_sample(sample: Dict[str, Any], out_dir: Path, sample_id: int) -> None:
-    """Emit three artifacts for one sample: clean X-ray, scene-graph viz,
-    text bundle."""
+def _render_chexpert(sample: Dict[str, Any],
+                     chexpert_row: Optional[Dict[str, float]],
+                     out_path: Path) -> None:
+    """Render the 14 CheXpert labels for this study as a compact dashboard
+    PNG: one row per category with a colored value chip."""
+    cell_h = 28
+    title_h = 36
+    pad = 12
+    W = 520
+    H = title_h + cell_h * len(CHEXPERT_CATEGORIES) + 2 * pad
+    canvas = Image.new("RGB", (W, H), (24, 24, 24))
+    draw = ImageDraw.Draw(canvas)
+    font_title = _try_font(15)
+    font = _try_font(13)
+    font_b = _try_font(13)
+
+    sid = sample["study_id"]
+    title = f"CheXpert labels — study {sid}"
+    if font_title:
+        draw.text((pad, pad), title, fill=(230, 230, 230), font=font_title)
+        sub = f"subject {sample['subject_id']}"
+        draw.text((pad, pad + 18), sub, fill=(140, 140, 140), font=font)
+
+    y = pad + title_h
+    draw.line([(pad, y - 4), (W - pad, y - 4)], fill=(60, 60, 60), width=1)
+
+    if chexpert_row is None:
+        draw.text((pad, y + 4),
+                  "(CheXpert CSV not provided or study not in CSV)",
+                  fill=(200, 120, 120), font=font)
+        canvas.save(out_path, format="PNG")
+        return
+
+    for cat in CHEXPERT_CATEGORIES:
+        v = chexpert_row.get(cat, float("nan"))
+        label, color = _chexpert_value_label(v)
+        # category name
+        draw.text((pad, y + 6), cat, fill=(220, 220, 220), font=font)
+        # value chip on the right
+        chip_w, chip_h = 130, cell_h - 8
+        cx1 = W - pad - chip_w
+        cy1 = y + 4
+        draw.rectangle([cx1, cy1, cx1 + chip_w, cy1 + chip_h], fill=color)
+        if font_b:
+            tb = draw.textbbox((0, 0), label, font=font_b)
+            tx = cx1 + (chip_w - (tb[2] - tb[0])) // 2
+            ty = cy1 + (chip_h - (tb[3] - tb[1])) // 2 - 1
+            draw.text((tx, ty), label, fill="white", font=font_b)
+        # divider
+        draw.line([(pad, y + cell_h), (W - pad, y + cell_h)],
+                  fill=(50, 50, 50), width=1)
+        y += cell_h
+
+    canvas.save(out_path, format="PNG")
+
+
+def _render_sample(sample: Dict[str, Any], out_dir: Path, sample_id: int,
+                   chexpert_row: Optional[Dict[str, float]] = None) -> None:
+    """Emit four artifacts for one sample: clean X-ray, scene-graph viz,
+    CheXpert dashboard, text bundle."""
     sample["_idx"] = sample_id
     base = f"sample_{sample_id:02d}"
 
@@ -435,9 +582,13 @@ def _render_sample(sample: Dict[str, Any], out_dir: Path, sample_id: int) -> Non
     sg_path = out_dir / f"{base}_scenegraph.png"
     _render_scene_graph(sample, observations, sg_path, render_size)
 
-    # 3. text bundle
+    # 3. CheXpert dashboard
+    chx_path = out_dir / f"{base}_chexpert.png"
+    _render_chexpert(sample, chexpert_row, chx_path)
+
+    # 4. text bundle (includes scene-graph + CheXpert)
     txt_path = out_dir / f"{base}.txt"
-    _write_text_bundle(sample, observations, txt_path)
+    _write_text_bundle(sample, observations, chexpert_row, txt_path)
 
 
 def main():
@@ -452,10 +603,22 @@ def main():
                         "Default 'none' = take first N studies in lex order "
                         "regardless of grade — fastest, guaranteed to find N.")
     p.add_argument("--out", type=Path, default=Path("dataset_samples"))
+    p.add_argument("--chexpert_csv", type=Path, default=None,
+                   help="Path to mimic-cxr-2.0.0-chexpert.csv(.gz). "
+                        "If omitted, CheXpert dashboard shows '(not provided)'.")
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
     quality = None if args.quality.lower() in ("none", "", "all") else args.quality
+
+    chexpert = {}
+    if args.chexpert_csv:
+        chexpert = _load_chexpert(args.chexpert_csv)
+        print(f"[chexpert] loaded {len(chexpert)} studies from {args.chexpert_csv}",
+              flush=True)
+    else:
+        print("[chexpert] no --chexpert_csv provided, dashboards will be empty",
+              flush=True)
 
     samples = _scan_questions(args.qba_root, args.jpg_root, args.n, quality)
     if not samples:
@@ -464,14 +627,17 @@ def main():
     index = []
     for i, s in enumerate(samples, 1):
         try:
-            _render_sample(s, args.out, i)
+            chx_row = chexpert.get((s["subject_id"], s["study_id"]))
+            _render_sample(s, args.out, i, chexpert_row=chx_row)
             base = f"sample_{i:02d}"
             print(f"[render {i:>2d}/{len(samples)}] wrote {base}_image.png, "
-                  f"{base}_scenegraph.png, {base}.txt", flush=True)
+                  f"{base}_scenegraph.png, {base}_chexpert.png, {base}.txt",
+                  flush=True)
             index.append({
                 "id": i,
                 "image_png": f"{base}_image.png",
                 "scene_graph_png": f"{base}_scenegraph.png",
+                "chexpert_png": f"{base}_chexpert.png",
                 "text_bundle": f"{base}.txt",
                 "subject_id": s["subject_id"],
                 "study_id": s["study_id"],
@@ -479,6 +645,7 @@ def main():
                 "question_type": s["question_type"],
                 "quality": s.get("quality"),
                 "answers": [a.get("text", "") for a in s["answers"]],
+                "chexpert_available": chx_row is not None,
                 "source_image_path": str(s["image_path"]),
                 "source_scene_graph_path": str(s["scene_graph_path"]),
             })
@@ -486,7 +653,7 @@ def main():
             print(f"FAILED sample {i}: {e}", file=sys.stderr)
 
     (args.out / "index.json").write_text(json.dumps(index, indent=2))
-    print(f"\nwrote {len(index)} samples (3 files each) + index.json to {args.out}")
+    print(f"\nwrote {len(index)} samples (4 files each) + index.json to {args.out}")
 
 
 if __name__ == "__main__":
