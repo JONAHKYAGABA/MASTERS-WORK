@@ -133,14 +133,15 @@ def main() -> int:
         size_gb = sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / 1e9
         print(f"\nUploading {local_dir}  ({size_gb:.1f} GB)  -> {hf_subfolder}/")
         print(f"  {desc}")
-        # upload_large_folder = parallel multi-file upload with resume
-        api.upload_large_folder(
+        # upload_folder supports path_in_repo (upload_large_folder does NOT).
+        # Xet transfer backend handles 13 GB files efficiently with built-in
+        # SHA dedup so re-runs skip already-uploaded blobs automatically.
+        api.upload_folder(
             folder_path=str(p),
             repo_id=REPO_ID,
             repo_type=REPO_TYPE,
             path_in_repo=hf_subfolder,
-            # don't upload the optimizer state — saves ~30% upload bandwidth
-            # and isn't useful for inference-only consumers
+            commit_message=f"Add {hf_subfolder}: {desc}",
             ignore_patterns=["optimizer.bin", "scheduler.bin", "training_state.json"],
         )
         print(f"  Done. Visit: https://huggingface.co/{REPO_ID}/tree/main/{hf_subfolder}")
