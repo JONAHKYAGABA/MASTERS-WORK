@@ -59,6 +59,18 @@ data:
   quality_grade: "A"
   view_filter: "frontal_only"
   question_types: null
+  # Drop question types that ask about report free-text (indication, history,
+  # technique, comparison-with-prior). These confuse a vision model because
+  # the answer lives in the report, not the image. Keep C0*, D0*, etc.
+  skip_question_types:
+    - A_indication
+    - A_history
+    - A_technique
+    - A_comparison
+
+  # Bumped from 250 -> 1000 so a single eval can distinguish runs with
+  # better than +/-6pp 95% CI (binomial). Roughly 4x eval wall-clock.
+  val_samples: 1000
 
   use_exports: true
   export_grade: "A_frontal"
@@ -72,44 +84,53 @@ data:
 training:
   output_dir: "./checkpoints/mimic-cxr-vqa-stage4-finetune"
 
-  # CRITICAL: selects finetune loss recipe (gen=1.0, grd=3.0, vqa=0.05, chex=0.05)
+  # CRITICAL: selects finetune loss recipe (gen=1.0, grd=3.0, vqa=0.05, chex=0.3)
   # Also makes the trainer's freeze_sg_generator logic kick in.
   phase: "finetune"
 
   batch_size_per_gpu: 2
   gradient_accumulation_steps: 4
 
-  # 2 epochs on the A-grade subset (~76K samples after dedup) — much smaller
-  # than B-grade's ~192K, so each epoch is ~3-4h instead of 10h.
-  num_epochs: 2
+  # 1 epoch on A-grade. Was 2; the second epoch overfits hard
+  # (Val Acc 0.464 E1 -> 0.384 E2 first eval -> 0.336 E2 final).
+  # Combined with EMA + halved LR + tighter eval cadence this should hold
+  # the peak instead of degrading past it.
+  num_epochs: 1
 
-  # Lower than Stage 3's 2e-5: A-grade is cleaner so smaller updates suffice;
-  # also reduces risk of unlearning what Stage 3 established.
-  learning_rate: 1.0e-5
-  weight_decay: 0.01
+  # Halved from prior 1e-5. Slower, smoother updates on the cleaner A-grade
+  # subset; reduces the late-stage drift that produced the E2 cliff.
+  learning_rate: 5.0e-6
+  weight_decay: 0.05               # bumped from 0.01 for stronger regularisation
   warmup_ratio: 0.05
   max_grad_norm: 1.0
 
   fp16: true
   gradient_checkpointing: false
 
+  # EMA decay for the shadow weights used during validation + best-model save.
+  # 0.999 -> ~1000-update window, matches typical fine-tune cadence.
+  ema_decay: 0.999
+
   # =====================================================
   # STAGE 4 LOSS WEIGHTS — finetune (grd boosted to 3.0)
   # =====================================================
   vqa_loss_weight: 0.05
   generation_loss_weight: 1.0
-  chexpert_loss_weight: 0.05
-  scene_graph_loss_weight: 0.0      # SG frozen
-  grounding_loss_weight: 3.0        # PRIMARY — boosted from Stage 3's 2.0
+  chexpert_loss_weight: 0.3        # bumped from 0.05; was vestigial
+                                   # (AUROC oscillated 0.50-0.69 because the
+                                   # head got almost no gradient).
+  scene_graph_loss_weight: 0.0     # SG frozen
+  grounding_loss_weight: 3.0       # PRIMARY — boosted from Stage 3's 2.0
   binary_head_weight: 0.1
   category_head_weight: 0.1
   region_head_weight: 0.1
   severity_head_weight: 0.1
 
   logging_steps: 100
-  save_steps: 3000   # smaller A-grade pool → save more frequently to track best
-  save_total_limit: 3
-  eval_steps: 1500
+  save_steps: 1000                 # was 3000; finer granularity catches peak
+  save_total_limit: 5              # bumped to keep more peak candidates
+  eval_steps: 500                  # was 1500; 3x more eval signal to pinpoint
+                                   # the true peak before degradation
 
   dataloader_num_workers: 2
   dataloader_pin_memory: true

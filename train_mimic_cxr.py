@@ -410,6 +410,74 @@ def init_wandb(config: MIMICCXRVQAConfig) -> Optional[Any]:
     return run
 
 
+class EMAModel:
+    """Tiny exponential-moving-average wrapper around a model's parameters.
+
+    Why a custom class instead of timm.utils.ModelEma: the trainer has zero
+    EMA infra today, and pulling in timm just for this is overkill. We hold
+    a CPU-side shadow copy of every parameter (avoids ~+8 GB VRAM with a
+    Qwen3-VL-8B base), update after each optimiser step, and provide
+    swap_in / swap_out for validation + save_checkpoint.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        # State dict only (no autograd, no buffers we don't need). Stored on
+        # CPU because the EMA copy is the same size as the trainable params
+        # and Turing GPUs are tight enough already.
+        self.shadow: Dict[str, torch.Tensor] = {
+            k: v.detach().cpu().clone()
+            for k, v in self._iter_params(model)
+        }
+        self._backup: Dict[str, torch.Tensor] = {}
+
+    @staticmethod
+    def _iter_params(model: nn.Module):
+        """Iterate trainable parameters only. Skips buffers (running stats,
+        positional ids, etc.) which the optimiser doesn't touch."""
+        target = model.module if hasattr(model, 'module') else model
+        for k, v in target.state_dict().items():
+            if torch.is_floating_point(v):
+                yield k, v
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        d = self.decay
+        for k, v in self._iter_params(model):
+            if k not in self.shadow:
+                self.shadow[k] = v.detach().cpu().clone()
+                continue
+            # shadow = d * shadow + (1-d) * v  (on CPU)
+            self.shadow[k].mul_(d).add_(v.detach().cpu(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def swap_in(self, model: nn.Module) -> None:
+        """Replace model's live parameters with EMA shadow; remember the
+        live values in ``_backup`` so swap_out can restore them."""
+        target = model.module if hasattr(model, 'module') else model
+        live = target.state_dict()
+        self._backup = {}
+        for k in self.shadow:
+            if k in live:
+                self._backup[k] = live[k].detach().clone()
+                live[k].copy_(self.shadow[k].to(live[k].device, dtype=live[k].dtype))
+
+    @torch.no_grad()
+    def swap_out(self, model: nn.Module) -> None:
+        if not self._backup:
+            return
+        target = model.module if hasattr(model, 'module') else model
+        live = target.state_dict()
+        for k, v in self._backup.items():
+            if k in live:
+                live[k].copy_(v)
+        self._backup = {}
+
+    def shadow_state_dict(self) -> Dict[str, torch.Tensor]:
+        """Return a CPU-side copy of the EMA weights for saving."""
+        return {k: v.clone() for k, v in self.shadow.items()}
+
+
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -418,7 +486,8 @@ def save_checkpoint(
     global_step: int,
     metrics: Dict[str, float],
     config: MIMICCXRVQAConfig,
-    is_best: bool = False
+    is_best: bool = False,
+    ema_model: Optional["EMAModel"] = None,
 ):
     """Save model checkpoint."""
     checkpoint_dir = Path(config.training.output_dir)
@@ -460,6 +529,18 @@ def save_checkpoint(
     checkpoint_path = checkpoint_dir / f"checkpoint-{global_step}"
     checkpoint_path.mkdir(exist_ok=True)
     torch.save(checkpoint, checkpoint_path / "pytorch_model.bin")
+
+    # Save EMA shadow weights alongside (small, ~same size as trainable params).
+    # serve_app can load this in place of pytorch_model.bin for the smoothed
+    # version of the model.
+    if ema_model is not None:
+        try:
+            torch.save(
+                {'model_state_dict': ema_model.shadow_state_dict()},
+                checkpoint_path / "pytorch_model_ema.bin",
+            )
+        except Exception as _e:
+            logger.warning(f"Could not save EMA weights: {_e}")
     
     # Save config
     with open(checkpoint_path / "config.json", 'w') as f:
@@ -504,28 +585,81 @@ def save_checkpoint(
     except Exception as e:
         logger.warning(f"Could not persist wandb run_id: {e}")
 
-    # Save best model
+    # ------------------------------------------------------------------
+    # Best-model pointer (replaces the old in-place byte copy).
+    #
+    # Old behaviour: torch.save(...) into best_model/pytorch_model.bin,
+    #                overwriting on every is_best=True. Created an ambiguity
+    #                where a later eval that happened to score above the
+    #                running max could clobber the actual peak checkpoint
+    #                bytes (e.g. Stage 4 E2 first-eval overwrote E1's 0.464
+    #                peak with a 0.384 model).
+    #
+    # New behaviour: write best_model/checkpoint_step.txt containing just the
+    #                global_step number. The numbered checkpoint
+    #                (checkpoint-{global_step}/) stays intact, and
+    #                serve_app._resolve_best_pointer() reads the pointer to
+    #                load the correct weights. _cleanup_old_checkpoints()
+    #                must NOT delete the checkpoint the pointer references.
+    # ------------------------------------------------------------------
     if is_best:
         best_path = checkpoint_dir / "best_model"
         best_path.mkdir(exist_ok=True)
-        torch.save(checkpoint, best_path / "pytorch_model.bin")
+        (best_path / "checkpoint_step.txt").write_text(f"{global_step}\n")
         with open(best_path / "config.json", 'w') as f:
             json.dump(config.to_dict(), f, indent=2)
-        logger.info(f"Saved best model to {best_path}")
+        # Record which metrics this is the best for so the dir is
+        # self-describing without grepping training logs.
+        with open(best_path / "training_metadata.json", 'w') as f:
+            json.dump({
+                'epoch': epoch,
+                'global_step': global_step,
+                'metrics': metrics,
+                'timestamp': datetime.now().isoformat(),
+                'note': "best_model is a pointer; load checkpoint-{global_step}/ "
+                        "instead, or use scripts/serve_app.py which resolves "
+                        "checkpoint_step.txt automatically.",
+            }, f, indent=2)
+        logger.info(
+            f"Saved best-model pointer at {best_path}/checkpoint_step.txt "
+            f"-> checkpoint-{global_step}"
+        )
 
     # Clean up old checkpoints
     _cleanup_old_checkpoints(checkpoint_dir, config.training.save_total_limit)
 
 
 def _cleanup_old_checkpoints(checkpoint_dir: Path, keep_last: int = 5):
-    """Remove old checkpoints, keeping only the most recent ones."""
+    """Remove old checkpoints, keeping only the most recent ones AND the
+    checkpoint that ``best_model/checkpoint_step.txt`` points at (so the
+    best-model pointer never becomes dangling).
+    """
     checkpoints = sorted(
         [d for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")],
         key=lambda x: int(x.name.split("-")[1])
     )
-    
-    # Remove old checkpoints
+
+    # Resolve the best-pointer (if any) so we don't delete its referent.
+    protected_step: Optional[int] = None
+    pointer = checkpoint_dir / "best_model" / "checkpoint_step.txt"
+    if pointer.exists():
+        try:
+            protected_step = int(pointer.read_text().strip())
+        except (ValueError, OSError):
+            protected_step = None
+
+    # Remove old checkpoints (skip the best-pointer target)
     for checkpoint in checkpoints[:-keep_last]:
+        try:
+            step = int(checkpoint.name.split("-")[1])
+        except ValueError:
+            step = None
+        if protected_step is not None and step == protected_step:
+            logger.info(
+                f"Skip cleanup of {checkpoint} (referenced by "
+                f"best_model/checkpoint_step.txt)"
+            )
+            continue
         import shutil
         shutil.rmtree(checkpoint)
         logger.info(f"Removed old checkpoint: {checkpoint}")
@@ -794,8 +928,11 @@ def train_epoch(
     scaler: Optional[GradScaler] = None,
     global_step: int = 0,
     local_rank: int = 0,
-    use_deepspeed: bool = False
-) -> tuple[float, int]:
+    use_deepspeed: bool = False,
+    ema_model: Optional["EMAModel"] = None,
+    val_dataloader: Optional[DataLoader] = None,
+    best_metric: float = 0.0,
+) -> tuple[float, int, float]:
     """
     Train for one epoch with gradient accumulation support.
     
@@ -1095,10 +1232,15 @@ def train_epoch(
                 # Update scheduler per optimizer step
                 if scheduler is not None:
                     scheduler.step()
-                
+
+                # EMA update — once per actual optimiser step (after grad-accum
+                # boundary). Cheap (CPU copy) but adds nothing if disabled.
+                if ema_model is not None:
+                    ema_model.update(model)
+
                 # Zero gradients for next accumulation
                 optimizer.zero_grad()
-                
+
                 # Track loss per actual step
                 total_loss += accumulated_loss
                 accumulated_loss = 0.0
@@ -1233,6 +1375,7 @@ def train_epoch(
                     metrics={'train_loss_running': total_loss / max(num_batches, 1)},
                     config=config,
                     is_best=False,
+                    ema_model=ema_model,
                 )
                 logger.info(
                     f"[mid-epoch] saved checkpoint at step {global_step} "
@@ -1250,6 +1393,81 @@ def train_epoch(
                     )
             except Exception as e:
                 logger.error(f"Mid-epoch save failed (continuing training): {e}")
+
+        # ------------------------------------------------------------------
+        # MID-EPOCH VALIDATION
+        # Triggered on every config.training.eval_steps boundary. Without
+        # this, val only runs at end-of-epoch -- with num_epochs=1 (Stage 4
+        # retrain recipe) that means a single val read total, no way to
+        # catch the peak before degradation. validate() must be called by
+        # ALL ranks (DDP barrier inside), but best-tracking + save happen
+        # only on rank 0.
+        # ------------------------------------------------------------------
+        _eval_steps_cfg = int(getattr(config.training, 'eval_steps', 0) or 0)
+        if (
+            val_dataloader is not None
+            and _eval_steps_cfg > 0
+            and global_step > 0
+            and global_step % _eval_steps_cfg == 0
+        ):
+            # Swap EMA in for validation (smoothed weights), restore after.
+            if ema_model is not None:
+                ema_model.swap_in(model)
+            try:
+                _val_metrics = validate(
+                    model=model,
+                    dataloader=val_dataloader,
+                    criterion=criterion,
+                    device=device,
+                    config=config,
+                )
+            finally:
+                if ema_model is not None:
+                    ema_model.swap_out(model)
+
+            if is_main_process(local_rank):
+                _metric_key = getattr(
+                    config.training, 'metric_for_best_model',
+                    'classification_accuracy'
+                )
+                _current = float(_val_metrics.get(_metric_key, 0.0) or 0.0)
+                _is_best = _current > best_metric
+                logger.info(
+                    f"[mid-epoch eval @ step {global_step}] "
+                    f"{_metric_key}={_current:.4f} "
+                    f"(prev best {best_metric:.4f}) "
+                    f"{'NEW BEST' if _is_best else ''}"
+                )
+                # Also surface key panel metrics so the log shows the trajectory
+                logger.info(
+                    f"  Val Acc={_val_metrics.get('classification_accuracy', 0):.4f} "
+                    f"Bin={_val_metrics.get('binary_accuracy', 0):.4f} "
+                    f"Grd IoU={_val_metrics.get('grounding_mean_iou', 0):.4f} "
+                    f"Chex AUROC={_val_metrics.get('chexpert_auroc', 0):.4f}"
+                )
+                if _is_best:
+                    best_metric = _current
+                    _model_to_save = (
+                        model.module if hasattr(model, 'module') else model
+                    )
+                    try:
+                        save_checkpoint(
+                            model=_model_to_save,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch=epoch,
+                            global_step=global_step,
+                            metrics=_val_metrics,
+                            config=config,
+                            is_best=True,
+                            ema_model=ema_model,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Mid-epoch best-checkpoint save failed: {e}"
+                        )
+            # validate() flipped the model to eval mode; restore train.
+            model.train()
 
         # ------------------------------------------------------------------
         # FREE large per-step objects to avoid holding references across
@@ -1272,7 +1490,7 @@ def train_epoch(
             _reclaim_cpu_memory()
     
     avg_loss = total_loss / max(num_batches, 1)
-    return avg_loss, global_step
+    return avg_loss, global_step, best_metric
 
 
 @torch.no_grad()
@@ -1739,6 +1957,18 @@ def main(args):
     if is_main_process(local_rank):
         logger.info("Loading datasets (using cache if available)...")
     
+    # New optional config flags (default-safe so older configs still load):
+    #   skip_question_types: list[str] - blacklist applied after the
+    #     question_types whitelist (Stage 4 drops A_* report-text qs).
+    #   min_localization_quality: int - drop obs with QBA loc_q < N from
+    #     SG-target extraction (Stage 1 only; default 0 = off).
+    #   val_samples: int - cap on val dataset size when not using max_samples.
+    _skip_qtypes = getattr(config.data, 'skip_question_types', None) or None
+    _min_loc_q = int(getattr(config.data, 'min_localization_quality', 0))
+    _val_samples = getattr(config.data, 'val_samples', None)
+    if _val_samples is not None:
+        _val_samples = int(_val_samples)
+
     train_dataset = MIMICCXRVQADataset(
         mimic_cxr_path=config.data.mimic_cxr_jpg_path,
         mimic_qa_path=config.data.mimic_ext_cxr_qba_path,
@@ -1748,6 +1978,7 @@ def main(args):
         quality_grade=config.data.quality_grade,
         view_filter=config.data.view_filter,
         question_types=config.data.question_types if config.data.question_types else None,
+        skip_question_types=_skip_qtypes,
         chexpert_labels_path=config.data.chexpert_labels_path if config.data.chexpert_labels_path else None,
         max_samples=args.max_samples,
         cache_dir=cache_dir,
@@ -1755,12 +1986,15 @@ def main(args):
         prebuilt_cache_path=args.prebuilt_cache_train,
         one_question_per_image=args.one_question_per_image,
         use_reports=args.use_reports,
+        min_localization_quality=_min_loc_q,
     )
-    
+
     # Barrier to ensure all processes have loaded/cached train data
     if is_distributed:
         dist.barrier()
-    
+
+    # Val sample cap: CLI --max_samples//10 wins; otherwise use config.val_samples.
+    _val_cap = (args.max_samples // 10) if args.max_samples else _val_samples
     val_dataset = MIMICCXRVQADataset(
         mimic_cxr_path=config.data.mimic_cxr_jpg_path,
         mimic_qa_path=config.data.mimic_ext_cxr_qba_path,
@@ -1770,13 +2004,15 @@ def main(args):
         quality_grade=config.data.quality_grade,
         view_filter=config.data.view_filter,
         question_types=config.data.question_types if config.data.question_types else None,
+        skip_question_types=_skip_qtypes,
         chexpert_labels_path=config.data.chexpert_labels_path if config.data.chexpert_labels_path else None,
-        max_samples=args.max_samples // 10 if args.max_samples else None,
+        max_samples=_val_cap,
         cache_dir=cache_dir,
         use_cache=True,
         prebuilt_cache_path=args.prebuilt_cache_val,
         one_question_per_image=args.one_question_per_image,
         use_reports=args.use_reports,
+        min_localization_quality=_min_loc_q,
     )
     
     # Barrier to ensure all processes have loaded/cached val data
@@ -2009,26 +2245,44 @@ def main(args):
             "(GradScaler requires fp32 grads — fp16 trainables crash unscale_)."
         )
 
-    # Mode-specific LR override (ADR-026 / migration notes):
-    #   pretrain → 2e-4 (LoRA warmup), finetune → 5e-5 (refinement)
-    # The override is SKIPPED if the user explicitly passed --learning_rate on
-    # the CLI (args.learning_rate is set). Without this skip, --learning_rate
-    # 2e-5 silently became 2e-4 in pretrain mode → 10× higher than requested →
-    # fp16 loss-scaler floor crash within ~5 hours (Stage 2's failure mode).
+    # Mode-specific LR fallback (ADR-026 / migration notes).
+    # Priority order (highest wins):
+    #   1. CLI --learning_rate (args.learning_rate)
+    #   2. YAML config.training.learning_rate, if it's a "real" value (not the
+    #      legacy sentinel 5e-5 that the codebase historically meant "I don't
+    #      care, pick the mode default for me")
+    #   3. Mode default from _MODE_LR
+    # Earlier behaviour clobbered the YAML even when it carried a deliberate
+    # value (e.g. Stage 4's 5.0e-6 -> mode-default 5e-5 = 10x too high), which
+    # is the exact footgun that caused the Stage 4 E2 overfitting cliff.
     _MODE_LR = {'sg_only': 1e-4, 'alignment': 5e-5, 'pretrain': 2e-4, 'finetune': 5e-5, 'rl': 1e-5}
-    if _phase in _MODE_LR and not args.learning_rate:
+    _SENTINEL_LRS = {None, 0.0, 5e-5}  # 5e-5 was the historical "default" value
+    if args.learning_rate:
+        if is_main_process(local_rank):
+            logger.info(
+                f"LR source = CLI --learning_rate: {args.learning_rate} "
+                f"(YAML had {config.training.learning_rate}; mode default for "
+                f"'{_phase}' is {_MODE_LR.get(_phase)})"
+            )
+        config.training.learning_rate = args.learning_rate
+    elif config.training.learning_rate not in _SENTINEL_LRS:
+        if is_main_process(local_rank):
+            logger.info(
+                f"LR source = YAML: {config.training.learning_rate} "
+                f"(mode default for '{_phase}' would be "
+                f"{_MODE_LR.get(_phase)}; pass --learning_rate to override)"
+            )
+        # leave config.training.learning_rate alone
+    elif _phase in _MODE_LR:
         _new_lr = _MODE_LR[_phase]
         if is_main_process(local_rank):
             logger.info(
-                f"Mode-specific LR override for '{_phase}': "
-                f"{config.training.learning_rate} -> {_new_lr}"
+                f"LR source = mode default for '{_phase}': "
+                f"{config.training.learning_rate} -> {_new_lr} "
+                f"(YAML had the sentinel value; pass --learning_rate or "
+                f"set a non-sentinel value in the YAML to override)"
             )
         config.training.learning_rate = _new_lr
-    elif args.learning_rate and is_main_process(local_rank):
-        logger.info(
-            f"Mode-specific LR override SKIPPED for '{_phase}' — "
-            f"using user-specified --learning_rate {args.learning_rate}"
-        )
     
     # ==================================================================
     # LOAD PRETRAINED CHECKPOINT (for finetuning or resuming)
@@ -2429,6 +2683,27 @@ def main(args):
             # weight distributions in the W&B UI.
             wandb.watch(model, log="parameters", log_freq=config.wandb.watch_log_freq)
     
+    # ------------------------------------------------------------------
+    # EMA (exponential moving average of weights).
+    # Enabled iff config.training.ema_decay > 0. CPU-side shadow copy so it
+    # doesn't eat VRAM on a Qwen3-VL-8B base. Updated after each optimiser
+    # step; swapped in for validation and saved alongside each checkpoint.
+    # ------------------------------------------------------------------
+    _ema_decay = float(getattr(config.training, 'ema_decay', 0.0))
+    ema_model: Optional[EMAModel] = None
+    if _ema_decay > 0.0 and not use_deepspeed:
+        ema_model = EMAModel(model, decay=_ema_decay)
+        if is_main_process(local_rank):
+            logger.info(
+                f"EMA enabled: decay={_ema_decay}, "
+                f"shadow params={len(ema_model.shadow)}, "
+                f"shadow lives on CPU."
+            )
+    elif _ema_decay > 0.0 and use_deepspeed:
+        if is_main_process(local_rank):
+            logger.warning("ema_decay set but DeepSpeed enabled: EMA disabled "
+                           "(DS manages its own optimizer state).")
+
     # Training loop
     best_metric = 0.0
     # global_step is already set from resume_step above (0 for fresh / finetune)
@@ -2454,8 +2729,10 @@ def main(args):
             logger.info(f"Epoch {epoch}/{config.training.num_epochs}")
             logger.info(f"{'='*50}")
         
-        # Train
-        train_loss, global_step = train_epoch(
+        # Train (in-epoch validation triggered inside on eval_steps boundary;
+        # train_epoch returns the running best_metric so we can keep tracking
+        # across epoch boundaries).
+        train_loss, global_step, best_metric = train_epoch(
             model=model,
             dataloader=train_dataloader,
             optimizer=optimizer,
@@ -2467,20 +2744,31 @@ def main(args):
             scaler=scaler,
             global_step=global_step,
             local_rank=local_rank,
-            use_deepspeed=use_deepspeed
+            use_deepspeed=use_deepspeed,
+            ema_model=ema_model,
+            val_dataloader=val_dataloader,
+            best_metric=best_metric,
         )
-        
+
         if is_main_process(local_rank):
             logger.info(f"Train Loss: {train_loss:.4f}")
-        
-        # Validate (all processes participate, but only main process logs)
-        val_metrics = validate(
-            model=model,
-            dataloader=val_dataloader,
-            criterion=criterion,
-            device=device,
-            config=config
-        )
+
+        # Validate using EMA weights when available (smoothed, less noisy).
+        # swap_in copies CPU shadow into the live model; swap_out restores
+        # the live weights so the next training epoch isn't perturbed.
+        if ema_model is not None:
+            ema_model.swap_in(model)
+        try:
+            val_metrics = validate(
+                model=model,
+                dataloader=val_dataloader,
+                criterion=criterion,
+                device=device,
+                config=config
+            )
+        finally:
+            if ema_model is not None:
+                ema_model.swap_out(model)
         
         # Only main process handles logging and checkpointing
         if is_main_process(local_rank):
@@ -2578,7 +2866,8 @@ def main(args):
                 global_step=global_step,
                 metrics=val_metrics,
                 config=config,
-                is_best=is_best
+                is_best=is_best,
+                ema_model=ema_model,
             )
             
             # Push to hub
@@ -2621,7 +2910,8 @@ def main(args):
             global_step=global_step,
             metrics=val_metrics,
             config=config,
-            is_best=False
+            is_best=False,
+            ema_model=ema_model,
         )
         
         # Also save as 'final_model' (never cleaned up) so finetuning always has a fixed path

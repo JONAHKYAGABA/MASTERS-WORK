@@ -680,6 +680,7 @@ class MIMICCXRVQADataset(Dataset):
         quality_grade: str = 'A',
         view_filter: str = 'frontal_only',
         question_types: Optional[List[str]] = None,
+        skip_question_types: Optional[List[str]] = None,  # NEW: blacklist (Stage 4 drops A_*)
         chexpert_labels_path: Optional[str] = None,
         max_samples: Optional[int] = None,
         transform: Optional[Any] = None,
@@ -691,6 +692,7 @@ class MIMICCXRVQADataset(Dataset):
         sg_cache_root: Optional[str] = None,  # Stage-3+ pre-generated SG cache (precompute_sg_cache.py)
         one_question_per_image: bool = False,  # Dedupe to one sample per image (max image diversity per max_samples)
         use_reports: bool = False,  # Inject radiologist INDICATION as input + FINDINGS/IMPRESSION as <think> target
+        min_localization_quality: int = 0,  # NEW: Stage 1 only; drop obs with localization_quality < N
     ):
         self.mimic_cxr_path = Path(mimic_cxr_path)
         self.mimic_qa_path = Path(mimic_qa_path)
@@ -699,6 +701,11 @@ class MIMICCXRVQADataset(Dataset):
         self.quality_grade = quality_grade
         self.view_filter = view_filter
         self.question_types = question_types
+        # Normalise blacklist to a set of lowercase strings for cheap membership tests
+        self.skip_question_types = (
+            {str(q).lower() for q in skip_question_types}
+            if skip_question_types else set()
+        )
         self.max_samples = max_samples
         self.use_exports = use_exports
         self.use_cache = use_cache
@@ -706,6 +713,12 @@ class MIMICCXRVQADataset(Dataset):
         self.prebuilt_cache_path = prebuilt_cache_path
         self.one_question_per_image = bool(one_question_per_image)
         self.use_reports = bool(use_reports)
+        # min_localization_quality: only used by SG-target extraction in
+        # _extract_gt_targets. Default 0 = off (Stages 2-4 see all observations
+        # for VQA). Set to 3 in Stage 1 config to drop NO_LOCALIZATION /
+        # FALLBACK_LOCALIZATION obs that gave Stage 1 garbage bbox targets
+        # (sg_loss plateaued at 4.71 across runs).
+        self.min_localization_quality = int(min_localization_quality)
         # When use_reports is on, we prepend clinical-context ("Clinical context: ...")
         # to the question text before tokenization. Indication is short (~30-80 tokens)
         # so bump max_question_length so the question itself doesn't get truncated.
@@ -1491,9 +1504,15 @@ class MIMICCXRVQADataset(Dataset):
                             skipped_quality += 1
                             continue
 
-                    # Question type filter
+                    # Question type filter — whitelist (question_types) and
+                    # blacklist (skip_question_types). Whitelist takes
+                    # precedence; blacklist runs after so it can prune even
+                    # whitelist-passing types (Stage 4: question_types=null
+                    # but A_* are blacklisted).
                     q_type = q.get('question_type', 'unknown')
                     if self.question_types and q_type not in self.question_types:
+                        continue
+                    if self.skip_question_types and q_type.lower() in self.skip_question_types:
                         continue
 
                     samples.append({
@@ -1931,6 +1950,27 @@ class MIMICCXRVQADataset(Dataset):
         positiveness_list = []
         
         for obs_id, obs in observations.items():
+            # Stage-1-only filter: drop observations whose localization_quality
+            # is below BBOX_LOCALIZATION (level 3). QBA's level-0/1/2 entries
+            # (NO_LOCALIZATION, FALLBACK_LOCALIZATION, INCOMPLETE_LOCALIZATION)
+            # produce whole-image or whole-region bboxes that taught the
+            # Stage-1 SG generator nothing useful (sg_loss plateaued ~4.7).
+            # min_localization_quality defaults to 0 = off; only Stage 1
+            # turns this on. See QBA_CRITERION_INT_GRADES['localization_quality'].
+            if self.min_localization_quality > 0:
+                loc_q = obs.get('localization_quality')
+                if isinstance(loc_q, dict):
+                    # Per-image int dict {dicom_id: int}; pick the worst across
+                    # images so a single-bad-localization study isn't kept.
+                    vals = [v for v in loc_q.values() if isinstance(v, int)]
+                    loc_q_int = min(vals) if vals else None
+                elif isinstance(loc_q, int):
+                    loc_q_int = loc_q
+                else:
+                    loc_q_int = None
+                if loc_q_int is None or loc_q_int < self.min_localization_quality:
+                    continue
+
             # Extract bbox
             bbox = None
             if 'localization' in obs and obs['localization']:
@@ -1940,7 +1980,7 @@ class MIMICCXRVQADataset(Dataset):
                         img_loc = loc[image_id]
                     else:
                         img_loc = next(iter(loc.values()), {})
-                    
+
                     if isinstance(img_loc, dict) and 'bboxes' in img_loc:
                         if img_loc['bboxes'] and len(img_loc['bboxes']) > 0:
                             raw_bbox = img_loc['bboxes'][0]
@@ -1951,7 +1991,7 @@ class MIMICCXRVQADataset(Dataset):
                             y2 = max(0, min(raw_bbox[3] / image_height, 1.0))
                             if x2 > x1 and y2 > y1:
                                 bbox = [x1, y1, x2, y2]
-            
+
             if bbox is None:
                 bbox = [0.0, 0.0, 1.0, 1.0]  # Default to full image
             bboxes.append(bbox)

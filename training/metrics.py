@@ -485,25 +485,39 @@ class VQAMetrics:
                         self.attention_plausibilities.append(plaus)
     
     def _get_head_indices(self, question_types: List[str]) -> Dict[str, List[int]]:
-        """Map question types to answer heads."""
+        """Map question types to answer heads.
+
+        Must use the SAME routing as training/loss.py:_get_head_indices,
+        otherwise validation metrics summarise the wrong head and produce
+        silent failures (e.g. Val Binary Acc = 0.0000 for the full curriculum
+        because the prior keyword-based heuristic here misclassified
+        C03/C04/C08 binary types as 'category' or 'region').
+
+        Canonical mapping lives in data.mimic_cxr_dataset.QUESTION_TYPE_MAP.
+        Keyword fallback is for unmapped question types only.
+        """
+        try:
+            from data.mimic_cxr_dataset import QUESTION_TYPE_MAP
+        except ImportError:
+            QUESTION_TYPE_MAP = {}
+
         head_indices = {'binary': [], 'category': [], 'region': [], 'severity': []}
-        
-        binary_keywords = ['abnormal', 'normal', 'has_', 'is_']
-        region_keywords = ['where', 'describe_region', 'location']
-        severity_keywords = ['severe', 'severity']
-        
+
         for idx, q_type in enumerate(question_types):
-            q_lower = q_type.lower()
-            
-            if any(k in q_lower for k in severity_keywords):
-                head_indices['severity'].append(idx)
-            elif any(k in q_lower for k in region_keywords):
-                head_indices['region'].append(idx)
-            elif any(k in q_lower for k in binary_keywords):
-                head_indices['binary'].append(idx)
-            else:
-                head_indices['category'].append(idx)
-        
+            head = QUESTION_TYPE_MAP.get(q_type)
+            if head is None:
+                q_lower = q_type.lower()
+                if any(x in q_lower for x in ['is_abnormal', 'is_normal', 'has_']):
+                    head = 'binary'
+                elif any(x in q_lower for x in ['where_is', 'describe_region']):
+                    head = 'region'
+                elif 'severe' in q_lower:
+                    head = 'severity'
+                else:
+                    head = 'category'
+            if head in head_indices:
+                head_indices[head].append(idx)
+
         return head_indices
     
     def _compute_attention_plausibility(self, attn_map: np.ndarray, roi_bbox: np.ndarray, threshold: float = 0.5) -> float:

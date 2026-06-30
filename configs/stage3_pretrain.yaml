@@ -61,6 +61,10 @@ data:
   view_filter: "frontal_only"
   question_types: null
 
+  # Bumped from 250 -> 1000 so a single eval can distinguish runs with
+  # better than +/-6pp 95% CI.
+  val_samples: 1000
+
   use_exports: true
   export_grade: "B_frontal"
 
@@ -106,7 +110,11 @@ training:
   # explicit here for visibility.
   vqa_loss_weight: 0.05
   generation_loss_weight: 1.0       # PRIMARY — Qwen LM
-  chexpert_loss_weight: 0.05
+  chexpert_loss_weight: 0.3         # bumped from 0.05; was vestigial.
+                                    # Stage 3's CheXpert AUROC oscillated
+                                    # 0.50-0.69 because the head got almost
+                                    # no gradient. CheXpert is the cleanest
+                                    # per-study supervision available.
   scene_graph_loss_weight: 0.0      # SG frozen; no gradient
   grounding_loss_weight: 2.0        # PRIMARY — bbox regression head
   binary_head_weight: 0.1

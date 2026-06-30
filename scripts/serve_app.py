@@ -105,6 +105,41 @@ def load_vocab(dataset_info_path: Optional[Path]) -> Tuple[List[str], List[str]]
 
 
 # ---------------------------------------------------------------------------
+# Best-checkpoint pointer resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_best_pointer(path: Path) -> Path:
+    """If `path` contains a `checkpoint_step.txt` file, treat it as a pointer to
+    the actual peak-val-accuracy checkpoint and return the referenced sibling
+    `checkpoint-{step}/` directory.
+
+    Background: the trainer used to overwrite `best_model/pytorch_model.bin`
+    in place each time `is_best=True`, which made the directory ambiguous after
+    crashes or epoch-end re-saves (e.g. Stage 4 E2 first-eval clobbered the
+    actual peak from E1). The new scheme writes `checkpoint_step.txt`
+    containing just the integer step number; the numbered checkpoint stays
+    untouched. This resolver makes both old and new layouts work transparently.
+    """
+    if not path or not path.exists():
+        return path
+    pointer = path / "checkpoint_step.txt"
+    if not pointer.exists():
+        return path
+    try:
+        step = int(pointer.read_text().strip())
+    except (ValueError, OSError) as e:
+        log.warning(f"could not parse {pointer}: {e}; falling back to {path}")
+        return path
+    candidate = path.parent / f"checkpoint-{step}"
+    if not candidate.exists():
+        log.warning(f"{pointer} points at step {step} but {candidate} is missing; "
+                    f"falling back to {path}")
+        return path
+    log.info(f"resolved {path} -> {candidate} (via checkpoint_step.txt)")
+    return candidate
+
+
+# ---------------------------------------------------------------------------
 # Model loading — mirrors scripts/predict_and_visualize.py:build_model
 # ---------------------------------------------------------------------------
 
@@ -187,6 +222,7 @@ def build_model(
 
     # ---- Load fine-tuned weights from pytorch_model.bin ----
     if checkpoint_path:
+        checkpoint_path = _resolve_best_pointer(checkpoint_path)
         bin_path = checkpoint_path / "pytorch_model.bin"
         if bin_path.exists():
             log.info(f"loading weights from {bin_path}")
@@ -1136,8 +1172,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model_id", default="Qwen/Qwen3-VL-8B-Instruct")
     p.add_argument("--checkpoint", type=Path,
-                   default=Path("./checkpoints/stage4_finetune_qwen3vl8b_5k/best_model"),
-                   help="Path to a saved best_model dir. Use a Stage 1/2/3 dir to compare stages.")
+                   default=Path("./checkpoints/mimic-cxr-vqa/finetune/checkpoint-13262"),
+                   help="Path to a checkpoint dir. If the dir contains "
+                        "'checkpoint_step.txt' (e.g. 'best_model/'), the file's "
+                        "contents are read as the actual best-checkpoint step "
+                        "number and the referenced 'checkpoint-{step}/' dir is "
+                        "loaded instead. Direct paths to 'checkpoint-N/' work "
+                        "unchanged. The default points at Stage-4 Epoch-1's "
+                        "13262 step (Val Acc 0.464) rather than the "
+                        "epoch-end-overwritten 'best_model/' (Val Acc 0.384).")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--host", default="0.0.0.0")

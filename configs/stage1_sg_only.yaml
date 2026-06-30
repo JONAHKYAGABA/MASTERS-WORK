@@ -52,6 +52,20 @@ data:
   view_filter: "frontal_only"
   question_types: null
 
+  # Drop observations with QBA localization_quality < 3
+  # (NO_LOCALIZATION / FALLBACK_LOCALIZATION / INCOMPLETE_LOCALIZATION).
+  # Stage 1 is the ONLY stage that uses GT bboxes for training -- the rest
+  # consume the trained SG generator's frozen outputs. Without this filter
+  # the SG head sees whole-region or whole-image bboxes (the fallback the
+  # text->region inheritance produces) and sg_loss plateaus at ~4.7.
+  # Expected drop: 50-70% of observations, but each remaining one has a
+  # real bbox drawn by an actual detector.
+  min_localization_quality: 3
+
+  # Bumped from 250 -> 1000 so a single eval can distinguish runs with
+  # better than +/-6pp 95% CI.
+  val_samples: 1000
+
   use_exports: true
   export_grade: "B_frontal"
 
