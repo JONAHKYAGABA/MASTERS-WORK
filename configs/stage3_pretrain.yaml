@@ -103,6 +103,11 @@ training:
   fp16: true
   gradient_checkpointing: false
 
+  # EMA decay for validation + best-model save. Same rationale as Stage 4:
+  # smooths late-stage drift so a single training crash doesn't clobber
+  # the peak checkpoint. Free once EMAModel infra exists in the trainer.
+  ema_decay: 0.999
+
   # =====================================================
   # STAGE 3 LOSS WEIGHTS — full multi-task
   # =====================================================

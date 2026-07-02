@@ -1022,7 +1022,15 @@ class MIMICCXRVQADataset(Dataset):
         return self._dicom_to_metadata.get(str(dicom_id), default)
     
     def _get_cache_key(self) -> str:
-        """Generate a unique cache key based on dataset configuration."""
+        """Generate a unique cache key based on dataset configuration.
+
+        MUST include every field that affects which samples land in the
+        cache. skip_question_types + min_localization_quality were added
+        for the v2 retrain fixes; forgetting them here means a stale
+        pickle from a prior run would be silently reused with the new
+        filters ignored (Stage 4 would still see A_* questions, Stage 1
+        would still get garbage bboxes).
+        """
         config_str = (
             f"cxr:{self.mimic_cxr_path}|"
             f"qa:{self.mimic_qa_path}|"
@@ -1030,6 +1038,8 @@ class MIMICCXRVQADataset(Dataset):
             f"quality:{self.quality_grade}|"
             f"view:{self.view_filter}|"
             f"qtypes:{sorted(self.question_types) if self.question_types else 'all'}|"
+            f"skip_qtypes:{sorted(self.skip_question_types) if self.skip_question_types else 'none'}|"
+            f"min_loc_q:{self.min_localization_quality}|"
             f"max:{self.max_samples or 'none'}|"
             f"exports:{self.use_exports}|"
             f"dedupe_img:{int(self.one_question_per_image)}|"
