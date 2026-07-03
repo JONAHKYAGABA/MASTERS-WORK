@@ -1969,25 +1969,30 @@ class MIMICCXRVQADataset(Dataset):
         positiveness_list = []
         
         for obs_id, obs in observations.items():
-            # Stage-1-only filter: drop observations whose localization_quality
-            # is below BBOX_LOCALIZATION (level 3). QBA's level-0/1/2 entries
-            # (NO_LOCALIZATION, FALLBACK_LOCALIZATION, INCOMPLETE_LOCALIZATION)
-            # produce whole-image or whole-region bboxes that taught the
-            # Stage-1 SG generator nothing useful (sg_loss plateaued ~4.7).
-            # min_localization_quality defaults to 0 = off; only Stage 1
-            # turns this on. See QBA_CRITERION_INT_GRADES['localization_quality'].
+            # Stage-1-only filter: drop observations that don't have a real
+            # bbox for the current image. QBA's `localization_quality` int is
+            # a per-QUESTION criterion, not per-observation, so checking it
+            # here filtered EVERY observation. The correct check is "does
+            # this observation carry a non-empty bboxes list under its
+            # localization dict for the current dicom_id?"
+            #
+            # min_localization_quality now means:
+            #   0 = keep everything (Stages 2-4: VQA needs all observations)
+            #   >=1 = keep only observations with a real bbox on THIS image
+            #         (Stage 1: SG head trains on the geometry, so garbage
+            #         fallback bboxes drown the signal).
             if self.min_localization_quality > 0:
-                loc_q = obs.get('localization_quality')
-                if isinstance(loc_q, dict):
-                    # Per-image int dict {dicom_id: int}; pick the worst across
-                    # images so a single-bad-localization study isn't kept.
-                    vals = [v for v in loc_q.values() if isinstance(v, int)]
-                    loc_q_int = min(vals) if vals else None
-                elif isinstance(loc_q, int):
-                    loc_q_int = loc_q
-                else:
-                    loc_q_int = None
-                if loc_q_int is None or loc_q_int < self.min_localization_quality:
+                loc = obs.get('localization') or {}
+                has_real_bbox = False
+                if isinstance(loc, dict) and loc:
+                    img_loc = (
+                        loc.get(image_id) if image_id and image_id in loc
+                        else next(iter(loc.values()), {})
+                    )
+                    if isinstance(img_loc, dict):
+                        raw = img_loc.get('bboxes') or []
+                        has_real_bbox = bool(raw) and len(raw[0]) == 4
+                if not has_real_bbox:
                     continue
 
             # Extract bbox
