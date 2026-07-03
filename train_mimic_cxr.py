@@ -1864,6 +1864,25 @@ def _train_standalone_sg_generator(args, config, sg_gen_cfg):
                     gt_entities=gt_entities,
                     gt_regions=gt_regions,
                 )
+            # Guard: when the batch has zero localised observations after the
+            # min_localization_quality filter, the underlying SG loss returns
+            # a scalar without grad_fn. backward() then errors with:
+            #     "element 0 of tensors does not require grad and does not
+            #      have a grad_fn".
+            # Add a zero-contribution differentiable term connected to the
+            # generator's own output so backward() still walks the graph;
+            # the batch effectively no-ops for gradient contribution but
+            # doesn't crash the run.
+            if not loss.requires_grad:
+                _stub = 0.0 * out['raw']['bbox_preds'].sum()
+                loss = loss + _stub
+                if global_step % max(1, int(config.training.logging_steps)) == 0 \
+                        and is_main_process(local_rank):
+                    logger.info(
+                        f"[sg_only] step={global_step} loss had no grad_fn "
+                        f"(all-empty batch after localization filter); "
+                        f"backward() no-ops this step."
+                    )
             if scaler:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
