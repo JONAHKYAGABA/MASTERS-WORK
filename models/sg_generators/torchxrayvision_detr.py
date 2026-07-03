@@ -48,9 +48,10 @@ def _load_txrv_backbone() -> tuple:
       1. torchxrayvision DenseNet121 ``densenet121-res224-all`` (CXR-pretrained).
       2. torchvision DenseNet121 ImageNet-pretrained (weaker domain match).
 
-    Both cases return a ``nn.Module`` that maps (B, 3, H, W) -> (B, C, h, w).
-    TXRV's 224x224 input constraint is handled by resizing before forward
-    in ``TXRVDetrSGGenerator.forward``.
+    Both cases return a ``nn.Module`` that accepts standard-format (B, 3, H, W)
+    RGB float32 input in [0, 1] and emits (B, C, h, w) feature maps. The
+    wrapper handles TXRV's 1-channel + [-1024, 1024] preprocessing internally
+    so callers don't have to know which backbone is active.
     """
     try:
         import torchxrayvision as xrv
@@ -63,38 +64,75 @@ def _load_txrv_backbone() -> tuple:
         return _load_torchvision_densenet121_backbone()
 
     logger.info("Loading torchxrayvision densenet121-res224-all (CXR-pretrained)...")
-    # xrv.models.DenseNet auto-downloads weights to ~/.cache/torch/hub/checkpoints
-    # on first call. weights='densenet121-res224-all' is the multi-dataset
-    # ensemble used across TXRV benchmarks.
+    # xrv.models.DenseNet auto-downloads weights to
+    # ~/.torchxrayvision/models_data/ on first call. weights=
+    # 'densenet121-res224-all' is the multi-dataset ensemble.
     net = xrv.models.DenseNet(weights="densenet121-res224-all")
     # TXRV wraps a torchvision DenseNet in `features`; the tail head after
     # `features` is a classifier we don't need. Use just the conv trunk.
     backbone_features = net.features  # (B, 1024, 7, 7) at 224x224 input
     feature_channels = 1024
-    return _TXRVBackboneWrapper(backbone_features), feature_channels
+    return _TXRVBackboneWrapper(backbone_features, source="txrv"), feature_channels
 
 
 def _load_torchvision_densenet121_backbone() -> tuple:
     """ImageNet DenseNet121 fallback."""
     from torchvision.models import densenet121, DenseNet121_Weights
     net = densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
-    return _TXRVBackboneWrapper(net.features), 1024
+    return _TXRVBackboneWrapper(net.features, source="torchvision"), 1024
+
+
+# ImageNet normalisation constants for the fallback backbone.
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 
 class _TXRVBackboneWrapper(nn.Module):
-    """Thin wrapper so we always emit ``(B, C, h, w)`` regardless of source."""
+    """Adapts a standard (B, 3, H, W) [0, 1] RGB input to whatever the wrapped
+    backbone expects, then emits (B, C, h, w) features.
 
-    def __init__(self, features: nn.Module) -> None:
+    TXRV DenseNet expects:
+      * 1 channel (chest X-rays are grayscale)
+      * pixel values in [-1024, 1024]
+    Torchvision DenseNet121 expects:
+      * 3 channels
+      * ImageNet-normalised: (x - mean) / std with the ImageNet stats
+
+    We inspect ``source`` at construction and apply the correct preprocessing
+    in ``forward`` so the outer generator code stays uniform.
+    """
+
+    def __init__(self, features: nn.Module, source: str = "txrv") -> None:
         super().__init__()
         self.features = features
+        assert source in ("txrv", "torchvision"), source
+        self.source = source
+        # Register normalisation constants as buffers so they move with .to()
+        # and DDP-shard cleanly.
+        self.register_buffer("_imagenet_mean", _IMAGENET_MEAN.clone())
+        self.register_buffer("_imagenet_std", _IMAGENET_STD.clone())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TXRV expects greyscale-normalised input in ``[-1024, 1024]``, but
-        # for the wrapper case we accept RGB in [0, 1] and let the pretrained
-        # first-conv layer do its job. Empirically this works because the
-        # first-conv weights are still domain-adapted; we're not aiming for
-        # 100% TXRV-metric parity, we're using the trunk as a feature
-        # extractor for a fresh detection head.
+        # x: (B, 3, H, W) float in [0, 1]
+        if self.source == "txrv":
+            # RGB -> grayscale via standard luminance weights (matches
+            # PIL's convert('L') and cv2's cvtColor with COLOR_RGB2GRAY).
+            if x.size(1) == 3:
+                r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+                x = 0.299 * r + 0.587 * g + 0.114 * b   # (B, 1, H, W)
+            elif x.size(1) != 1:
+                raise ValueError(
+                    f"txrv backbone expects 1 or 3 input channels, got {x.size(1)}"
+                )
+            # [0, 1] -> [-1024, 1024]: this matches
+            # torchxrayvision.datasets.normalize(img, 255) up to the same
+            # rescale constant xrv uses in its data pipeline.
+            x = x * 2048.0 - 1024.0
+        else:
+            # torchvision expects 3-channel ImageNet-normalised input.
+            if x.size(1) == 1:
+                x = x.expand(-1, 3, -1, -1)
+            x = (x - self._imagenet_mean) / self._imagenet_std
         return self.features(x)
 
 
