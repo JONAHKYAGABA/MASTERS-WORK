@@ -1442,33 +1442,90 @@ class SSGVQANetV2(nn.Module):
         self,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
+        pil_images: Optional[List[Any]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], List[Dict[str, Any]]]:
         """
-        Extract Qwen ViT features and run the SG generator.
+        Run the SG generator and return ``(raw_outputs, sg_dicts)``.
 
-        Returns ``(raw_outputs, sg_dicts)`` — raw outputs are required by
-        ``MultiTaskLoss._compute_scene_graph_loss`` in ``sg_only`` mode;
-        the dicts feed ``SceneGraphEncoderV2``.
+        Two branches:
 
-        IMPORTANT: when the SG generator is frozen we force it into eval()
-        for the forward, regardless of whether model.train() was called on
-        the outer module. The generator contains BatchNorm2d layers which
-        produce NaN in fp16 with batch_size=1 (0 variance → div by ~sqrt(eps)
-        → blow-up → NaN propagates through SG tokens into Qwen → lm_loss
-        nan). Eval mode uses the running stats (initially mean=0/var=1) and
-        sidesteps the batch-stat path entirely.
+        1. **Standalone SGGenerator** (``models.sg_generators.SGGenerator``
+           subclass) -- the refactored path. Takes raw ``(B, 3, H, W)``
+           images built from ``pil_images``. No Qwen ViT features. The
+           generator emits both raw tensors AND already-decoded dicts, so
+           the legacy ``_sg_outputs_to_dicts`` post-processing is skipped.
+
+        2. **Legacy SceneGraphGenerator** (Qwen-ViT-features RPN) -- the
+           pre-refactor path. Extracts Qwen ViT feature maps and runs the
+           RPN over them. Retained so old checkpoints keep working.
+
+        Which branch fires is determined by an isinstance check on
+        ``self.sg_generator``. Everything after this call
+        (SceneGraphEncoderV2, SGTokenProjector, injection into inputs_embeds)
+        is UNCHANGED -- both branches return the same
+        ``(raw_outputs, sg_dicts)`` payload shape, so downstream code
+        doesn't know which generator produced them.
+
+        Frozen-generator hardening: we force ``sg_generator.eval()`` when
+        freeze is on, because Turing-fp16 BatchNorm2d with batch_size=1
+        produces NaN via 0-variance -> sqrt(eps) blow-up. Eval mode uses
+        the running stats and sidesteps the batch-stat path entirely.
         """
-        feature_maps = self._extract_qwen_vit_feature_maps(pixel_values, image_grid_thw)
+        # Delayed import so this file still loads if the sg_generators
+        # subpackage is absent (older branches).
+        try:
+            from models.sg_generators.base import SGGenerator as _SGGeneratorABC
+        except Exception:
+            _SGGeneratorABC = None
+
         ctx = torch.no_grad() if self.freeze_sg_generator else torch.enable_grad()
         prev_mode = self.sg_generator.training
         if self.freeze_sg_generator:
             self.sg_generator.eval()
         try:
+            # Standalone path -- takes raw images.
+            if _SGGeneratorABC is not None and isinstance(self.sg_generator, _SGGeneratorABC):
+                if pil_images is None:
+                    raise ValueError(
+                        "The active SG generator is a standalone SGGenerator "
+                        "and requires raw pil_images. Pass them through "
+                        "SSGVQANetV2.forward()."
+                    )
+                images_t = self._pil_to_batch_tensor(pil_images, device=pixel_values.device)
+                with ctx:
+                    result = self.sg_generator(images_t, return_dicts=True)
+                return result["raw"], result["dicts"]
+
+            # Legacy path -- features RPN.
+            feature_maps = self._extract_qwen_vit_feature_maps(pixel_values, image_grid_thw)
             with ctx:
                 sg_raw = self.sg_generator(feature_maps)
+            return sg_raw, self._sg_outputs_to_dicts(sg_raw)
         finally:
             self.sg_generator.train(prev_mode)
-        return sg_raw, self._sg_outputs_to_dicts(sg_raw)
+
+    @staticmethod
+    def _pil_to_batch_tensor(pil_images: List[Any], device: torch.device) -> torch.Tensor:
+        """Convert a list of PIL RGB images to a (B, 3, 224, 224) float
+        tensor in [0, 1]. Runs on-the-fly so we don't add a dependency
+        on the dataset's transform pipeline. TorchXRayVision internally
+        resizes to 224 anyway, but doing it here up front keeps the
+        input tensor small and avoids per-generator resize surprises.
+        """
+        import numpy as np
+        from PIL import Image
+        arrs = []
+        for img in pil_images:
+            if isinstance(img, torch.Tensor):
+                arrs.append(img)
+                continue
+            if not isinstance(img, Image.Image):
+                raise TypeError(
+                    f"Expected PIL.Image or torch.Tensor in pil_images; got {type(img)}"
+                )
+            a = np.asarray(img.convert("RGB").resize((224, 224)), dtype=np.float32) / 255.0
+            arrs.append(torch.from_numpy(a).permute(2, 0, 1))
+        return torch.stack(arrs, dim=0).to(device)
 
     # ----------------------------------------------------------------------
     # SG token injection
@@ -1654,9 +1711,13 @@ class SSGVQANetV2(nn.Module):
         # outputs to supervise — even if the caller mistakenly passed dicts.
         sg_raw_outputs: Optional[Dict[str, torch.Tensor]] = None
         if scene_graphs is None or self.training_mode == "sg_only":
+            # Pass pil_images through so the standalone SGGenerator branch
+            # (models/sg_generators/*.py) can run in image-in mode. The
+            # legacy Qwen-ViT-features branch ignores this argument.
             sg_raw_outputs, scene_graphs = self._run_sg_generator(
                 proc_inputs["pixel_values"],
                 proc_inputs["image_grid_thw"],
+                pil_images=pil_images,
             )
 
         # ---- 3. Encode SG dicts → node features → soft tokens -----------------

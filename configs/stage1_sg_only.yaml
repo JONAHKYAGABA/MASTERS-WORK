@@ -16,31 +16,40 @@
 #     ...
 
 model:
-  visual_backbone: "convnext_base"
-  text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
-  visual_feature_dim: 512
-  scene_graph_dim: 134
-  visual_embedding_dim: 646
-  hidden_size: 768
-  intermediate_size: 3072
-  num_hidden_layers: 6
-  num_attention_heads: 12
-  hidden_dropout_prob: 0.1
-  attention_probs_dropout_prob: 0.1
-  sim_layers: 2
+  # STAGE 1 -- STANDALONE SG GENERATOR ONLY
+  # No Qwen is loaded. train_mimic_cxr.py sees phase=sg_only + this
+  # sg_generator block and dispatches to _train_standalone_sg_generator().
+  # Output: checkpoints/mimic-cxr-vqa-stage1-sg-only/best_model
+  # Stages 2-4 point their model.sg_generator.checkpoint at that path.
+  sg_generator:
+    name: txrv_detr             # CXR-pretrained DenseNet121 + DETR head
+                                # (auto-downloads torchxrayvision weights)
+    # Collapsed vocab -- see data/vocab_collapse.py
+    # 237 entities -> 22, 310 regions -> 30. Per-class density jumps ~10x
+    # and detection becomes learnable on the compute we have.
+    num_entities: 22
+    num_regions: 30
+    num_relations: 10
+    num_queries: 20
+    d_model: 384
+    num_decoder_layers: 2
+    num_heads: 8
+    dropout: 0.1
+    input_size: 224
+    freeze_backbone: false      # CXR-pretrained trunk fine-tunes for free
 
-  num_regions: 310
-  num_entities: 237
-  region_embedding_dim: 64
-  entity_embedding_dim: 64
-
+  # The keys below are legacy v1; retained so the config loader (which is
+  # struct-shaped) still parses. train_mimic_cxr.py does not read them
+  # when the standalone path is active.
+  num_regions: 30               # collapsed count
+  num_entities: 22              # collapsed count
   num_binary_classes: 2
   num_category_classes: 14
   num_region_classes: 26
   num_severity_classes: 4
-
   max_question_length: 128
   vocab_size: 30522
+  text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
 
 data:
   mimic_cxr_jpg_path: "/root/code/MASTERS-WORK/data/mimic-cxr-jpg"

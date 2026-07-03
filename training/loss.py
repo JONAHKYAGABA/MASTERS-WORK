@@ -794,3 +794,67 @@ class FocalLoss(nn.Module):
         elif self.reduction == 'sum':
             return focal_loss.sum()
         return focal_loss
+
+
+
+
+# ==========================================================================
+# Standalone functional wrapper used by SGGenerator subclasses.
+#
+# The refactored, decoupled SG generators (models/sg_generators/*.py) need
+# to compute the same DETR-style Hungarian loss as the monolithic model
+# did in Stage 1, but without instantiating a full MultiTaskLoss with all
+# its other head machinery. This wrapper builds a minimal MultiTaskLoss
+# with only the SG weight nonzero and dispatches to its _compute_scene_graph_loss.
+# Optional class-weight files can be passed through so the mode-collapse
+# fix carries over verbatim to the standalone path.
+# ==========================================================================
+
+
+_STANDALONE_SG_LOSS_CACHE = {}
+
+
+def compute_scene_graph_loss_hungarian(
+    raw_outputs,
+    gt_bboxes,
+    gt_entities,
+    gt_regions,
+    gt_positiveness = None,
+    num_entities: int = 22,
+    num_regions: int = 30,
+    entity_weights_json = None,
+    region_weights_json = None,
+):
+    """Standalone SG loss used by SGGenerator.compute_training_loss.
+
+    Signature mirrors MultiTaskLoss._compute_scene_graph_loss (which is
+    the source of truth). Returns (loss, log_dict) where log_dict
+    holds per-term scalars for progress logging.
+
+    Caches the underlying MultiTaskLoss instance by (num_entities,
+    num_regions, weight-file paths) so the class-weight tensors are only
+    loaded once per training run.
+    """
+    cache_key = (
+        int(num_entities), int(num_regions),
+        entity_weights_json, region_weights_json,
+    )
+    if cache_key not in _STANDALONE_SG_LOSS_CACHE:
+        _STANDALONE_SG_LOSS_CACHE[cache_key] = MultiTaskLoss(
+            training_mode='sg_only',
+            entity_weights_json=entity_weights_json,
+            region_weights_json=region_weights_json,
+        )
+    module = _STANDALONE_SG_LOSS_CACHE[cache_key]
+    # Move to whatever device the predictions live on -- cheap because
+    # weighted-CE modules hold only small class-weight buffers.
+    device = raw_outputs['bbox_preds'].device
+    if next(module.parameters(), torch.zeros(1)).device != device:
+        module.to(device)
+    return module._compute_scene_graph_loss(
+        sg_outputs=raw_outputs,
+        gt_bboxes=gt_bboxes,
+        gt_entities=gt_entities,
+        gt_regions=gt_regions,
+        device=device,
+    )

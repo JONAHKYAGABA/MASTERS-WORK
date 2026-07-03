@@ -1692,16 +1692,274 @@ def check_data_readiness(config) -> bool:
         return False
 
 
+def _train_standalone_sg_generator(args, config, sg_gen_cfg):
+    """Standalone Stage 1: train a decoupled SG generator.
+
+    Runs when ``training.phase == 'sg_only'`` AND ``model.sg_generator``
+    is set in the config. Loads NO Qwen backbone, NO LoRA, NO VQA/CheXpert
+    heads -- just the SGGenerator specified in the config, wraps it in
+    DDP if launched with torchrun, and iterates image -> Hungarian SG loss
+    to convergence. Saves under the config's output_dir with the same
+    ``best_model/checkpoint_step.txt`` pointer scheme the monolithic
+    trainer uses, so downstream stages can consume the resulting
+    ``model.sg_generator.checkpoint`` uniformly.
+    """
+    from models.sg_generators import get_sg_generator
+    from data.mimic_cxr_dataset import MIMICCXRVQADataset, create_dataloader
+
+    # Distributed init (torchrun-launched runs; single-process otherwise)
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    is_distributed = world_size > 1
+    if is_distributed:
+        dist.init_process_group(backend='nccl', init_method='env://')
+        torch.cuda.set_device(local_rank)
+    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+
+    if is_main_process(local_rank):
+        logger.info(
+            "=" * 60 + "\n"
+            "STANDALONE SG GENERATOR TRAINING\n"
+            f"  generator     : {sg_gen_cfg.get('name')}\n"
+            f"  num_entities  : {sg_gen_cfg.get('num_entities')}\n"
+            f"  num_regions   : {sg_gen_cfg.get('num_regions')}\n"
+            f"  output_dir    : {config.training.output_dir}\n"
+            "  (NO Qwen loaded. NO LoRA. NO VQA head. NO LM.)\n"
+            + "=" * 60
+        )
+
+    # -----------------------------------------------------------
+    # Build the generator + optionally load a warm-start ckpt.
+    # -----------------------------------------------------------
+    gen_kwargs = {k: v for k, v in sg_gen_cfg.items()
+                  if k not in ('name', 'checkpoint', 'frozen')}
+    generator = get_sg_generator(sg_gen_cfg['name'], **gen_kwargs).to(device)
+    if sg_gen_cfg.get('checkpoint'):
+        warm_start = Path(sg_gen_cfg['checkpoint'])
+        if warm_start.exists():
+            if is_main_process(local_rank):
+                logger.info(f"Warm-starting SG generator from {warm_start}")
+            # Support both flat and best_model pointer layouts.
+            if (warm_start / 'checkpoint_step.txt').exists():
+                step = int((warm_start / 'checkpoint_step.txt').read_text().strip())
+                warm_start = warm_start.parent / f'checkpoint-{step}'
+            generator.load_weights(str(warm_start / 'sg_generator.pt'), strict=False)
+
+    if is_distributed:
+        generator = DDP(generator, device_ids=[local_rank],
+                        output_device=local_rank, find_unused_parameters=True)
+
+    # -----------------------------------------------------------
+    # Dataset -- forces vocab collapse so target ids match the
+    # (small) generator output space. If the config's num_entities /
+    # num_regions do not match the collapsed vocab, log a clear warning
+    # and trust the config.
+    # -----------------------------------------------------------
+    from data.vocab_collapse import NUM_COLLAPSED_ENTITIES, NUM_COLLAPSED_REGIONS
+    if (int(sg_gen_cfg.get('num_entities', 0)) != NUM_COLLAPSED_ENTITIES
+            or int(sg_gen_cfg.get('num_regions', 0)) != NUM_COLLAPSED_REGIONS):
+        if is_main_process(local_rank):
+            logger.warning(
+                f"SG generator vocab ({sg_gen_cfg.get('num_entities')}/"
+                f"{sg_gen_cfg.get('num_regions')}) differs from the collapsed "
+                f"vocab ({NUM_COLLAPSED_ENTITIES}/{NUM_COLLAPSED_REGIONS}). "
+                "Ensure the loss/target mapping is consistent."
+            )
+
+    _skip_qtypes = getattr(config.data, 'skip_question_types', None) or None
+    _min_loc_q = int(getattr(config.data, 'min_localization_quality', 0))
+    _val_samples = getattr(config.data, 'val_samples', None)
+    _val_samples = int(_val_samples) if _val_samples is not None else None
+
+    train_dataset = MIMICCXRVQADataset(
+        mimic_cxr_path=config.data.mimic_cxr_jpg_path,
+        mimic_qa_path=config.data.mimic_ext_cxr_qba_path,
+        split='train',
+        quality_grade=config.data.quality_grade,
+        view_filter=config.data.view_filter,
+        question_types=config.data.question_types if config.data.question_types else None,
+        skip_question_types=_skip_qtypes,
+        max_samples=args.max_samples,
+        one_question_per_image=True,   # standalone SG only needs unique studies
+        min_localization_quality=_min_loc_q,
+    )
+    train_dataset.use_collapsed_vocab = True
+    val_dataset = MIMICCXRVQADataset(
+        mimic_cxr_path=config.data.mimic_cxr_jpg_path,
+        mimic_qa_path=config.data.mimic_ext_cxr_qba_path,
+        split='validate',
+        quality_grade=config.data.quality_grade,
+        view_filter=config.data.view_filter,
+        question_types=config.data.question_types if config.data.question_types else None,
+        skip_question_types=_skip_qtypes,
+        max_samples=_val_samples,
+        one_question_per_image=True,
+        min_localization_quality=_min_loc_q,
+    )
+    val_dataset.use_collapsed_vocab = True
+
+    train_sampler = (
+        torch.utils.data.distributed.DistributedSampler(train_dataset)
+        if is_distributed else None
+    )
+    train_dl = create_dataloader(
+        train_dataset,
+        batch_size=config.training.batch_size_per_gpu,
+        shuffle=(train_sampler is None),
+        num_workers=config.training.dataloader_num_workers,
+        sampler=train_sampler,
+    )
+    val_dl = create_dataloader(
+        val_dataset,
+        batch_size=config.training.batch_size_per_gpu,
+        shuffle=False,
+        num_workers=config.training.dataloader_num_workers,
+    )
+
+    # -----------------------------------------------------------
+    # Optimizer + scheduler
+    # -----------------------------------------------------------
+    optimizer = torch.optim.AdamW(
+        generator.parameters(),
+        lr=float(config.training.learning_rate),
+        weight_decay=float(config.training.weight_decay),
+    )
+    total_steps = max(1, len(train_dl) * int(config.training.num_epochs))
+    from torch.optim.lr_scheduler import OneCycleLR
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=float(config.training.learning_rate),
+        total_steps=total_steps,
+        pct_start=float(config.training.warmup_ratio),
+        anneal_strategy='cos',
+    )
+    scaler = GradScaler('cuda') if config.training.fp16 else None
+
+    # -----------------------------------------------------------
+    # Train + validate loop
+    # -----------------------------------------------------------
+    out_dir = Path(config.training.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    best_val_iou = 0.0
+    global_step = 0
+
+    for epoch in range(1, int(config.training.num_epochs) + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        generator.train()
+        for batch in train_dl:
+            images = batch['images'].to(device, non_blocking=True)
+            gt_bboxes = batch.get('gt_sg_bboxes')
+            gt_entities = batch.get('gt_sg_entities')
+            gt_regions = batch.get('gt_sg_regions')
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type='cuda', dtype=torch.float16,
+                                enabled=bool(scaler)):
+                out = generator(images, return_dicts=False)
+                inner = generator.module if hasattr(generator, 'module') else generator
+                loss, log_dict = inner.compute_training_loss(
+                    raw_outputs=out['raw'],
+                    gt_bboxes=gt_bboxes,
+                    gt_entities=gt_entities,
+                    gt_regions=gt_regions,
+                )
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(generator.parameters(),
+                                               float(config.training.max_grad_norm))
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(generator.parameters(),
+                                               float(config.training.max_grad_norm))
+                optimizer.step()
+            scheduler.step()
+            global_step += 1
+
+            if is_main_process(local_rank) and global_step % int(config.training.logging_steps) == 0:
+                logger.info(
+                    f"[sg_only] epoch={epoch} step={global_step} "
+                    f"loss={float(loss):.4f}"
+                )
+
+        # ---- Per-epoch validation ----
+        if is_main_process(local_rank):
+            generator.eval()
+            iou_sum, n = 0.0, 0
+            with torch.no_grad():
+                for batch in val_dl:
+                    images = batch['images'].to(device, non_blocking=True)
+                    out = generator(images, return_dicts=False)
+                    boxes = out['raw']['bbox_preds']
+                    gt = batch.get('gt_sg_bboxes')
+                    if gt is None:
+                        continue
+                    # Cheap proxy: mean per-image IoU@1 with top-objectness box
+                    objs = out['raw']['objectness_scores']
+                    top = objs.argmax(dim=1)
+                    for b in range(boxes.size(0)):
+                        pred = boxes[b, top[b]].cpu().tolist()
+                        target = gt[b][0].cpu().tolist() if len(gt[b]) else None
+                        if target is None:
+                            continue
+                        # simple xyxy IoU
+                        x1 = max(pred[0], target[0]); y1 = max(pred[1], target[1])
+                        x2 = min(pred[2], target[2]); y2 = min(pred[3], target[3])
+                        inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                        pa = (pred[2] - pred[0]) * (pred[3] - pred[1])
+                        ta = (target[2] - target[0]) * (target[3] - target[1])
+                        iou = inter / (pa + ta - inter + 1e-9)
+                        iou_sum += float(iou); n += 1
+            val_iou = iou_sum / max(n, 1)
+            logger.info(f"[sg_only] epoch={epoch} Val SG mean IoU@1 = {val_iou:.4f}")
+
+            # Save every epoch, best-marker on improvement
+            step_dir = out_dir / f'checkpoint-{global_step}'
+            step_dir.mkdir(exist_ok=True)
+            inner = generator.module if hasattr(generator, 'module') else generator
+            inner.save_weights(str(step_dir / 'sg_generator.pt'))
+            (step_dir / 'config.json').write_text(json.dumps(config.to_dict(), indent=2))
+            if val_iou > best_val_iou:
+                best_val_iou = val_iou
+                best_dir = out_dir / 'best_model'
+                best_dir.mkdir(exist_ok=True)
+                (best_dir / 'checkpoint_step.txt').write_text(f'{global_step}\n')
+                (best_dir / 'config.json').write_text(json.dumps(config.to_dict(), indent=2))
+                logger.info(
+                    f"[sg_only] NEW BEST Val IoU {val_iou:.4f} -> "
+                    f"best_model/checkpoint_step.txt = {global_step}"
+                )
+
+    if is_distributed:
+        dist.destroy_process_group()
+    return
+
+
 def main(args):
     """Main training function with distributed training support."""
     # Set optimal environment variables
     set_optimal_environment()
-    
+
     # Load config
     if args.config and os.path.exists(args.config):
         config = load_config_from_file(args.config)
     else:
         config = get_default_config()
+
+    # ---------------------------------------------------------------
+    # Fork to the standalone SG-generator trainer BEFORE any Qwen
+    # loading happens. When training.phase == 'sg_only' AND the config
+    # supplies a model.sg_generator block, the standalone trainer
+    # takes over: no Qwen backbone, no LoRA, no VQA heads, no LM. Just
+    # image -> scene-graph -> Hungarian loss.
+    # ---------------------------------------------------------------
+    _phase_for_dispatch = str(getattr(config.training, 'phase', 'standard')).lower()
+    _sg_gen_cfg = getattr(config.model, 'sg_generator', None)
+    if _phase_for_dispatch == 'sg_only' and _sg_gen_cfg:
+        return _train_standalone_sg_generator(args, config, _sg_gen_cfg)
     
     # ========================================
     # HARDWARE AUTO-DETECTION AND OPTIMIZATION
@@ -2211,6 +2469,43 @@ def main(args):
         torch_dtype=_qwen_dtype,
         freeze_sg_generator=_freeze_sg,
     )
+
+    # -----------------------------------------------------------
+    # Load pretrained standalone SG generator (Stages 2-4).
+    # When config.model.sg_generator.checkpoint is set, we swap the
+    # SSGVQANetV2's internal SceneGraphGenerator for the trained
+    # standalone one and load its weights from disk. The generator
+    # then runs frozen (freeze_sg_generator is already True for
+    # non-sg_only phases). Downstream forward is unchanged because
+    # the interface between generator and encoder is symbolic.
+    # -----------------------------------------------------------
+    _sg_gen_cfg_for_load = getattr(config.model, 'sg_generator', None)
+    if _sg_gen_cfg_for_load and _sg_gen_cfg_for_load.get('checkpoint'):
+        from models.sg_generators import get_sg_generator
+        _swap_path = Path(_sg_gen_cfg_for_load['checkpoint'])
+        if (_swap_path / 'checkpoint_step.txt').exists():
+            _step = int((_swap_path / 'checkpoint_step.txt').read_text().strip())
+            _swap_path = _swap_path.parent / f'checkpoint-{_step}'
+        _bin = _swap_path / 'sg_generator.pt'
+        if _bin.exists():
+            _swap_kwargs = {k: v for k, v in _sg_gen_cfg_for_load.items()
+                            if k not in ('name', 'checkpoint', 'frozen')}
+            new_gen = get_sg_generator(_sg_gen_cfg_for_load['name'], **_swap_kwargs)
+            new_gen.load_weights(str(_bin), strict=False)
+            model.sg_generator = new_gen  # swap in the standalone module
+            if is_main_process(local_rank):
+                logger.info(
+                    f"Loaded standalone SG generator "
+                    f"'{_sg_gen_cfg_for_load['name']}' from {_bin} "
+                    "and swapped into SSGVQANetV2.sg_generator "
+                    f"(frozen={not _freeze_sg is False})"
+                )
+        elif is_main_process(local_rank):
+            logger.warning(
+                f"config.model.sg_generator.checkpoint={_swap_path} does not "
+                "contain sg_generator.pt; leaving the untrained internal "
+                "SceneGraphGenerator in place."
+            )
 
     # Dtype consistency: Qwen runs in fp16 (or bf16 on Ampere+) but the v2
     # custom modules (SG encoder/projector, grounding head, aux heads, mHC)

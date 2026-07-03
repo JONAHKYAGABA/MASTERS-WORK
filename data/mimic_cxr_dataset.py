@@ -719,6 +719,15 @@ class MIMICCXRVQADataset(Dataset):
         # FALLBACK_LOCALIZATION obs that gave Stage 1 garbage bbox targets
         # (sg_loss plateaued at 4.71 across runs).
         self.min_localization_quality = int(min_localization_quality)
+
+        # use_collapsed_vocab: when True, gt_entities and gt_regions are
+        # mapped through data.vocab_collapse (237 -> 22 entities, 310 -> 30
+        # regions). Required for training the standalone SG generator
+        # because per-class sample density jumps ~10x on the collapsed vocab
+        # and detection becomes learnable. Default False for backwards
+        # compatibility with existing v2 checkpoints; toggle from Stage 1
+        # config only.
+        self.use_collapsed_vocab = False  # set later by trainer if configured
         # When use_reports is on, we prepend clinical-context ("Clinical context: ...")
         # to the question text before tokenization. Indication is short (~30-80 tokens)
         # so bump max_question_length so the question itself doesn't get truncated.
@@ -2012,9 +2021,8 @@ class MIMICCXRVQADataset(Dataset):
                 entity_name = obs_entities[0].lower() if isinstance(obs_entities[0], str) else 'unknown'
                 entity_id = self.sg_processor.entity_to_idx.get(entity_name, 0)
             else:
+                entity_name = None
                 entity_id = 0
-            entities.append(entity_id)
-            
             # Region
             obs_regions = obs.get('regions', [])
             if obs_regions:
@@ -2024,7 +2032,20 @@ class MIMICCXRVQADataset(Dataset):
                     region_name = str(obs_regions[0]).lower()
                 region_id = self.sg_processor.region_to_idx.get(region_name, 0)
             else:
+                region_name = None
                 region_id = 0
+
+            # Collapse to Chest ImaGenome-style small vocab when requested.
+            # Preserves Stage-2+ backwards compat (they train on 237/310) but
+            # lets the standalone Stage-1 SG generator learn on 22/30.
+            if getattr(self, 'use_collapsed_vocab', False):
+                from data.vocab_collapse import (
+                    collapse_entity_id, collapse_region_id,
+                )
+                entity_id = collapse_entity_id(entity_id, name=entity_name)
+                region_id = collapse_region_id(region_id, name=region_name)
+
+            entities.append(entity_id)
             regions.append(region_id)
             
             # Positiveness
