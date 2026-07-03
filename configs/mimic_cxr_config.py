@@ -50,6 +50,26 @@ class ModelConfig:
     max_question_length: int = 128
     vocab_size: int = 30522  # BERT vocab size
 
+    # ----- V2 (Qwen VLM) keys -----
+    qwen_model_id: Optional[str] = None
+    use_quantization: Optional[bool] = None
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_target_modules: Optional[List[str]] = None
+    num_sg_tokens: int = 8
+
+    # ----- V2 standalone scene-graph generator -----
+    # When non-None, train_mimic_cxr.py dispatches to the standalone SG
+    # generator trainer at phase=sg_only, and swaps the loaded generator
+    # into SSGVQANetV2.sg_generator at phases 2-4. Shape:
+    #   sg_generator:
+    #     name: txrv_detr
+    #     num_entities: 22
+    #     num_regions: 30
+    #     checkpoint: ./checkpoints/.../best_model   # frozen load in stages 2-4
+    #     frozen: true
+    sg_generator: Optional[Dict[str, Any]] = None
+
 
 @dataclass
 class DataConfig:
@@ -78,6 +98,27 @@ class DataConfig:
     image_size: int = 224
     normalize_mean: List[float] = field(default_factory=lambda: [0.485, 0.456, 0.406])
     normalize_std: List[float] = field(default_factory=lambda: [0.229, 0.224, 0.225])
+
+    # ----- V2 additions -----
+    # Question-type blacklist applied AFTER the whitelist (question_types).
+    # Stage 4 drops A_indication/A_history/A_technique/A_comparison because
+    # those ask about report free text, not the image.
+    skip_question_types: Optional[List[str]] = None
+
+    # Drop scene-graph observations whose QBA localization_quality is below
+    # this level. Stage 1 sets it to 3 (BBOX_LOCALIZATION); leaves 0 elsewhere
+    # so VQA training still sees all observations.
+    min_localization_quality: int = 0
+
+    # Cap on val dataset size when not using --max_samples. Bumped from
+    # the implicit 250 to 1000 so a single eval can distinguish runs with
+    # better than +/-6pp 95% CI.
+    val_samples: Optional[int] = None
+
+    # Override quality_grade for the val dataset only. Used by Stage 4's
+    # train-B/val-A pattern when we want a wider train pool but still
+    # measure on the target A distribution.
+    val_quality_grade: Optional[str] = None
 
 
 @dataclass
@@ -148,6 +189,11 @@ class TrainingConfig:
     # Reproducibility
     seed: int = 42
 
+    # Exponential moving average of weights, used for validation and best-model
+    # save. 0.0 = disabled (backwards-compat default). 0.999 is a reasonable
+    # value for LoRA fine-tuning at Stage 3/4.
+    ema_decay: float = 0.0
+
 
 @dataclass
 class WandbConfig:
@@ -216,19 +262,35 @@ class MIMICCXRVQAConfig:
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "MIMICCXRVQAConfig":
-        """Create config from dictionary."""
-        model_config = ModelConfig(**config_dict.get('model', {}))
-        data_config = DataConfig(**config_dict.get('data', {}))
-        training_config = TrainingConfig(**config_dict.get('training', {}))
-        wandb_config = WandbConfig(**config_dict.get('wandb', {}))
-        deepspeed_config = DeepSpeedConfig(**config_dict.get('deepspeed', {}))
-        
+        """Create config from dictionary. Silently drops keys not in the
+        declared dataclass fields so YAMLs can carry annotations, legacy v1
+        keys, and future experimental toggles without blowing up the loader.
+        A warning is logged for each dropped key so mistakes still surface.
+        """
+        import dataclasses
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+
+        def _filter(dc_cls, raw: Dict[str, Any]) -> Dict[str, Any]:
+            known = {f.name for f in dataclasses.fields(dc_cls)}
+            kept: Dict[str, Any] = {}
+            for k, v in (raw or {}).items():
+                if k in known:
+                    kept[k] = v
+                else:
+                    _log.info(
+                        f"[config] dropping unknown {dc_cls.__name__} key "
+                        f"'{k}' (not a declared field). This is safe if the "
+                        f"trainer reads the key via getattr(config.*, ...)."
+                    )
+            return kept
+
         return cls(
-            model=model_config,
-            data=data_config,
-            training=training_config,
-            wandb=wandb_config,
-            deepspeed=deepspeed_config
+            model=ModelConfig(**_filter(ModelConfig, config_dict.get('model', {}))),
+            data=DataConfig(**_filter(DataConfig, config_dict.get('data', {}))),
+            training=TrainingConfig(**_filter(TrainingConfig, config_dict.get('training', {}))),
+            wandb=WandbConfig(**_filter(WandbConfig, config_dict.get('wandb', {}))),
+            deepspeed=DeepSpeedConfig(**_filter(DeepSpeedConfig, config_dict.get('deepspeed', {}))),
         )
 
 
