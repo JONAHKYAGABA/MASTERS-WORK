@@ -56,8 +56,12 @@ data:
   mimic_ext_cxr_qba_path: "/root/code/MASTERS-WORK/data/mimic-ext-cxr-qba"
   chexpert_labels_path: ""
 
-  # Stage 1 uses B-grade pool (per user's curriculum: grade B for pretraining)
-  quality_grade: "B"
+  # Stage 1 uses A-grade pool: clean labels give the fresh CXR-pretrained
+  # DETR-based detector the strongest possible supervision. Capped at 100K
+  # via --max_samples on the CLI. Combined with min_localization_quality
+  # below and view_filter=frontal_only, the effective train pool is 30-70K
+  # studies with real bboxes -- perfect for the small collapsed vocab.
+  quality_grade: "A"
   view_filter: "frontal_only"
   question_types: null
 

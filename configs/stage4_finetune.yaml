@@ -90,14 +90,12 @@ data:
   mimic_ext_cxr_qba_path: "/root/code/MASTERS-WORK/data/mimic-ext-cxr-qba"
   chexpert_labels_path: ""
 
-  # A+B BLEND for training (was A-only).
-  # A-only training on ~76K samples overfit hard (E1 0.464 -> E2 0.336).
-  # The B-grade pool includes A (B is "B-or-better"), so setting B here
-  # trains on ~106K samples that include the clean A subset. Validation
-  # runs on A-only via val_quality_grade below, so we still measure the
-  # target distribution but no longer overfit to it.
-  quality_grade: "B"
-  val_quality_grade: "A"   # only meaningful when train quality != val quality
+  # Pure A-grade (per user's launch spec: 100K A-grade for Stage 4).
+  # Cap via --max_samples on the CLI. Overfit protection now comes from
+  # num_epochs=1 + EMA + tighter eval cadence + LoRA rank 32 + bumped
+  # regularisation (weight_decay=0.05) rather than the A+B blend.
+  quality_grade: "A"
+  val_quality_grade: "A"
   view_filter: "frontal_only"
   question_types: null
   # Drop question types that ask about report free-text (indication, history,
