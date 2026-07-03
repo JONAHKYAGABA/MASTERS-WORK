@@ -1963,11 +1963,15 @@ def main(args):
     #   min_localization_quality: int - drop obs with QBA loc_q < N from
     #     SG-target extraction (Stage 1 only; default 0 = off).
     #   val_samples: int - cap on val dataset size when not using max_samples.
+    #   val_quality_grade: str - override quality_grade for val dataset only.
+    #     Enables "train on B (includes A), validate on A" pattern for
+    #     Stage 4 to prevent overfitting on the ~76K A-only pool.
     _skip_qtypes = getattr(config.data, 'skip_question_types', None) or None
     _min_loc_q = int(getattr(config.data, 'min_localization_quality', 0))
     _val_samples = getattr(config.data, 'val_samples', None)
     if _val_samples is not None:
         _val_samples = int(_val_samples)
+    _val_quality_grade = getattr(config.data, 'val_quality_grade', None) or config.data.quality_grade
 
     train_dataset = MIMICCXRVQADataset(
         mimic_cxr_path=config.data.mimic_cxr_jpg_path,
@@ -1995,13 +1999,19 @@ def main(args):
 
     # Val sample cap: CLI --max_samples//10 wins; otherwise use config.val_samples.
     _val_cap = (args.max_samples // 10) if args.max_samples else _val_samples
+    if is_main_process(local_rank) and _val_quality_grade != config.data.quality_grade:
+        logger.info(
+            f"Val uses stricter quality_grade='{_val_quality_grade}' "
+            f"(train uses '{config.data.quality_grade}'). Enables "
+            f"train-on-B-validate-on-A pattern."
+        )
     val_dataset = MIMICCXRVQADataset(
         mimic_cxr_path=config.data.mimic_cxr_jpg_path,
         mimic_qa_path=config.data.mimic_ext_cxr_qba_path,
         split='validate',
         tokenizer_name=config.model.text_encoder,
         max_question_length=config.model.max_question_length,
-        quality_grade=config.data.quality_grade,
+        quality_grade=_val_quality_grade,
         view_filter=config.data.view_filter,
         question_types=config.data.question_types if config.data.question_types else None,
         skip_question_types=_skip_qtypes,
@@ -2153,12 +2163,16 @@ def main(args):
     )
     _use_quant = bool(getattr(config.model, 'use_quantization', _force_qlora))
     _lora_rank = int(getattr(config.model, 'lora_rank', 16))
+    _lora_alpha = int(getattr(config.model, 'lora_alpha', 2 * _lora_rank))
+    _lora_targets = getattr(config.model, 'lora_target_modules', None) or None
     _num_sg_tokens = int(getattr(config.model, 'num_sg_tokens', 8))
 
     if is_main_process(local_rank):
         logger.info(
             f"V2 model: {_qwen_id} | cc={_gpu0_cc} | quantization={_use_quant} "
-            f"| lora_rank={_lora_rank} | num_sg_tokens={_num_sg_tokens} "
+            f"| lora_rank={_lora_rank} | lora_alpha={_lora_alpha} "
+            f"| lora_targets={_lora_targets or '(default: attn only)'} "
+            f"| num_sg_tokens={_num_sg_tokens} "
             f"| dtype={_qwen_dtype} | training_mode={_phase}"
         )
         if _force_qlora and not _use_quant:
@@ -2184,6 +2198,8 @@ def main(args):
         qwen_model_id=_qwen_id,
         use_quantization=_use_quant or _force_qlora,
         lora_rank=_lora_rank,
+        lora_alpha=_lora_alpha,
+        lora_target_modules=_lora_targets,
         num_sg_tokens=_num_sg_tokens,
         num_regions=config.model.num_regions,
         num_entities=config.model.num_entities,

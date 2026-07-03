@@ -24,6 +24,10 @@
 #     --resume_from_checkpoint checkpoints/mimic-cxr-vqa/pretrain/best_model
 
 model:
+  # These 12 keys are legacy v1 (ConvNeXt + BioBERT) and are NOT read by the
+  # v2 trainer. Kept for historical parity; ignore. The v2-relevant keys are
+  # qwen_model_id / use_quantization / lora_rank / lora_alpha /
+  # lora_target_modules / num_sg_tokens / num_*_classes.
   visual_backbone: "convnext_base"
   text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
   visual_feature_dim: 512
@@ -50,13 +54,34 @@ model:
   max_question_length: 128
   vocab_size: 30522
 
+  # V2 LoRA config -- these ARE read by the trainer (via getattr on
+  # config.model). Rank 32 + full attention + MLP targets = bigger
+  # adaptation surface than the default rank-16 attention-only; still
+  # cheap on 48 GB Turing.
+  lora_rank: 32
+  lora_alpha: 64
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
 data:
   mimic_cxr_jpg_path: "/root/code/MASTERS-WORK/data/mimic-cxr-jpg"
   mimic_ext_cxr_qba_path: "/root/code/MASTERS-WORK/data/mimic-ext-cxr-qba"
   chexpert_labels_path: ""
 
-  # A-grade ONLY (per curriculum: grade A for finetuning)
-  quality_grade: "A"
+  # A+B BLEND for training (was A-only).
+  # A-only training on ~76K samples overfit hard (E1 0.464 -> E2 0.336).
+  # The B-grade pool includes A (B is "B-or-better"), so setting B here
+  # trains on ~106K samples that include the clean A subset. Validation
+  # runs on A-only via val_quality_grade below, so we still measure the
+  # target distribution but no longer overfit to it.
+  quality_grade: "B"
+  val_quality_grade: "A"   # only meaningful when train quality != val quality
   view_filter: "frontal_only"
   question_types: null
   # Drop question types that ask about report free-text (indication, history,
@@ -112,17 +137,25 @@ training:
   ema_decay: 0.999
 
   # =====================================================
-  # STAGE 4 LOSS WEIGHTS — finetune (grd boosted to 3.0)
+  # STAGE 4 LOSS WEIGHTS — finetune
   # =====================================================
-  vqa_loss_weight: 0.05
+  # vqa_loss_weight bumped from 0.05 -> 0.15. The classification head
+  # (binary/category/region/severity) was starving at 0.05; combined with
+  # the earlier metric-routing bug that made Val Binary Acc read 0.0000
+  # across all stages, we had no signal that the head was learning at all.
+  # 0.15 gives it real gradient without drowning the generation loss.
+  vqa_loss_weight: 0.15
   generation_loss_weight: 1.0
   chexpert_loss_weight: 0.3        # bumped from 0.05; was vestigial
                                    # (AUROC oscillated 0.50-0.69 because the
                                    # head got almost no gradient).
   scene_graph_loss_weight: 0.0     # SG frozen
-  grounding_loss_weight: 3.0       # PRIMARY — boosted from Stage 3's 2.0
-  binary_head_weight: 0.1
-  category_head_weight: 0.1
+  grounding_loss_weight: 3.0       # PRIMARY -- boosted from Stage 3's 2.0
+  # Per-head weights bumped 0.1 -> 0.2 for the priority binary and category
+  # heads. ~36% of A-grade pairs are binary; getting that head off 0% is the
+  # single largest headline-accuracy lever we have.
+  binary_head_weight: 0.2
+  category_head_weight: 0.2
   region_head_weight: 0.1
   severity_head_weight: 0.1
 

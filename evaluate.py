@@ -896,6 +896,12 @@ def main():
                        help='Evaluation batch size')
     parser.add_argument('--compute_attention', action='store_true',
                        help='Compute attention-based explainability metrics')
+    parser.add_argument('--zero_sg_tokens', action='store_true',
+                       help='Ablation: zero the SG soft tokens before injection '
+                            'into the LM. Everything else runs normally. Use to '
+                            'measure whether the scene-graph pathway is actually '
+                            'carrying signal end-to-end. Compare metrics against '
+                            'a normal run of the same checkpoint.')
     
     # Cross-dataset evaluation arguments
     parser.add_argument('--cross_dataset', action='store_true',
@@ -926,6 +932,14 @@ def main():
     model = MIMICCXRVQAModel.from_pretrained(args.model_path)
     model = model.to(device)
     model.eval()
+
+    # Toggle the SG-ablation mode on the module so every forward zeros the
+    # soft tokens. Set at model level (rather than per-call) because
+    # evaluate_model() lives further down and touching its signature isn't
+    # worth it for a one-flag ablation.
+    if args.zero_sg_tokens:
+        setattr(model, 'zero_sg_tokens', True)
+        logger.info("ABLATION: SG soft tokens will be zeroed before injection.")
     
     # Load test dataset
     test_data_path = args.test_data or config.data.mimic_cxr_jpg_path

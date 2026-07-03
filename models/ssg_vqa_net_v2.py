@@ -1607,6 +1607,14 @@ class SSGVQANetV2(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         answer_ids: Optional[torch.Tensor] = None,
+        # Ablation: when True, projected SG soft tokens are zeroed BEFORE
+        # injection so the Qwen LM sees zero vectors at every <|sg_token_k|>
+        # position. Used to test whether the scene-graph pathway is actually
+        # carrying signal end-to-end (a-priori evidence says it isn't; flat
+        # SG IoU across all four stages coincided with monotonic downstream
+        # improvement). Set via evaluate.py --zero_sg_tokens or by setting
+        # self.zero_sg_tokens on the module.
+        zero_sg_tokens: Optional[bool] = None,
         **_unused,
     ) -> Dict[str, Any]:
         device = next(self.parameters()).device
@@ -1654,6 +1662,18 @@ class SSGVQANetV2(nn.Module):
         # ---- 3. Encode SG dicts → node features → soft tokens -----------------
         sg_nodes, sg_mask = self.sg_encoder(scene_graphs, device)
         sg_tokens = self.sg_projector(sg_nodes, sg_mask)  # (B, K, d_llm)
+
+        # Ablation: zero the soft tokens if the caller asked (per-call kwarg)
+        # or the module-level attribute is set. The scene graphs, encoder,
+        # projector, and injector all still run so the graph does not
+        # change shape — only the values passed to the LM are zeroed.
+        _zero_sg = (
+            zero_sg_tokens
+            if zero_sg_tokens is not None
+            else bool(getattr(self, "zero_sg_tokens", False))
+        )
+        if _zero_sg:
+            sg_tokens = torch.zeros_like(sg_tokens)
 
         # ---- 4. Compute inputs_embeds and splice SG tokens into the stream ---
         # Qwen handles image-token substitution inside its forward when
