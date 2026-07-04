@@ -1728,6 +1728,34 @@ def _train_standalone_sg_generator(args, config, sg_gen_cfg):
             + "=" * 60
         )
 
+    # ---- Wandb (main rank only) ----------------------------------
+    # Standalone SG training now logs to wandb just like the monolithic
+    # trainer. Same config.wandb block; project/entity/name come from
+    # the yaml. We init here rather than reuse setup_wandb() because
+    # setup_wandb is tightly coupled to the monolithic model + args.
+    _wandb_run = None
+    if is_main_process(local_rank) and WANDB_AVAILABLE and \
+            getattr(config.wandb, 'enabled', False):
+        try:
+            import wandb
+            _wandb_run = wandb.init(
+                project=getattr(config.wandb, 'project', 'mimic-cxr-vqa'),
+                entity=(getattr(config.wandb, 'entity', '') or None),
+                name=(getattr(config.wandb, 'name', '') or None),
+                group=getattr(config.wandb, 'group', 'curriculum'),
+                tags=list(getattr(config.wandb, 'tags', [])) + ['standalone-sg'],
+                notes=getattr(config.wandb, 'notes', ''),
+                config=config.to_dict(),
+                reinit=True,
+            )
+            wandb.define_metric('sg/train_loss', summary='min')
+            wandb.define_metric('sg/val_mean_iou', summary='max')
+            wandb.define_metric('sg/val_iou50_rate', summary='max')
+            logger.info(f"wandb run started: {_wandb_run.id}")
+        except Exception as _e:
+            logger.warning(f"wandb init failed: {_e}; continuing without wandb.")
+            _wandb_run = None
+
     # -----------------------------------------------------------
     # Build the generator + optionally load a warm-start ckpt.
     # -----------------------------------------------------------
@@ -1903,37 +1931,77 @@ def _train_standalone_sg_generator(args, config, sg_gen_cfg):
                     f"[sg_only] epoch={epoch} step={global_step} "
                     f"loss={float(loss):.4f}"
                 )
+                if _wandb_run is not None:
+                    try:
+                        import wandb
+                        wandb.log({
+                            'sg/train_loss': float(loss),
+                            'sg/epoch': epoch,
+                            'sg/lr': float(optimizer.param_groups[0]['lr']),
+                        }, step=global_step)
+                    except Exception:
+                        pass
 
         # ---- Per-epoch validation ----
+        # Metric: for each GT bbox, find the prediction with the best IoU
+        # (across ALL N proposals), then average. Old top-1-vs-first-gt
+        # metric was too strict for QBA's small anatomical boxes and
+        # collapsed to 0.0000 even for a trained model whose loss
+        # descended from 6 -> 1.5. This one is a fair mAR@N proxy.
         if is_main_process(local_rank):
+            from torchvision.ops import box_iou
             generator.eval()
             iou_sum, n = 0.0, 0
+            iou50_hits = 0
             with torch.no_grad():
                 for batch in val_dl:
                     images = batch['images'].to(device, non_blocking=True)
                     out = generator(images, return_dicts=False)
-                    boxes = out['raw']['bbox_preds']
+                    boxes = out['raw']['bbox_preds']  # (B, N, 4) [0,1] xyxy
                     gt = batch.get('gt_sg_bboxes')
                     if gt is None:
                         continue
-                    # Cheap proxy: mean per-image IoU@1 with top-objectness box
-                    objs = out['raw']['objectness_scores']
-                    top = objs.argmax(dim=1)
                     for b in range(boxes.size(0)):
-                        pred = boxes[b, top[b]].cpu().tolist()
-                        target = gt[b][0].cpu().tolist() if len(gt[b]) else None
-                        if target is None:
+                        preds_b = boxes[b].detach().float().cpu()  # (N, 4)
+                        gt_b = gt[b]
+                        if gt_b is None or len(gt_b) == 0:
                             continue
-                        # simple xyxy IoU
-                        x1 = max(pred[0], target[0]); y1 = max(pred[1], target[1])
-                        x2 = min(pred[2], target[2]); y2 = min(pred[3], target[3])
-                        inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-                        pa = (pred[2] - pred[0]) * (pred[3] - pred[1])
-                        ta = (target[2] - target[0]) * (target[3] - target[1])
-                        iou = inter / (pa + ta - inter + 1e-9)
-                        iou_sum += float(iou); n += 1
+                        if not torch.is_tensor(gt_b):
+                            gt_b = torch.as_tensor(gt_b)
+                        gt_b = gt_b.detach().float().cpu()
+                        if gt_b.dim() == 1:
+                            gt_b = gt_b.unsqueeze(0)
+                        # Skip degenerate GT boxes.
+                        w = gt_b[:, 2] - gt_b[:, 0]
+                        h = gt_b[:, 3] - gt_b[:, 1]
+                        valid = (w > 0) & (h > 0)
+                        if not valid.any():
+                            continue
+                        gt_b = gt_b[valid]
+                        # Pairwise IoU (N_pred, N_gt), take best pred per GT.
+                        pairwise = box_iou(preds_b, gt_b)  # (N_pred, N_gt)
+                        best_per_gt, _ = pairwise.max(dim=0)  # (N_gt,)
+                        iou_sum += float(best_per_gt.sum().item())
+                        n += int(best_per_gt.numel())
+                        iou50_hits += int((best_per_gt >= 0.5).sum().item())
             val_iou = iou_sum / max(n, 1)
-            logger.info(f"[sg_only] epoch={epoch} Val SG mean IoU@1 = {val_iou:.4f}")
+            iou50_rate = iou50_hits / max(n, 1)
+            logger.info(
+                f"[sg_only] epoch={epoch} "
+                f"Val SG mean best-IoU per GT = {val_iou:.4f} "
+                f"(IoU>=0.5 rate = {iou50_rate:.4f}, matched {n} GT bboxes)"
+            )
+            if _wandb_run is not None:
+                try:
+                    import wandb
+                    wandb.log({
+                        'sg/val_mean_iou': val_iou,
+                        'sg/val_iou50_rate': iou50_rate,
+                        'sg/val_matched_gt': n,
+                        'sg/epoch': epoch,
+                    }, step=global_step)
+                except Exception:
+                    pass
 
             # Save every epoch, best-marker on improvement
             step_dir = out_dir / f'checkpoint-{global_step}'
@@ -1952,6 +2020,12 @@ def _train_standalone_sg_generator(args, config, sg_gen_cfg):
                     f"best_model/checkpoint_step.txt = {global_step}"
                 )
 
+    if is_main_process(local_rank) and _wandb_run is not None:
+        try:
+            import wandb
+            wandb.finish(exit_code=0)
+        except Exception:
+            pass
     if is_distributed:
         dist.destroy_process_group()
     return
