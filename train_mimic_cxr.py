@@ -2348,8 +2348,24 @@ def main(args):
     if is_distributed:
         dist.barrier()
 
-    # Val sample cap: CLI --max_samples//10 wins; otherwise use config.val_samples.
-    _val_cap = (args.max_samples // 10) if args.max_samples else _val_samples
+    # Val sample cap priority (tightest wins):
+    #   1. yaml val_samples if set (explicit intent -- Stage 2's generation-
+    #      based val on 25K samples takes 19h and the last NCCL-timeout
+    #      crash cost us 22h of Stage 2 progress).
+    #   2. --max_samples // 10 (proportional cap for smoke runs).
+    # Take min so `--max_samples 250000` never blows through the yaml's
+    # explicit `val_samples: 1000`.
+    _val_cli = (args.max_samples // 10) if args.max_samples else None
+    _val_cap = None
+    for _c in (_val_samples, _val_cli):
+        if _c is None:
+            continue
+        _val_cap = _c if _val_cap is None else min(_val_cap, _c)
+    if is_main_process(local_rank):
+        logger.info(
+            f"Val cap = {_val_cap} (yaml val_samples={_val_samples}, "
+            f"cli --max_samples//10={_val_cli}). Tightest wins."
+        )
     if is_main_process(local_rank) and _val_quality_grade != config.data.quality_grade:
         logger.info(
             f"Val uses stricter quality_grade='{_val_quality_grade}' "
