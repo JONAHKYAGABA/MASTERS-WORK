@@ -3071,6 +3071,26 @@ def main(args):
     # of training for that epoch). Real bug discovered in Stage 2 of the
     # budget curriculum — lost ~96% of epoch 1 after auto_resume from
     # checkpoint-500 (12500 steps_per_epoch → 500/12500 = 4% complete).
+    # --------------------------------------------------------------
+    # Cross-stage resume: --reset_scheduler ALSO resets the step and
+    # epoch counters. Without this, Stage 2's terminal counter
+    # (global_step = 15624, epoch = 2) got inherited into Stage 3 whose
+    # own total_steps was also 15624, so Stage 3 immediately fell out of
+    # the training loop with "Training complete!" and then crashed on
+    # UnboundLocalError: local variable 'epoch' referenced before
+    # assignment. When user passes --reset_scheduler they mean "this is
+    # a new stage, treat the resumed weights as an initialisation, not
+    # as a mid-run continuation".
+    # --------------------------------------------------------------
+    if getattr(args, 'reset_scheduler', False) and resume_epoch > 0:
+        if is_main_process(local_rank):
+            logger.info(
+                f"--reset_scheduler set: also resetting step/epoch counters "
+                f"(was step={resume_step}, epoch={resume_epoch}) -> "
+                f"step=0, start_epoch=1. Weights kept as-is."
+            )
+        resume_step = 0
+        resume_epoch = 0
     if resume_epoch > 0:
         steps_per_epoch = len(train_dataloader) // config.training.gradient_accumulation_steps
         was_mid_epoch = steps_per_epoch > 0 and (resume_step % steps_per_epoch) != 0
@@ -3128,6 +3148,11 @@ def main(args):
     best_metric = 0.0
     # global_step is already set from resume_step above (0 for fresh / finetune)
     epochs_without_improvement = 0
+    # Initialise `epoch` before the loop so post-loop cleanup / final save
+    # never crashes with UnboundLocalError when the loop body doesn't run
+    # (e.g. a resumed run whose start_epoch already equals num_epochs+1).
+    # Also serves as a sensible fallback value for wandb metadata.
+    epoch = start_epoch - 1
     
     if is_main_process(local_rank):
         logger.info("Starting training...")
