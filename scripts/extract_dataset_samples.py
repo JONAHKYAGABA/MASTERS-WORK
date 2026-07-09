@@ -455,6 +455,33 @@ def _write_text_bundle(sample: Dict[str, Any],
             if a.get("modifiers"):
                 lines.append(f"      modifiers: {a['modifiers']}")
 
+    # Clinical context (INDICATION / HISTORY / EXAM_TECHNIQUE) pulled from
+    # the scene_graph.json's `sentences` block. This is what the trainer's
+    # --use_reports flag prepends to the question as "Clinical context:".
+    clinical = sample.get("_clinical") or {}
+    if clinical:
+        lines += [
+            "",
+            "=" * 70,
+            "CLINICAL CONTEXT (from scene_graph.json report sentences)",
+            "=" * 70,
+            f"Indication      : {clinical.get('indication_text', '') or '(none)'}",
+            f"History         : {clinical.get('history_text', '') or '(none)'}",
+            f"Exam technique  : {clinical.get('technique_text', '') or '(none)'}",
+            f"Findings        : {clinical.get('findings_text', '') or '(none)'}",
+            f"Impression      : {clinical.get('impression_text', '') or '(none)'}",
+        ]
+        struct = clinical.get("indication_struct") or {}
+        if isinstance(struct, dict) and struct:
+            lines += ["", "-" * 70, "STRUCTURED INDICATION BLOCK", "-" * 70]
+            for k in ("indication_summary", "patient_info", "clinical_indication",
+                      "expected_evaluation", "answer_for_indication"):
+                v = struct.get(k)
+                if v:
+                    if isinstance(v, (list, dict)):
+                        v = json.dumps(v, ensure_ascii=False)
+                    lines.append(f"  {k:<22s}: {v}")
+
     lines += [
         "",
         "=" * 70,
@@ -562,10 +589,259 @@ def _render_chexpert(sample: Dict[str, Any],
     canvas.save(out_path, format="PNG")
 
 
+def _extract_clinical_context(sg: Dict[str, Any]) -> Dict[str, Any]:
+    """Pull INDICATION + HISTORY + EXAM_TECHNIQUE from a QBA scene_graph.json.
+
+    QBA embeds the original report text under two shapes we care about:
+
+    1. ``sentences``: a dict keyed by section_type where each entry is
+       either a list of strings or a list of dicts with a ``text`` field.
+       Section types include INDICATION, HISTORY, EXAM_TECHNIQUE,
+       FINDINGS, IMPRESSION, COMPARISON, WET_READ.
+    2. ``indication``: a structured dict with keys such as
+       ``indication_summary``, ``patient_info``, ``clinical_indication``,
+       ``expected_evaluation``, ``answer_for_indication``. This is what
+       the QBA question-generation pipeline uses to construct
+       "Indication" questions and is exactly what the trainer's
+       ``--use_reports`` flag prepends to the question.
+
+    Returns a dict:
+        {
+          "indication_text":  concatenated INDICATION sentences (str),
+          "history_text":     concatenated HISTORY sentences (str),
+          "technique_text":   concatenated EXAM_TECHNIQUE sentences (str),
+          "findings_text":    concatenated FINDINGS sentences (str),
+          "impression_text":  concatenated IMPRESSION sentences (str),
+          "indication_struct": raw dict from sg["indication"] (or {}),
+        }
+
+    Any missing section is returned as "".
+    """
+    def _flatten(v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, list):
+            parts = []
+            for item in v:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    for k in ("text", "sentence", "value"):
+                        if k in item and isinstance(item[k], str):
+                            parts.append(item[k])
+                            break
+            return " ".join(p.strip() for p in parts if p and p.strip())
+        if isinstance(v, dict):
+            for k in ("text", "sentence", "value"):
+                if k in v and isinstance(v[k], str):
+                    return v[k].strip()
+        return ""
+
+    sentences = sg.get("sentences") or {}
+    if not isinstance(sentences, dict):
+        sentences = {}
+
+    def _sec(name: str) -> str:
+        # try exact + lowercased + a couple of aliases
+        for key in (name, name.lower(), name.upper(),
+                    name.title().replace("_", " ")):
+            if key in sentences:
+                return _flatten(sentences[key])
+        return ""
+
+    result = {
+        "indication_text":  _sec("INDICATION"),
+        "history_text":     _sec("HISTORY"),
+        "technique_text":   _sec("EXAM_TECHNIQUE"),
+        "findings_text":    _sec("FINDINGS"),
+        "impression_text":  _sec("IMPRESSION"),
+        "indication_struct": sg.get("indication") if isinstance(sg.get("indication"), dict) else {},
+    }
+    return result
+
+
+def _render_paper_figure(sample: Dict[str, Any],
+                         observations: List[Dict[str, Any]],
+                         clinical: Dict[str, Any],
+                         out_path: Path,
+                         render_size: Tuple[int, int]) -> None:
+    """Render a single publication-ready PNG combining, top-to-bottom:
+
+        [ Clinical context text box    ]
+        [ X-ray  |  Scene-graph legend ]
+        [ Question + Answer row        ]
+
+    Designed for direct inclusion in the paper as a "sample walkthrough"
+    figure. Nothing is drawn on the X-ray itself apart from thin colored
+    bbox outlines + tiny digit tags; all readable text lives in the panels
+    above and beside the image so the anatomy is never occluded.
+    """
+    W, H = render_size
+    xray = Image.open(sample["image_path"]).convert("RGB")
+    if xray.size != (W, H):
+        xray = xray.resize((W, H))
+
+    # Layout constants
+    sidebar_w = 360
+    context_h = 180
+    footer_h = 130
+    canvas_w = W + sidebar_w
+    canvas_h = context_h + H + footer_h
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (245, 245, 247))
+    draw = ImageDraw.Draw(canvas, "RGBA")
+
+    # Fonts
+    f_title = _try_font(15)
+    f_hdr   = _try_font(13)
+    f_body  = _try_font(12)
+    f_small = _try_font(11)
+    f_tag   = _try_font(max(9, min(13, min(W, H) // 80)))
+
+    # ---- 1. Clinical-context header ---------------------------------
+    ctx_x0, ctx_y0 = 20, 12
+    draw.rectangle([10, 6, canvas_w - 10, context_h - 6],
+                   fill=(255, 255, 255), outline=(200, 200, 210), width=1)
+    if f_title:
+        draw.text((ctx_x0, ctx_y0), "Clinical context (from QBA scene graph)",
+                  fill=(30, 30, 40), font=f_title)
+        ctx_y0 += 22
+
+    def _wrap_lines(text: str, max_w: int, font) -> List[str]:
+        if not text or not font:
+            return [text] if text else []
+        words = text.split()
+        lines, cur = [], ""
+        for w in words:
+            trial = (cur + " " + w).strip()
+            tb = draw.textbbox((0, 0), trial, font=font)
+            if tb[2] - tb[0] <= max_w:
+                cur = trial
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        return lines
+
+    avail_w = canvas_w - 40
+    lh = 15
+    for label, val in (
+        ("Indication:", clinical.get("indication_text", "").strip() or "(none)"),
+        ("History:",    clinical.get("history_text", "").strip() or "(none)"),
+        ("Technique:",  clinical.get("technique_text", "").strip() or "(none)"),
+    ):
+        if f_hdr:
+            draw.text((ctx_x0, ctx_y0), label, fill=(80, 80, 100), font=f_hdr)
+            lbl_w = draw.textbbox((0, 0), label, font=f_hdr)[2] + 6
+        else:
+            lbl_w = 90
+        wrapped = _wrap_lines(val, avail_w - lbl_w, f_body)[:2]
+        for i, ln in enumerate(wrapped):
+            draw.text((ctx_x0 + lbl_w, ctx_y0 + i * lh), ln,
+                      fill=(30, 30, 40), font=f_body)
+        ctx_y0 += max(lh, lh * len(wrapped)) + 6
+        if ctx_y0 > context_h - 20:
+            break
+
+    # ---- 2. X-ray + scene-graph annotations -------------------------
+    canvas.paste(xray, (0, context_h))
+    draw.line([(W, context_h), (W, context_h + H)],
+              fill=(200, 200, 210), width=1)
+
+    # thin bboxes + digit tags on the X-ray
+    lw = max(1, min(W, H) // 400)
+    for i, obs in enumerate(observations):
+        color = _COLORS[i % len(_COLORS)]
+        x1, y1, x2, y2 = obs["bbox"]
+        px1, py1 = int(x1 * W), context_h + int(y1 * H)
+        px2, py2 = int(x2 * W), context_h + int(y2 * H)
+        draw.rectangle([px1, py1, px2, py2], outline=color, width=lw)
+        tag = str(i + 1)
+        if f_tag:
+            tb = draw.textbbox((0, 0), tag, font=f_tag)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        else:
+            tw, th = 8, 10
+        pad = 2
+        cx2 = px1 + tw + 2 * pad
+        cy2 = py1 + th + 2 * pad
+        draw.rectangle([px1, py1, cx2, cy2], fill=color)
+        kw = {"font": f_tag} if f_tag else {}
+        draw.text((px1 + pad, py1 + pad - 1), tag, fill="white", **kw)
+
+    # ---- 3. Scene-graph legend sidebar ------------------------------
+    lx = W + 12
+    ly = context_h + 10
+    if f_title:
+        draw.text((lx, ly), "Ground-truth scene graph",
+                  fill=(30, 30, 40), font=f_title)
+        ly += f_title.size + 8
+    if not observations:
+        if f_body:
+            draw.text((lx, ly), "(no localised observations)",
+                      fill=(120, 120, 130), font=f_body)
+    line_h = 14
+    for i, obs in enumerate(observations):
+        color = _COLORS[i % len(_COLORS)]
+        chip = 16
+        draw.rectangle([lx, ly, lx + chip, ly + chip], fill=color)
+        if f_tag:
+            tb = draw.textbbox((0, 0), str(i + 1), font=f_tag)
+            tx = lx + (chip - (tb[2] - tb[0])) // 2
+            ty = ly + (chip - (tb[3] - tb[1])) // 2 - 1
+            draw.text((tx, ty), str(i + 1), fill="white", font=f_tag)
+        tx0 = lx + chip + 6
+        pos = obs["positiveness"]
+        pos_color = ((60, 160, 70) if pos == "pos"
+                     else (220, 60, 60) if pos == "neg"
+                     else (140, 140, 140))
+        ent = obs["entity"][:32]
+        if f_body:
+            draw.text((tx0, ly), ent, fill=(30, 30, 40), font=f_body)
+        reg = "@ " + obs["region"][:28]
+        if f_small:
+            draw.text((tx0, ly + line_h), reg,
+                      fill=(100, 100, 120), font=f_small)
+            draw.text((tx0 + 220, ly + line_h), f"[{pos}]",
+                      fill=pos_color, font=f_small)
+        ly += 2 * line_h + 4
+        if ly > context_h + H - 20:
+            break
+
+    # ---- 4. Question/Answer footer ----------------------------------
+    fy = context_h + H + 12
+    draw.rectangle([10, fy - 6, canvas_w - 10, canvas_h - 6],
+                   fill=(255, 255, 255), outline=(200, 200, 210), width=1)
+    ans_text = _main_answer_text(sample.get("answers", [])) or "(no answer)"
+    for label, val, color in (
+        ("Question:", sample.get("question", "") or "(empty)", (30, 30, 40)),
+        ("Answer:",   ans_text,                                 (10, 80, 40)),
+    ):
+        if f_hdr:
+            draw.text((20, fy), label, fill=(80, 80, 100), font=f_hdr)
+            lbl_w = draw.textbbox((0, 0), label, font=f_hdr)[2] + 6
+        else:
+            lbl_w = 80
+        lines = _wrap_lines(val, canvas_w - 40 - lbl_w, f_body)[:2]
+        for i, ln in enumerate(lines):
+            draw.text((20 + lbl_w, fy + i * lh), ln, fill=color, font=f_body)
+        fy += max(lh, lh * len(lines)) + 6
+
+    canvas.save(out_path, format="PNG")
+
+
 def _render_sample(sample: Dict[str, Any], out_dir: Path, sample_id: int,
-                   chexpert_row: Optional[Dict[str, float]] = None) -> None:
+                   chexpert_row: Optional[Dict[str, float]] = None,
+                   paper_figure: bool = False) -> None:
     """Emit four artifacts for one sample: clean X-ray, scene-graph viz,
-    CheXpert dashboard, text bundle."""
+    CheXpert dashboard, text bundle. When ``paper_figure=True``, ALSO
+    emit a fifth artifact: sample_XX_paper.png -- a single combined
+    figure with clinical context header + X-ray + scene-graph legend +
+    Q/A footer, suitable for direct inclusion in the thesis.
+    """
     sample["_idx"] = sample_id
     base = f"sample_{sample_id:02d}"
 
@@ -582,13 +858,24 @@ def _render_sample(sample: Dict[str, Any], out_dir: Path, sample_id: int,
     sg_path = out_dir / f"{base}_scenegraph.png"
     _render_scene_graph(sample, observations, sg_path, render_size)
 
+    # Extract clinical context once; used by text bundle AND paper figure.
+    clinical = _extract_clinical_context(sg)
+    # Attach to the sample dict so the text bundle can persist it too.
+    sample["_clinical"] = clinical
+
     # 3. CheXpert dashboard
     chx_path = out_dir / f"{base}_chexpert.png"
     _render_chexpert(sample, chexpert_row, chx_path)
 
-    # 4. text bundle (includes scene-graph + CheXpert)
+    # 4. text bundle (includes scene-graph + CheXpert + clinical context)
     txt_path = out_dir / f"{base}.txt"
     _write_text_bundle(sample, observations, chexpert_row, txt_path)
+
+    # 5. combined publication figure (image + indication + scene graph)
+    if paper_figure:
+        paper_path = out_dir / f"{base}_paper.png"
+        _render_paper_figure(sample, observations, clinical,
+                             paper_path, render_size)
 
 
 def main():
@@ -607,6 +894,11 @@ def main():
                    help="Override path to mimic-cxr-2.0.0-chexpert.csv(.gz). "
                         "If omitted, looks for <jpg_root>/mimic-cxr-2.0.0-chexpert.csv.gz "
                         "(same default as the training loader).")
+    p.add_argument("--paper_figures", action="store_true",
+                   help="Additionally emit sample_XX_paper.png -- a single "
+                        "publication-ready figure per sample with clinical "
+                        "context header + X-ray + scene-graph legend + Q/A "
+                        "footer, suitable for direct inclusion in the thesis.")
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -636,7 +928,8 @@ def main():
     for i, s in enumerate(samples, 1):
         try:
             chx_row = chexpert.get((s["subject_id"], s["study_id"]))
-            _render_sample(s, args.out, i, chexpert_row=chx_row)
+            _render_sample(s, args.out, i, chexpert_row=chx_row,
+                            paper_figure=args.paper_figures)
             base = f"sample_{i:02d}"
             print(f"[render {i:>2d}/{len(samples)}] wrote {base}_image.png, "
                   f"{base}_scenegraph.png, {base}_chexpert.png, {base}.txt",
