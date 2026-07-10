@@ -131,20 +131,37 @@ def _extract_gt_observations(
     image_w: int,
     image_h: int,
     dicom_id: Optional[str],
+    min_localization_quality: int = 0,
 ) -> List[Dict[str, Any]]:
-    """Pull (entity, region, bbox_normalised, raw_bbox, positiveness) per
-    observation.  Skips observations without a real localisation bbox so the
-    visualisation only shows boxes that were actually grounded."""
+    """Pull (entity, region, bbox_normalised, raw_bbox, positiveness,
+    localization_quality) per observation.
+
+    Skips observations without a real localisation bbox.
+
+    When ``min_localization_quality > 0``, ALSO skips observations whose
+    per-image localization_quality is below the threshold. This is the
+    fix for the "labels distorted in positions" issue: QBA's level 0-1
+    entries are fallback / whole-region defaults that don't match the
+    finding's actual pixel position. Only level 3+ (BBOX_LOCALIZATION)
+    are pixel-accurate. Recommended value for paper figures: 3.
+    """
     observations = scene_graph.get("observations", {})
     out = []
     for obs_id, obs in observations.items():
         loc = obs.get("localization") or {}
         bbox = None
         raw_bbox = None
+        loc_q: Optional[int] = None
         if isinstance(loc, dict) and loc:
             img_loc = loc.get(dicom_id) if dicom_id and dicom_id in loc else next(iter(loc.values()), {})
             if isinstance(img_loc, dict):
                 bboxes = img_loc.get("bboxes") or []
+                # QBA stores per-image localization_quality inside the
+                # per-dicom_id block. Values 0-4 map to
+                # NO_LOCALIZATION / FALLBACK / INCOMPLETE / BBOX / BBOX+MASK.
+                raw_lq = img_loc.get("localization_quality")
+                if isinstance(raw_lq, int):
+                    loc_q = raw_lq
                 if bboxes:
                     raw = bboxes[0]
                     if len(raw) == 4:
@@ -163,6 +180,12 @@ def _extract_gt_observations(
                                 bbox = None
         if bbox is None:
             continue
+        if min_localization_quality > 0:
+            # Reject anything below the threshold. None (missing quality
+            # tag) is treated as "unknown" and dropped when we're being
+            # strict, since we can't defend that placement in the paper.
+            if loc_q is None or loc_q < min_localization_quality:
+                continue
         entities = obs.get("obs_entities") or []
         regions = obs.get("regions") or []
         entity = entities[0] if entities else "?"
@@ -177,6 +200,7 @@ def _extract_gt_observations(
             "bbox": bbox,
             "raw_bbox": raw_bbox,
             "positiveness": obs.get("positiveness", "?"),
+            "localization_quality": loc_q,
         })
     return out
 
@@ -397,6 +421,20 @@ def _render_scene_graph(sample: Dict[str, Any], observations: List[Dict[str, Any
         if len(ent) > 30:
             ent = ent[:29] + "."
         draw.text((tx0, y), ent, fill=(240, 240, 240), font=font_legend)
+        # Quality tag next to the entity so readers can see at a glance
+        # which sidebar entries have trustworthy pixel-level bboxes.
+        loc_q = obs.get("localization_quality")
+        if font_legend:
+            _quality_names = {
+                0: "no-loc", 1: "fallback", 2: "partial",
+                3: "bbox", 4: "bbox+mask",
+            }
+            q_txt = _quality_names.get(loc_q, "?") if loc_q is not None else "?"
+            q_color = ((90, 200, 90) if isinstance(loc_q, int) and loc_q >= 3
+                       else (220, 170, 60) if loc_q == 2
+                       else (220, 90, 90))
+            q_str = f"[Q={loc_q if loc_q is not None else '?'}:{q_txt}]"
+            draw.text((tx0 + 200, y), q_str, fill=q_color, font=font_legend)
         reg_line = f"@ {obs['region']}"
         if len(reg_line) > 32:
             reg_line = reg_line[:31] + "."
@@ -495,11 +533,20 @@ def _write_text_bundle(sample: Dict[str, Any],
     ]
     if not observations:
         lines.append("(no observations with localisation bboxes)")
+    _quality_names = {
+        0: "NO_LOCALIZATION", 1: "FALLBACK_LOCALIZATION",
+        2: "INCOMPLETE_LOCALIZATION",
+        3: "BBOX_LOCALIZATION", 4: "BBOX_AND_MASK_LOCALIZATION",
+    }
     for i, obs in enumerate(observations, 1):
         x1, y1, x2, y2 = obs["bbox"]
+        loc_q = obs.get("localization_quality")
+        q_str = (f"{loc_q} ({_quality_names.get(loc_q, '?')})"
+                 if loc_q is not None else "?")
         lines.append(
             f"  [{i}] entity={obs['entity']!r}  region={obs['region']!r}  "
-            f"positiveness={obs['positiveness']!r}"
+            f"positiveness={obs['positiveness']!r}  "
+            f"localization_quality={q_str}"
         )
         if obs.get("raw_bbox"):
             r = obs["raw_bbox"]
@@ -801,6 +848,21 @@ def _render_paper_figure(sample: Dict[str, Any],
         ent = obs["entity"][:32]
         if f_body:
             draw.text((tx0, ly), ent, fill=(30, 30, 40), font=f_body)
+        # Quality tag next to the entity: [Q=3] means BBOX_LOCALIZATION;
+        # [Q=fallback] etc. warns the reader that a bbox is a QBA default
+        # rather than a semantically-accurate position.
+        loc_q = obs.get("localization_quality")
+        if f_small:
+            _quality_names = {
+                0: "no-loc", 1: "fallback", 2: "partial",
+                3: "bbox", 4: "bbox+mask",
+            }
+            q_txt = _quality_names.get(loc_q, "?") if loc_q is not None else "?"
+            q_color = ((60, 160, 70) if isinstance(loc_q, int) and loc_q >= 3
+                       else (200, 140, 40) if loc_q == 2
+                       else (200, 80, 60))
+            q_str = f"[Q={loc_q if loc_q is not None else '?'}:{q_txt}]"
+            draw.text((tx0 + 200, ly), q_str, fill=q_color, font=f_small)
         reg = "@ " + obs["region"][:28]
         if f_small:
             draw.text((tx0, ly + line_h), reg,
@@ -835,12 +897,17 @@ def _render_paper_figure(sample: Dict[str, Any],
 
 def _render_sample(sample: Dict[str, Any], out_dir: Path, sample_id: int,
                    chexpert_row: Optional[Dict[str, float]] = None,
-                   paper_figure: bool = False) -> None:
+                   paper_figure: bool = False,
+                   min_localization_quality: int = 0) -> None:
     """Emit four artifacts for one sample: clean X-ray, scene-graph viz,
     CheXpert dashboard, text bundle. When ``paper_figure=True``, ALSO
     emit a fifth artifact: sample_XX_paper.png -- a single combined
     figure with clinical context header + X-ray + scene-graph legend +
     Q/A footer, suitable for direct inclusion in the thesis.
+
+    ``min_localization_quality`` is forwarded to _extract_gt_observations
+    so paper figures can drop QBA fallback / whole-region bboxes that
+    would otherwise be drawn at semantically-wrong positions.
     """
     sample["_idx"] = sample_id
     base = f"sample_{sample_id:02d}"
@@ -853,8 +920,10 @@ def _render_sample(sample: Dict[str, Any], out_dir: Path, sample_id: int,
     orig_w, orig_h = Image.open(sample["image_path"]).size
     with open(sample["scene_graph_path"]) as f:
         sg = json.load(f)
-    observations = _extract_gt_observations(sg, orig_w, orig_h,
-                                            sample["image_path"].stem)[:10]
+    observations = _extract_gt_observations(
+        sg, orig_w, orig_h, sample["image_path"].stem,
+        min_localization_quality=min_localization_quality,
+    )[:10]
     sg_path = out_dir / f"{base}_scenegraph.png"
     _render_scene_graph(sample, observations, sg_path, render_size)
 
@@ -899,6 +968,14 @@ def main():
                         "publication-ready figure per sample with clinical "
                         "context header + X-ray + scene-graph legend + Q/A "
                         "footer, suitable for direct inclusion in the thesis.")
+    p.add_argument("--min_localization_quality", type=int, default=0,
+                   help="When >0, drop scene-graph observations whose per-image "
+                        "localization_quality is below this level. Level 3 = "
+                        "BBOX_LOCALIZATION (recommended for paper figures -- "
+                        "fixes the 'labels distorted in positions' effect where "
+                        "QBA fallback / whole-region bboxes get drawn at "
+                        "semantically-wrong positions). Levels 0-2 are "
+                        "fallback / incomplete / whole-region defaults.")
     args = p.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -929,7 +1006,8 @@ def main():
         try:
             chx_row = chexpert.get((s["subject_id"], s["study_id"]))
             _render_sample(s, args.out, i, chexpert_row=chx_row,
-                            paper_figure=args.paper_figures)
+                            paper_figure=args.paper_figures,
+                            min_localization_quality=args.min_localization_quality)
             base = f"sample_{i:02d}"
             print(f"[render {i:>2d}/{len(samples)}] wrote {base}_image.png, "
                   f"{base}_scenegraph.png, {base}_chexpert.png, {base}.txt",
