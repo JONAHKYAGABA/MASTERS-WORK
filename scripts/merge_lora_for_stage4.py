@@ -116,15 +116,17 @@ def main():
                     help="'cuda:0' (default) or 'cpu'. GPU makes merge ~5x faster.")
     ap.add_argument("--verify", action="store_true",
                     help="Run pre/post-merge forward parity check on 3 target layers.")
-    ap.add_argument("--parity_tol", type=float, default=1e-2,
-                    help=("Max absolute output diff allowed by --verify. Default 1e-2 for "
-                          "an fp16 merge (rounding-limited). For the NF4 requantise path "
-                          "(--load_quantized), realistic tolerance is 3e-1 or higher."))
-    ap.add_argument("--load_quantized", action="store_true",
-                    help=("Load Stage 3 in NF4 (matches training-time layout). NOT recommended: "
-                          "PEFT re-quantises the merged weights back to NF4, introducing ~1-2%% "
-                          "output drift and leaving the saved backbone as NF4 (which double-quants "
-                          "at Stage 4 load time). Default is fp16 load → exact merge → fp16 save."))
+    ap.add_argument("--parity_tol", type=float, default=5e-1,
+                    help=("Max absolute output diff allowed by --verify. Default 5e-1 for "
+                          "the NF4 merge path — PEFT dequantises to fp16, adds the LoRA "
+                          "delta, then re-quantises to NF4. The requantise step introduces "
+                          "~1-2%% output drift per layer, bounded by NF4's inherent precision. "
+                          "This is not a bug; anything under 5e-1 is expected."))
+    ap.add_argument("--fp16_load", action="store_true",
+                    help=("Try loading Stage 3 without quantisation (allows an exact merge). "
+                          "Only works if the checkpoint stored dequantised fp16 base weights. "
+                          "Fails on our Stage-3 checkpoint, which saved NF4-packed base weights. "
+                          "Left available for future checkpoints that dequantise before saving."))
     args = ap.parse_args()
 
     if not args.stage3_ckpt.is_dir():
@@ -149,21 +151,23 @@ def main():
     print(f"[merge] Stage-3 LoRA:  rank={s3_rank}  alpha={s3_alpha}  targets={s3_targets}")
     print(f"[merge] Qwen backbone: {qwen_id}")
 
-    # fp16 merge (default) vs NF4 merge (--load_quantized).
-    # fp16 merge is exact: dequantize once via HF from_pretrained (fp16),
-    # add the LoRA delta, save fp16. Stage 4 quantises to NF4 on load,
-    # once. NF4 merge dequantises, adds LoRA, re-quantises to NF4 — the
-    # requant step drops precision by ~1-2%% per layer and leaves the
-    # saved backbone in a state that fights with Stage 4's own quant.
-    _load_quantized = args.load_quantized
-    _peak_gb_est = "~5 GB" if _load_quantized else "~16 GB"
-    _mode_label = "NF4 + LoRA rank" if _load_quantized else "fp16 + LoRA rank"
+    # Our Stage-3 pytorch_model.bin stores the Qwen base weights as NF4-packed
+    # uint8 buffers (e.g. q_proj.base_layer.weight has shape [8388608, 1] =
+    # 4096*4096/2 bytes at 4 bits per weight). An fp16 architecture cannot
+    # ingest those buffers — it wants [4096, 4096] fp16 matrices. So the
+    # merge runs in NF4 mode: PEFT dequantises during merge, adds LoRA, and
+    # re-quantises to NF4 (this is the source of the ~1-2%% output drift the
+    # parity probe measures). --fp16_load is preserved for future checkpoints
+    # that save dequantised weights, but for THIS run it will fail at load.
+    _use_quant_load = not args.fp16_load
+    _peak_gb_est = "~5 GB" if _use_quant_load else "~16 GB"
+    _mode_label = "NF4 + LoRA rank" if _use_quant_load else "fp16 + LoRA rank"
     print(f"[merge] Building Stage-3 architecture ({_mode_label} {s3_rank}, "
           f"peak GPU mem est. {_peak_gb_est})...")
 
     model = SSGVQANetV2(
         qwen_model_id=qwen_id,
-        use_quantization=_load_quantized,
+        use_quantization=_use_quant_load,
         lora_rank=s3_rank,
         lora_alpha=s3_alpha,
         lora_target_modules=s3_targets,
@@ -305,19 +309,21 @@ def main():
         "source_lora_target_modules": s3_targets,
         "target_lora_rank": args.target_lora_rank,
         "qwen_model_id": qwen_id,
-        "merge_mode": ("nf4_requantised" if _load_quantized else "fp16_exact"),
+        "merge_mode": ("nf4_requantised" if _use_quant_load else "fp16_exact"),
         "parity_tolerance": args.parity_tol,
         "parity_verified": bool(args.verify),
         "merged_at": str(date.today()),
         "num_heads_tensors": len(heads_sd),
         "note": (
             "Stage-3 rank-16 LoRA folded into Qwen backbone "
-            + ("(NF4 requantised — expect ~1-2%% per-layer drift)"
-               if _load_quantized else "(fp16 exact merge)")
-            + ". Stage 4 must load qwen_merged_fp16/ as base (fresh NF4 quant + "
-              "rank-32 LoRA) plus heads.bin as sidecar. Do NOT strict-load "
-              "pytorch_model.bin here — it does not exist in this dir by design "
-              "(bytes are split base/heads)."
+            + ("(NF4 requantised — expect ~1-2%% per-layer drift, bounded by "
+               "NF4's inherent precision on the merged weight round-trip)"
+               if _use_quant_load else "(fp16 exact merge)")
+            + ". Stage 4 must load qwen_merged_fp16/ as base plus heads.bin as "
+              "sidecar. Do NOT strict-load pytorch_model.bin here — it does not "
+              "exist in this dir by design (bytes are split base/heads). Note: "
+              "the directory name is 'qwen_merged_fp16' for backward compat with "
+              "the trainer patch; check merge_mode above for the actual dtype."
         ),
     }, indent=2))
     print(f"[merge] Wrote sentinel: {marker}")
