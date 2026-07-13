@@ -2522,9 +2522,56 @@ def main(args):
     _force_qlora = _gpu0_cc < (8, 0)
     _qwen_dtype = torch.float16 if _force_qlora else torch.bfloat16
 
+    # ------------------------------------------------------------------
+    # Merged-base checkpoint detection (Stage 3 -> Stage 4 LoRA rank bump)
+    # ------------------------------------------------------------------
+    # If --resume_from_checkpoint points at a directory containing
+    # MERGED_BASE.json, the Stage-3 rank-16 LoRA has been folded into the
+    # backbone by scripts/merge_lora_for_stage4.py. In that case:
+    #   * `_qwen_id` is overridden to the merged qwen_merged_fp16/ dir so
+    #     the fresh HF from_pretrained call loads the folded base and
+    #     applies fresh NF4 + fresh (higher-rank) LoRA on top.
+    #   * The checkpoint loader (lower down) skips pytorch_model.bin
+    #     (which does not exist in a merged dir by design) and instead
+    #     loads heads.bin as a non-qwen sidecar.
+    _merged_base_dir = None       # Path | None
+    _merged_heads_path = None     # Path | None
+    _merged_meta = None           # dict | None
+    if getattr(args, 'resume_from_checkpoint', None):
+        _mb_check_dir = Path(args.resume_from_checkpoint)
+        _mb_marker = _mb_check_dir / 'MERGED_BASE.json'
+        if _mb_marker.exists():
+            _merged_meta = json.loads(_mb_marker.read_text())
+            _mb_qwen = _mb_check_dir / 'qwen_merged_fp16'
+            _mb_heads = _mb_check_dir / 'heads.bin'
+            if not _mb_qwen.is_dir():
+                raise FileNotFoundError(
+                    f"MERGED_BASE.json present but qwen_merged_fp16/ missing at {_mb_check_dir}"
+                )
+            if not _mb_heads.is_file():
+                raise FileNotFoundError(
+                    f"MERGED_BASE.json present but heads.bin missing at {_mb_check_dir}"
+                )
+            _merged_base_dir = _mb_qwen
+            _merged_heads_path = _mb_heads
+            if is_main_process(local_rank):
+                logger.info(
+                    f"Merged-base checkpoint detected at {_mb_check_dir}:\n"
+                    f"  source ckpt : {_merged_meta.get('source_checkpoint')}\n"
+                    f"  merged rank : {_merged_meta.get('source_lora_rank')} "
+                    f"(alpha={_merged_meta.get('source_lora_alpha')}, "
+                    f"targets={_merged_meta.get('source_lora_target_modules')})\n"
+                    f"  target rank : {_merged_meta.get('target_lora_rank')} "
+                    "(will be re-initialised fresh from this stage's config)\n"
+                    f"  merged at   : {_merged_meta.get('merged_at')}"
+                )
+
     # CLI flag --qwen_model_id wins over config; config wins over default.
+    # Merged-base override (highest priority) supersedes all three so the
+    # HF from_pretrained call inside SSGVQANetV2 loads the folded backbone.
     _qwen_id = (
-        getattr(args, 'qwen_model_id', None)
+        (str(_merged_base_dir) if _merged_base_dir is not None else None)
+        or getattr(args, 'qwen_model_id', None)
         or getattr(config.model, 'qwen_model_id', None)
         or 'Qwen/Qwen3-VL-8B-Instruct'
     )
@@ -2715,10 +2762,53 @@ def main(args):
     resume_optimizer_state = None
     resume_scheduler_state = None
     resume_rng_state = None
-    if args.resume_from_checkpoint:
+    if args.resume_from_checkpoint and _merged_heads_path is not None:
+        # ------------------------------------------------------------------
+        # Merged-base mode: the Qwen backbone was already loaded from
+        # qwen_merged_fp16/ by SSGVQANetV2 (via _qwen_id override above),
+        # with a FRESH rank-32 LoRA on top per this stage's config. Only
+        # the non-qwen weights (SG generator, encoder, projector, mHC,
+        # grounding head, aux heads, embeddings, view-position) need to
+        # be restored from the sidecar. LoRA weights start from PEFT's
+        # default init (LoRA-A random, LoRA-B zero => zero delta at
+        # step 0, so the model's step-0 output is identical to Stage 3).
+        # ------------------------------------------------------------------
+        if is_main_process(local_rank):
+            logger.info(f"Loading heads sidecar from: {_merged_heads_path}")
+        # heads.bin is produced by scripts/merge_lora_for_stage4.py and
+        # contains ONLY tensor state (non-qwen weights of SSGVQANetV2).
+        # weights_only=True is safe here and rejects any pickled object
+        # code — unlike the main pytorch_model.bin path further down,
+        # which embeds DeepSpeed / numpy metric objects.
+        heads_sd = torch.load(_merged_heads_path, map_location='cpu', weights_only=True)
+        missing, unexpected = model.load_state_dict(heads_sd, strict=False)
+        if is_main_process(local_rank):
+            _n_missing_non_qwen = sum(1 for k in missing if not k.startswith('qwen.'))
+            _n_missing_qwen = len(missing) - _n_missing_non_qwen
+            _n_missing_lora = sum(1 for k in missing if 'lora_' in k)
+            logger.info(
+                f"  Sidecar keys loaded : {len(heads_sd) - len(unexpected)}/{len(heads_sd)}\n"
+                f"  Missing non-qwen    : {_n_missing_non_qwen}  (expect 0)\n"
+                f"  Missing qwen.* base : {_n_missing_qwen - _n_missing_lora}  "
+                "(expect 0 — Qwen loaded from merged HF dir)\n"
+                f"  Missing qwen.* LoRA : {_n_missing_lora}  "
+                "(expect >0 — fresh rank-32 LoRA re-initialised)"
+            )
+            if _n_missing_non_qwen > 0:
+                _bad = [k for k in missing if not k.startswith('qwen.')][:8]
+                logger.warning(f"  Unexpected non-qwen missing keys: {_bad}")
+            if unexpected:
+                logger.warning(f"  Unexpected keys (first 8): {unexpected[:8]}")
+        # Merged mode is always a fresh-optimizer start (rank/target changed).
+        # No global_step / epoch / optimizer / scheduler / RNG to restore.
+        if is_main_process(local_rank):
+            logger.info("  Merged mode: fresh optimizer/scheduler/step (rank changed).")
+        del heads_sd
+        _reclaim_cpu_memory()
+    elif args.resume_from_checkpoint:
         ckpt_path = Path(args.resume_from_checkpoint)
         ckpt_file = None
-        
+
         # Find the actual .bin file
         if ckpt_path.is_dir():
             for candidate in ['pytorch_model.bin', 'model.bin', 'checkpoint.bin']:
@@ -2732,7 +2822,7 @@ def main(args):
                     ckpt_file = ds_ckpt
         elif ckpt_path.is_file():
             ckpt_file = ckpt_path
-        
+
         if ckpt_file is not None:
             if is_main_process(local_rank):
                 logger.info(f"Loading checkpoint from: {ckpt_file}")
