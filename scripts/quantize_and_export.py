@@ -229,6 +229,34 @@ def _save_heads_sidecar(heads_state: Dict[str, torch.Tensor], out_dir: Path) -> 
 # ==========================================================================
 # Variant exporters
 # ==========================================================================
+def _stringify_dtypes_in_config(config) -> None:
+    """
+    Recursively convert any `torch.dtype` attribute on `config` (and its
+    nested sub-configs such as `text_config`, `vision_config`) into its
+    lowercase string name. Without this, `save_pretrained -> to_json_string
+    -> json.dumps` fails with:
+
+        TypeError: Object of type dtype is not JSON serializable
+
+    HF's `to_dict()` converts torch_dtype on the TOP-LEVEL config in newer
+    versions, but it does NOT recurse into sub-configs the same way, and
+    it does not convert the non-legacy `dtype` attribute on some model
+    families (Qwen3-VL among them). We do it defensively.
+    """
+    if config is None:
+        return
+    for attr in ("torch_dtype", "dtype"):
+        val = getattr(config, attr, None)
+        if isinstance(val, torch.dtype):
+            setattr(config, attr, str(val).replace("torch.", ""))
+    # Recurse into every attribute that looks like a sub-config
+    for name in list(vars(config).keys()) if hasattr(config, "__dict__") else []:
+        val = getattr(config, name, None)
+        # PretrainedConfig subclasses expose `to_dict`; use that as the marker
+        if val is not None and hasattr(val, "to_dict") and hasattr(val, "__dict__"):
+            _stringify_dtypes_in_config(val)
+
+
 def _dequantize_bnb_inplace(qwen_model) -> int:
     """
     Walk `qwen_model` and replace every bitsandbytes Linear4bit / Linear8bitLt
@@ -309,6 +337,10 @@ def _export_fp16(qwen_model, out_dir: Path) -> None:
     else:
         # Already fp16 (e.g. non-bnb load path). Safe to cast.
         qwen_model.to(dtype=torch.float16)
+    # save_pretrained -> to_json_string chokes on torch.dtype values in the
+    # config tree; stringify them defensively before the serialise step.
+    if hasattr(qwen_model, "config"):
+        _stringify_dtypes_in_config(qwen_model.config)
     qwen_model.save_pretrained(str(out_dir), safe_serialization=True, max_shard_size="4GB")
     logger.info("  wrote FP16 model.safetensors")
 
