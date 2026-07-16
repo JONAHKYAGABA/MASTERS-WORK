@@ -32,15 +32,15 @@ Full methodology in the accompanying thesis. This card reports **results only**.
 
 ## Repositories
 
-| Variant | HuggingFace repo | Size | How to load |
-|---|---|---:|---|
-| Stage 4 final (baseline) | `KYAGABA/mimic-cxr-vqa-stage4-finetune` | 9 GB | HF `AutoModelForImageTextToText`, NF4 quant config |
-| FP16 (dequantised baseline) | `KYAGABA/mimic-cxr-vqa-stage4-fp16` | 16.4 GB | HF `AutoModelForImageTextToText`, no quant config |
-| INT8 (bitsandbytes) | `KYAGABA/mimic-cxr-vqa-stage4-int8` | 8.6 GB | HF + `BitsAndBytesConfig(load_in_8bit=True)` |
-| NF4 (bitsandbytes, QLoRA format) | `KYAGABA/mimic-cxr-vqa-stage4-nf4` | 4.6 GB | HF + `BitsAndBytesConfig(load_in_4bit=True, nf4)` |
-| GGUF Q5_K_M | `KYAGABA/mimic-cxr-vqa-stage4-q5_k_m` | 5.7 GB | `llama-cpp-python` |
-| GGUF Q4_K_M | `KYAGABA/mimic-cxr-vqa-stage4-q4_k_m` | 4.1 GB | `llama-cpp-python` |
-| GGUF Q3_K_M | `KYAGABA/mimic-cxr-vqa-stage4-q3_k_m` | 3.5 GB | `llama-cpp-python` |
+Disk sizes are the actual PTQ pipeline outputs (backbone + heads sidecar + tokenizer / processor / configs). Slightly larger than the methodology chapter's Table `tab:qvariants` estimates because those covered the backbone alone.
+
+| Variant | HuggingFace repo | Size | vs FP16 | How to load |
+|---|---|---:|---:|---|
+| Stage 4 final (checkpoint-3125) | `KYAGABA/mimic-cxr-vqa-stage4-finetune` | 9.07 GB | — | HF, ships with `quantization_config: nf4` baked in |
+| FP16 (dequantised baseline) | `KYAGABA/mimic-cxr-vqa-stage4-fp16` | **19.68 GB** | 1.00× | HF `AutoModelForImageTextToText`, no quant config |
+| INT8 (bitsandbytes) | `KYAGABA/mimic-cxr-vqa-stage4-int8` | **10.36 GB** | 1.90× | HF + `BitsAndBytesConfig(load_in_8bit=True)` |
+| NF4 (bitsandbytes, QLoRA format) | `KYAGABA/mimic-cxr-vqa-stage4-nf4` | **6.96 GB** | 2.83× | HF + `BitsAndBytesConfig(load_in_4bit=True, nf4)` |
+| GGUF Q5_K_M / Q4_K_M / Q3_K_M | *(planned, pending stable llama.cpp Qwen3-VL support)* | ~3.5-5.7 GB | 3.4×-4.7× | `llama-cpp-python` |
 
 Every repo also ships a `heads.safetensors` sidecar (~300 MB) containing the scene-graph generator, encoder/projector, mHC grounding head, and auxiliary heads. The plain HF snippets below use only the Qwen backbone (fast baseline). For the full `<think><box><answer>` pipeline with SG-token injection and mHC grounding refinement, use `scripts/serve_app.py` from the training repo (§ Full pipeline below).
 
@@ -249,14 +249,14 @@ Reproduces Table `tab:qpolicy` from the methodology. Only the Qwen backbone (99.
 
 Reproduces Table `tab:qvariants` from the methodology. Six variants produced by `scripts/quantize_and_export.py` from the Stage-4 best checkpoint.
 
-| Variant | Toolchain | Method | Disk | Val Acc | Median CPU latency (8-core) |
-|---|---|---|---:|---:|---:|
-| FP16 (baseline) | HuggingFace | none | 16.4 GB | *TBD* | *TBD* |
-| INT8 | bitsandbytes | row-wise dynamic INT8 | 8.6 GB | *TBD* | *TBD* |
-| NF4 | bitsandbytes | 4-bit NormalFloat + double-quant | 4.6 GB | *TBD* | *TBD* |
-| GGUF Q5_K_M | llama.cpp | 5-bit block-wise K-quants | 5.7 GB | *TBD* | *TBD* |
-| GGUF Q4_K_M | llama.cpp | 4-bit block-wise K-quants | 4.1 GB | *TBD* | *TBD* |
-| GGUF Q3_K_M | llama.cpp | 3-bit block-wise K-quants | 3.5 GB | *TBD* | *TBD* |
+| Variant | Toolchain | Method | Disk (measured) | vs FP16 | Val Acc | Median CPU latency (8-core) |
+|---|---|---|---:|---:|---:|---:|
+| FP16 (baseline) | HuggingFace | none | **19.68 GB** | 1.00× | *TBD* | *TBD* |
+| INT8 | bitsandbytes | row-wise dynamic INT8 | **10.36 GB** | 1.90× | *TBD* | *TBD* |
+| NF4 | bitsandbytes | 4-bit NormalFloat + double-quant | **6.96 GB** | 2.83× | *TBD* | *TBD* |
+| GGUF Q5_K_M | llama.cpp | 5-bit block-wise K-quants | *(planned)* | ~3.4× | — | — |
+| GGUF Q4_K_M | llama.cpp | 4-bit block-wise K-quants | *(planned)* | ~4.0× | — | — |
+| GGUF Q3_K_M | llama.cpp | 3-bit block-wise K-quants | *(planned)* | ~4.7× | — | — |
 
 Val Acc and Median CPU latency to be filled in from `benchmark_manifest.json` once `scripts/benchmark_cpu.py` completes on the canonical test-bed (Intel Xeon 12/24 cores 2.1 GHz, 8-thread pin, `OMP_NUM_THREADS=8`, `MKL_NUM_THREADS=8`, `CUDA_VISIBLE_DEVICES=""`, batch 1, 100 warm-up + 500 measured queries per variant).
 
