@@ -86,12 +86,28 @@ def _load_and_merge(checkpoint_dir: Path, model_id: str, dtype: torch.dtype = to
 
     logger.info(f"Constructing SSGVQANetV2 with base {model_id} (dtype={dtype})")
 
-    # Reconstruct via the same path the trainer uses. QLoRA is force-on for
-    # Turing GPUs; on CPU (this script's host) we still want the model to
-    # build, so we allow use_quantization=False and dtype=fp16.
+    # Reconstruct via the same path the trainer uses.
+    #
+    # use_quantization MUST be True when loading from our merged-base dir:
+    # the merged Stage-4 checkpoint stores Qwen weights as NF4-packed uint8
+    # buffers (shape [N*M/2, 1]) that only a `Linear4bit` layer can ingest,
+    # AND the merged config.json carries a `quantization_config` dict that
+    # trips a HF `from_pretrained` bug when we pass `quantization_config=None`
+    # -- HF ends up with `config.quantization_config = None`, then
+    # `logger.info(f"Model config {config}")` calls
+    # `__repr__ -> to_json_string -> to_dict -> self.quantization_config.to_dict()`
+    # on the None and raises `AttributeError: 'NoneType' object has no attribute
+    # 'to_dict'`. Passing `use_quantization=True` supplies an explicit
+    # BitsAndBytesConfig object that HF wires up correctly.
+    #
+    # Downstream: `_export_fp16` calls `.to(dtype=torch.float16)` on the
+    # merged model to dequantise before saving; bitsandbytes >= 0.43 supports
+    # this in-place dequant. For int8/nf4/gguf variants the model is reloaded
+    # from the FP16 export, so the initial NF4 load only affects the merge
+    # itself (which adds ~1-2%% per-layer requant drift, bounded by NF4).
     model = SSGVQANetV2(
         qwen_model_id=model_id,
-        use_quantization=False,
+        use_quantization=True,
         lora_rank=32,
         lora_alpha=64,
         lora_target_modules=[
