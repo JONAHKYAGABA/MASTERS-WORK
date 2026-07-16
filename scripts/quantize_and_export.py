@@ -47,6 +47,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Make the repo root importable when this file is invoked as a script.
+# Without this, `from models.sg_generators import ...` in _load_and_merge()
+# raises ModuleNotFoundError because Python only puts the script's own dir
+# (scripts/) on sys.path, not the repo root that contains the models/ package.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import torch
 
 logger = logging.getLogger(__name__)
