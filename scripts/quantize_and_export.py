@@ -229,10 +229,87 @@ def _save_heads_sidecar(heads_state: Dict[str, torch.Tensor], out_dir: Path) -> 
 # ==========================================================================
 # Variant exporters
 # ==========================================================================
+def _dequantize_bnb_inplace(qwen_model) -> int:
+    """
+    Walk `qwen_model` and replace every bitsandbytes Linear4bit / Linear8bitLt
+    with a plain fp16 nn.Linear holding the dequantized weight. Needed before
+    save_pretrained as fp16: a bnb-wrapped model refuses `.to(dtype=fp16)` and
+    save_pretrained writes NF4-packed uint8 buffers rather than fp16 tensors.
+
+    Returns the number of layers converted, so the caller can sanity-check.
+    """
+    import bitsandbytes as bnb
+    from torch import nn
+
+    lin4bit = getattr(bnb.nn, "Linear4bit", None)
+    lin8bit = getattr(bnb.nn, "Linear8bitLt", None)
+    target_types = tuple(t for t in (lin4bit, lin8bit) if t is not None)
+    if not target_types:
+        return 0
+
+    n_converted = 0
+    for name, module in list(qwen_model.named_modules()):
+        if not isinstance(module, target_types):
+            continue
+
+        # Dequantize the packed weight back to fp16.
+        if lin4bit is not None and isinstance(module, lin4bit):
+            w_fp16 = bnb.functional.dequantize_4bit(
+                module.weight.data, module.weight.quant_state
+            ).to(torch.float16)
+        else:
+            # Linear8bitLt stores CB (int8) + SCB (fp16 scales)
+            w_fp16 = (module.weight.CB.to(torch.float16) * module.weight.SCB.view(-1, 1) / 127.0)
+
+        plain = nn.Linear(
+            module.in_features, module.out_features,
+            bias=module.bias is not None,
+        ).to(dtype=torch.float16)
+        plain.weight = nn.Parameter(w_fp16.contiguous(), requires_grad=False)
+        if module.bias is not None:
+            plain.bias = nn.Parameter(
+                module.bias.data.to(torch.float16).contiguous(), requires_grad=False,
+            )
+
+        parent_name, _, child_name = name.rpartition(".")
+        parent = qwen_model.get_submodule(parent_name) if parent_name else qwen_model
+        setattr(parent, child_name, plain)
+        n_converted += 1
+
+    # Strip the quantization_config so save_pretrained emits a clean fp16 config.
+    # Leaving it would (a) mislead loaders into thinking the weights are still
+    # NF4, (b) re-trigger the `NoneType.to_dict()` crash on later loads.
+    if hasattr(qwen_model, "config"):
+        try:
+            qwen_model.config.quantization_config = None
+        except Exception:
+            pass
+        try:
+            del qwen_model.config.quantization_config
+        except Exception:
+            pass
+        # Also clear the flag some HF versions consult
+        for flag in ("is_quantized", "_is_quantized_training_enabled", "hf_quantizer"):
+            try:
+                setattr(qwen_model, flag, False if flag == "is_quantized" else None)
+            except Exception:
+                pass
+
+    return n_converted
+
+
 def _export_fp16(qwen_model, out_dir: Path) -> None:
     """Save the merged Qwen backbone as FP16 (baseline; no quantization)."""
-    qwen_model.to(dtype=torch.float16)
-    qwen_model.save_pretrained(str(out_dir), safe_serialization=True)
+    # merged qwen is still wrapped in bnb Linear4bit modules — save_pretrained
+    # would emit NF4-packed uint8 buffers. Dequantize each target layer to
+    # fp16 before save so the FP16 baseline is a genuine fp16 model.
+    n = _dequantize_bnb_inplace(qwen_model)
+    if n > 0:
+        logger.info(f"  dequantised {n} bnb layers to fp16 for FP16 export")
+    else:
+        # Already fp16 (e.g. non-bnb load path). Safe to cast.
+        qwen_model.to(dtype=torch.float16)
+    qwen_model.save_pretrained(str(out_dir), safe_serialization=True, max_shard_size="4GB")
     logger.info("  wrote FP16 model.safetensors")
 
 
