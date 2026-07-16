@@ -229,6 +229,42 @@ def _save_heads_sidecar(heads_state: Dict[str, torch.Tensor], out_dir: Path) -> 
 # ==========================================================================
 # Variant exporters
 # ==========================================================================
+from contextlib import contextmanager
+
+
+class _TorchDtypeSafeEncoder(json.JSONEncoder):
+    """JSON encoder that stringifies torch.dtype (and falls back to str for
+    any other unserialisable object rather than raising)."""
+    def default(self, o):
+        if isinstance(o, torch.dtype):
+            return str(o).replace("torch.", "")
+        try:
+            return super().default(o)
+        except TypeError:
+            return str(o)
+
+
+@contextmanager
+def _json_dumps_with_dtype_encoder():
+    """Temporarily monkey-patch json.dumps so any torch.dtype in the object
+    tree is serialised as its short string name. Restores the original on
+    exit even if the wrapped block raises. Scoped narrowly around
+    save_pretrained calls; process-wide side effects revert on exit.
+    """
+    _original_dumps = json.dumps
+
+    def _safe_dumps(obj, **kwargs):
+        # Do not override an explicit `cls` (respect any caller preference).
+        kwargs.setdefault("cls", _TorchDtypeSafeEncoder)
+        return _original_dumps(obj, **kwargs)
+
+    json.dumps = _safe_dumps
+    try:
+        yield
+    finally:
+        json.dumps = _original_dumps
+
+
 def _stringify_dtypes_in_config(config) -> None:
     """
     Recursively convert any `torch.dtype` attribute on `config` (and its
@@ -341,7 +377,12 @@ def _export_fp16(qwen_model, out_dir: Path) -> None:
     # config tree; stringify them defensively before the serialise step.
     if hasattr(qwen_model, "config"):
         _stringify_dtypes_in_config(qwen_model.config)
-    qwen_model.save_pretrained(str(out_dir), safe_serialization=True, max_shard_size="4GB")
+    # Belt-and-braces: some torch.dtype values hide in nested dicts (e.g.
+    # rope_scaling, _pre_quantization_dtype, list-of-dicts) that our config
+    # walk cannot reach. Patch json.dumps with a custom encoder that turns
+    # any torch.dtype anywhere in the serialised tree into its short name.
+    with _json_dumps_with_dtype_encoder():
+        qwen_model.save_pretrained(str(out_dir), safe_serialization=True, max_shard_size="4GB")
     logger.info("  wrote FP16 model.safetensors")
 
 
@@ -371,7 +412,10 @@ def _export_bnb(model_id_for_reload: Path, out_dir: Path, mode: str) -> None:
         torch_dtype=torch.float16,
         device_map="cpu",
     )
-    reloaded.save_pretrained(str(out_dir), safe_serialization=True)
+    if hasattr(reloaded, "config"):
+        _stringify_dtypes_in_config(reloaded.config)
+    with _json_dumps_with_dtype_encoder():
+        reloaded.save_pretrained(str(out_dir), safe_serialization=True)
     logger.info(f"  wrote {mode} quantized weights")
 
 
