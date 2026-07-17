@@ -40,7 +40,9 @@ Disk sizes are the actual PTQ pipeline outputs (backbone + heads sidecar + token
 | FP16 (dequantised baseline) | `KYAGABA/mimic-cxr-vqa-stage4-fp16` | **19.68 GB** | 1.00× | HF `AutoModelForImageTextToText`, no quant config |
 | INT8 (bitsandbytes) | `KYAGABA/mimic-cxr-vqa-stage4-int8` | **10.36 GB** | 1.90× | HF + `BitsAndBytesConfig(load_in_8bit=True)` |
 | NF4 (bitsandbytes, QLoRA format) | `KYAGABA/mimic-cxr-vqa-stage4-nf4` | **6.96 GB** | 2.83× | HF + `BitsAndBytesConfig(load_in_4bit=True, nf4)` |
-| GGUF Q5_K_M / Q4_K_M / Q3_K_M | *(planned, pending stable llama.cpp Qwen3-VL support)* | ~3.5-5.7 GB | 3.4×-4.7× | `llama-cpp-python` |
+| GGUF Q5_K_M | `KYAGABA/mimic-cxr-vqa-stage4-q5_k_m` | **6.48 GB** | 3.04× | `llama-cpp-python` |
+| GGUF Q4_K_M | `KYAGABA/mimic-cxr-vqa-stage4-q4_k_m` | **5.71 GB** | 3.45× | `llama-cpp-python` |
+| GGUF Q3_K_M | `KYAGABA/mimic-cxr-vqa-stage4-q3_k_m` | **4.87 GB** | 4.04× | `llama-cpp-python` |
 
 Every repo also ships a `heads.safetensors` sidecar (~300 MB) containing the scene-graph generator, encoder/projector, mHC grounding head, and auxiliary heads. The plain HF snippets below use only the Qwen backbone (fast baseline). For the full `<think><box><answer>` pipeline with SG-token injection and mHC grounding refinement, use `scripts/serve_app.py` from the training repo (§ Full pipeline below).
 
@@ -254,9 +256,9 @@ Reproduces Table `tab:qvariants` from the methodology. Six variants produced by 
 | FP16 (baseline) | HuggingFace | none | **19.68 GB** | 1.00× | *TBD* | *TBD* |
 | INT8 | bitsandbytes | row-wise dynamic INT8 | **10.36 GB** | 1.90× | *TBD* | *TBD* |
 | NF4 | bitsandbytes | 4-bit NormalFloat + double-quant | **6.96 GB** | 2.83× | *TBD* | *TBD* |
-| GGUF Q5_K_M | llama.cpp | 5-bit block-wise K-quants | *(planned)* | ~3.4× | — | — |
-| GGUF Q4_K_M | llama.cpp | 4-bit block-wise K-quants | *(planned)* | ~4.0× | — | — |
-| GGUF Q3_K_M | llama.cpp | 3-bit block-wise K-quants | *(planned)* | ~4.7× | — | — |
+| GGUF Q5_K_M | llama.cpp | 5-bit block-wise K-quants | **6.48 GB** | 3.04× | *TBD* | *TBD* |
+| GGUF Q4_K_M | llama.cpp | 4-bit block-wise K-quants | **5.71 GB** | 3.45× | *TBD* | *TBD* |
+| GGUF Q3_K_M | llama.cpp | 3-bit block-wise K-quants | **4.87 GB** | 4.04× | *TBD* | *TBD* |
 
 Val Acc and Median CPU latency to be filled in from `benchmark_manifest.json` once `scripts/benchmark_cpu.py` completes on the canonical test-bed (Intel Xeon 12/24 cores 2.1 GHz, 8-thread pin, `OMP_NUM_THREADS=8`, `MKL_NUM_THREADS=8`, `CUDA_VISIBLE_DEVICES=""`, batch 1, 100 warm-up + 500 measured queries per variant).
 
