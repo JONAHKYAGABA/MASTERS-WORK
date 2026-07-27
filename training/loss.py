@@ -257,7 +257,7 @@ class MultiTaskLoss(nn.Module):
             generation_loss = precomputed_lm_loss
             loss_dict['generation_loss'] = generation_loss
             # Surface the report-only loss (LM CE restricted to <think>...</think>
-            # tokens — see SSGVQANetV2._compute_report_loss). This is a MONITORED
+            # tokens — see customvqamodel._compute_report_loss). This is a MONITORED
             # metric only: it is NOT added to total_loss because the underlying
             # tokens are already supervised by generation_loss above. Showing it
             # separately lets the trainer/wandb plot report-generation quality.

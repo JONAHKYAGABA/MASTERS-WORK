@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scripts/test_real_data.py — test SSGVQANetV2 on N real MIMIC+QBA samples.
+scripts/test_real_data.py — test customvqamodel on N real MIMIC+QBA samples.
 
 Walks qa/ directly using the same logic as scripts/prebuild_cache.py
 (_map_qa_file at lines 681-702) but skips the split.csv filter — that filter
@@ -323,7 +323,7 @@ def format_answer_text(answers: List[Dict[str, Any]], dicom_id: str, w: int, h: 
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Test SSGVQANetV2 on real samples (cache-free)")
+    p = argparse.ArgumentParser(description="Test customvqamodel on real samples (cache-free)")
     p.add_argument("--n", type=int, default=3)
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--model_id", default="Qwen/Qwen3-VL-8B-Instruct")
@@ -335,7 +335,7 @@ def main(argv=None) -> int:
                         "permits; lower to 336 if you OOM.")
     args = p.parse_args(argv)
 
-    print(f"=== SSGVQANetV2 real-data test (n={args.n}) — cache-free ===\n")
+    print(f"=== customvqamodel real-data test (n={args.n}) — cache-free ===\n")
 
     paths = load_paths()
     mimic_cxr = Path(paths["mimic_cxr_jpg_path"])
@@ -428,9 +428,9 @@ def main(argv=None) -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
 
-    from models import SSGVQANetV2
+    from models import customvqamodel
     t0 = time.time()
-    model = SSGVQANetV2(
+    model = customvqamodel(
         qwen_model_id=args.model_id,
         use_quantization=force_qlora,
         num_sg_tokens=4,

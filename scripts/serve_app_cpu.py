@@ -327,7 +327,7 @@ class CPUPipeline:
     # ----------------------------------------------------------------------
     def _add_sg_placeholder_tokens(self, num_sg_tokens: int):
         """Add <|sg_token_N|> placeholders to the tokenizer (parallels
-        SSGVQANetV2._add_sg_placeholder_tokens). For HF-backed variants
+        customvqamodel._add_sg_placeholder_tokens). For HF-backed variants
         we also resize the embedding matrix. For GGUF this is a no-op --
         llama.cpp cannot resize embeddings so we skip actual injection
         and rely on prompt-level SG-token summary instead (documented
@@ -391,7 +391,7 @@ class CPUPipeline:
         sg_block = "".join(
             f"<|sg_token_{i}|>" for i in range(self._num_sg_tokens)
         )
-        # Structured target format (matches SSGVQANetV2._build_prompts).
+        # Structured target format (matches customvqamodel._build_prompts).
         # Note: this is a simplified single-turn form; the full model uses
         # Qwen's chat template.
         return (

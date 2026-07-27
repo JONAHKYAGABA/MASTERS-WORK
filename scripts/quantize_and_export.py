@@ -72,7 +72,7 @@ GGUF_VARIANTS = {"q5_k_m", "q4_k_m", "q3_k_m"}
 # LoRA merge + heads-sidecar split
 # ==========================================================================
 def _load_and_merge(checkpoint_dir: Path, model_id: str, dtype: torch.dtype = torch.float16):
-    """Load a trained SSGVQANetV2 checkpoint and merge LoRA into the Qwen base.
+    """Load a trained customvqamodel checkpoint and merge LoRA into the Qwen base.
 
     Returns (merged_model, heads_state_dict) where merged_model is the LoRA-
     merged HuggingFace Qwen3-VL ready for HF-style export, and heads_state_dict
@@ -82,9 +82,9 @@ def _load_and_merge(checkpoint_dir: Path, model_id: str, dtype: torch.dtype = to
     reconstruct the heads with matching dimensions.
     """
     from models.sg_generators import get_sg_generator  # noqa: F401  (auto-registers)
-    from models.ssg_vqa_net_v2 import SSGVQANetV2
+    from models.ssg_vqa_net_v2 import customvqamodel
 
-    logger.info(f"Constructing SSGVQANetV2 with base {model_id} (dtype={dtype})")
+    logger.info(f"Constructing customvqamodel with base {model_id} (dtype={dtype})")
 
     # Reconstruct via the same path the trainer uses.
     #
@@ -105,7 +105,7 @@ def _load_and_merge(checkpoint_dir: Path, model_id: str, dtype: torch.dtype = to
     # this in-place dequant. For int8/nf4/gguf variants the model is reloaded
     # from the FP16 export, so the initial NF4 load only affects the merge
     # itself (which adds ~1-2%% per-layer requant drift, bounded by NF4).
-    model = SSGVQANetV2(
+    model = customvqamodel(
         qwen_model_id=model_id,
         use_quantization=True,
         lora_rank=32,

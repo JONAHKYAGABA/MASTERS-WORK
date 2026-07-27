@@ -106,7 +106,7 @@ def compute_entity_weights(entity_to_idx, args) -> List[float]:
 
     IMPORTANT — vocab/model mismatch handling:
       - dataset_info.json defines 232 entity names
-      - SSGVQANetV2 default num_entities=237 (5 extra slots for padding /
+      - customvqamodel default num_entities=237 (5 extra slots for padding /
         unknown / special tokens reserved in the classifier head)
       - PyTorch CE requires weight tensor size == logits class count
     So we PAD to args.num_entities (default 237) with neutral weight 1.0
@@ -215,17 +215,17 @@ def main():
                     help="Use only pos_mention (not total). Best if most loss "
                          "comes from positive-finding samples.")
     # Must match the model's classifier head dimensions exactly (CE weight tensor
-    # size has to equal logits class count). SSGVQANetV2 defaults are
+    # size has to equal logits class count). customvqamodel defaults are
     # num_entities=237, num_regions=310 — those are the right numbers for our
-    # current trainer. If you ever change SSGVQANetV2.__init__ defaults, bump
+    # current trainer. If you ever change customvqamodel.__init__ defaults, bump
     # these to match or you'll get the "weight tensor should be defined either
     # for all N classes or no classes" runtime error.
     ap.add_argument("--num_entities", type=int, default=237,
                     help="Pad/truncate entity weights to this length (model's "
-                         "classifier dim — default 237 matches SSGVQANetV2).")
+                         "classifier dim — default 237 matches customvqamodel).")
     ap.add_argument("--num_regions",  type=int, default=310,
                     help="Pad/truncate region weights to this length (model's "
-                         "classifier dim — default 310 matches SSGVQANetV2).")
+                         "classifier dim — default 310 matches customvqamodel).")
     ap.add_argument("--output_dir", type=Path, default=OUT_DIR)
     args = ap.parse_args()
 

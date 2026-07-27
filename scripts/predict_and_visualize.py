@@ -68,8 +68,8 @@ def build_model(
     gpu: int,
     checkpoint_path: Optional[Path] = None,
 ) -> Tuple[Any, torch.device, torch.dtype]:
-    """Build SSGVQANetV2, optionally load fine-tuned LoRA adapter."""
-    from models import SSGVQANetV2
+    """Build customvqamodel, optionally load fine-tuned LoRA adapter."""
+    from models import customvqamodel
 
     if torch.cuda.is_available():
         torch.cuda.set_device(gpu)
@@ -85,7 +85,7 @@ def build_model(
 
     if checkpoint_path and checkpoint_path.exists():
         print(f"[model] loading from checkpoint: {checkpoint_path}")
-        model = SSGVQANetV2.from_pretrained(
+        model = customvqamodel.from_pretrained(
             str(checkpoint_path),
             torch_dtype=dtype,
             use_quantization=force_qlora,
@@ -93,7 +93,7 @@ def build_model(
     else:
         if checkpoint_path:
             warnings.warn(f"Checkpoint not found at {checkpoint_path} — using untrained model")
-        model = SSGVQANetV2(
+        model = customvqamodel(
             qwen_model_id=model_id,
             use_quantization=force_qlora,
             num_sg_tokens=4,
@@ -363,7 +363,7 @@ def main(argv=None) -> int:
                            "and highlight their location with a bounding box.",
                    help="Question/prompt to ask about each image")
     p.add_argument("--checkpoint", type=Path, default=None,
-                   help="Fine-tuned SSGVQANetV2 checkpoint dir (saved via save_pretrained)")
+                   help="Fine-tuned customvqamodel checkpoint dir (saved via save_pretrained)")
     p.add_argument("--model_id", type=str, default="Qwen/Qwen3-VL-8B-Instruct",
                    help="Base model. Use Qwen3-VL-4B-Instruct for faster smoke runs.")
     p.add_argument("--gpu", type=int, default=0)

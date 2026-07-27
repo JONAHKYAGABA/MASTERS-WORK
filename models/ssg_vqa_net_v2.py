@@ -815,7 +815,7 @@ def parse_structured_output(text: str) -> Dict[str, Any]:
 # =============================================================================
 
 
-class SSGVQANetV2(nn.Module):
+class customvqamodel(nn.Module):
     """
     Scene-Graph-Guided VQA model built around Qwen3-VL.
 
@@ -879,7 +879,7 @@ class SSGVQANetV2(nn.Module):
 
         if not _HAS_TRANSFORMERS:
             raise ImportError(
-                "transformers is required for SSGVQANetV2. Install with:\n"
+                "transformers is required for customvqamodel. Install with:\n"
                 "    pip install 'transformers>=4.45'"
             )
         if not _HAS_PEFT:
@@ -1489,7 +1489,7 @@ class SSGVQANetV2(nn.Module):
                     raise ValueError(
                         "The active SG generator is a standalone SGGenerator "
                         "and requires raw pil_images. Pass them through "
-                        "SSGVQANetV2.forward()."
+                        "customvqamodel.forward()."
                     )
                 images_t = self._pil_to_batch_tensor(pil_images, device=pixel_values.device)
                 with ctx:
@@ -1681,7 +1681,7 @@ class SSGVQANetV2(nn.Module):
         # legacy tensor inputs, fail fast with a clear message.
         if pil_images is None or questions is None:
             raise ValueError(
-                "SSGVQANetV2.forward requires `pil_images` (List[PIL.Image]) "
+                "customvqamodel.forward requires `pil_images` (List[PIL.Image]) "
                 "and `questions` (List[str]) — produced by collate_fn in "
                 "data/mimic_cxr_dataset.py. Got "
                 f"pil_images={'set' if pil_images is not None else 'None'}, "
@@ -2140,7 +2140,7 @@ class SSGVQANetV2(nn.Module):
             }, f, indent=2)
 
     @classmethod
-    def from_pretrained(cls, save_directory: str, **override_kwargs) -> "SSGVQANetV2":
+    def from_pretrained(cls, save_directory: str, **override_kwargs) -> "customvqamodel":
         """
         Load a checkpoint saved by ``save_pretrained``.
 

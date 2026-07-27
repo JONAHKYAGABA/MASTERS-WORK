@@ -127,10 +127,10 @@ from configs.mimic_cxr_config import (
 )
 from data.mimic_cxr_dataset import MIMICCXRVQADataset, create_dataloader
 # V2 model: Qwen2.5-VL backbone + SG soft tokens + grounding refinement head.
-# The legacy MIMICCXRVQAModel was retired; SSGVQANetV2 lives in
+# The legacy MIMICCXRVQAModel was retired; customvqamodel lives in
 # models/ssg_vqa_net_v2.py and exposes the same forward output keys consumed
 # by training.loss.MultiTaskLoss and training.metrics.VQAMetrics.
-from models import SSGVQANetV2
+from models import customvqamodel
 from training.loss import MultiTaskLoss
 from training.metrics import VQAMetrics
 from utils.hardware_utils import (
@@ -795,9 +795,9 @@ using the MIMIC-CXR-JPG images and MIMIC-Ext-CXR-QBA question-answer pairs.
 ## Usage
 
 ```python
-from models import SSGVQANetV2
+from models import customvqamodel
 
-model = SSGVQANetV2(qwen_model_id="{config.training.hub_model_id}")
+model = customvqamodel(qwen_model_id="{config.training.hub_model_id}")
 ```
 
 ## Citation
@@ -1537,7 +1537,7 @@ def validate(
         chexpert_mask = batch['chexpert_mask'].to(device)
 
         # === V2 raw inputs for Qwen processor ===
-        # In validation we omit answer_texts so SSGVQANetV2 runs free generation.
+        # In validation we omit answer_texts so customvqamodel runs free generation.
         pil_images = batch.get('pil_images')
         questions = batch.get('questions')
 
@@ -2568,7 +2568,7 @@ def main(args):
 
     # CLI flag --qwen_model_id wins over config; config wins over default.
     # Merged-base override (highest priority) supersedes all three so the
-    # HF from_pretrained call inside SSGVQANetV2 loads the folded backbone.
+    # HF from_pretrained call inside customvqamodel loads the folded backbone.
     _qwen_id = (
         (str(_merged_base_dir) if _merged_base_dir is not None else None)
         or getattr(args, 'qwen_model_id', None)
@@ -2608,7 +2608,7 @@ def main(args):
             f"(phase={_phase})"
         )
 
-    model = SSGVQANetV2(
+    model = customvqamodel(
         qwen_model_id=_qwen_id,
         use_quantization=_use_quant or _force_qlora,
         lora_rank=_lora_rank,
@@ -2629,7 +2629,7 @@ def main(args):
     # -----------------------------------------------------------
     # Load pretrained standalone SG generator (Stages 2-4).
     # When config.model.sg_generator.checkpoint is set, we swap the
-    # SSGVQANetV2's internal SceneGraphGenerator for the trained
+    # customvqamodel's internal SceneGraphGenerator for the trained
     # standalone one and load its weights from disk. The generator
     # then runs frozen (freeze_sg_generator is already True for
     # non-sg_only phases). Downstream forward is unchanged because
@@ -2653,7 +2653,7 @@ def main(args):
                 logger.info(
                     f"Loaded standalone SG generator "
                     f"'{_sg_gen_cfg_for_load['name']}' from {_bin} "
-                    "and swapped into SSGVQANetV2.sg_generator "
+                    "and swapped into customvqamodel.sg_generator "
                     f"(frozen={not _freeze_sg is False})"
                 )
         elif is_main_process(local_rank):
@@ -2765,7 +2765,7 @@ def main(args):
     if args.resume_from_checkpoint and _merged_heads_path is not None:
         # ------------------------------------------------------------------
         # Merged-base mode: the Qwen backbone was already loaded from
-        # qwen_merged_fp16/ by SSGVQANetV2 (via _qwen_id override above),
+        # qwen_merged_fp16/ by customvqamodel (via _qwen_id override above),
         # with a FRESH rank-32 LoRA on top per this stage's config. Only
         # the non-qwen weights (SG generator, encoder, projector, mHC,
         # grounding head, aux heads, embeddings, view-position) need to
@@ -2776,7 +2776,7 @@ def main(args):
         if is_main_process(local_rank):
             logger.info(f"Loading heads sidecar from: {_merged_heads_path}")
         # heads.bin is produced by scripts/merge_lora_for_stage4.py and
-        # contains ONLY tensor state (non-qwen weights of SSGVQANetV2).
+        # contains ONLY tensor state (non-qwen weights of customvqamodel).
         # weights_only=True is safe here and rejects any pickled object
         # code — unlike the main pytorch_model.bin path further down,
         # which embeds DeepSpeed / numpy metric objects.

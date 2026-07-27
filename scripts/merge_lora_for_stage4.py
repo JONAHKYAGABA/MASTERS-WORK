@@ -50,7 +50,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from configs.mimic_cxr_config import load_config_from_file  # noqa: E402
-from models import SSGVQANetV2  # noqa: E402
+from models import customvqamodel  # noqa: E402
 
 
 def _safe_load(path: Path):
@@ -165,7 +165,7 @@ def main():
     print(f"[merge] Building Stage-3 architecture ({_mode_label} {s3_rank}, "
           f"peak GPU mem est. {_peak_gb_est})...")
 
-    model = SSGVQANetV2(
+    model = customvqamodel(
         qwen_model_id=qwen_id,
         use_quantization=_use_quant_load,
         lora_rank=s3_rank,

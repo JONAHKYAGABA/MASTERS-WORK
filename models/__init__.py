@@ -6,9 +6,9 @@ decoder) has been retired. v2 wraps Qwen3-VL with LoRA, scene-graph soft
 tokens, and a manifold-constrained grounding refinement head.
 
 Usage:
-    from models import SSGVQANetV2
+    from models import customvqamodel
 
-    model = SSGVQANetV2(
+    model = customvqamodel(
         qwen_model_id="Qwen/Qwen3-VL-8B-Instruct",
         use_quantization=True,
         training_mode="pretrain",
@@ -22,7 +22,7 @@ backwards-compatible imports.
 
 from .ssg_vqa_net_v2 import (
     # v2 primary API
-    SSGVQANetV2,
+    customvqamodel,
     SceneGraphEncoderV2,
     SGTokenProjector,
     GroundingRefinementHead,
@@ -39,7 +39,7 @@ from .ssg_vqa_net_v2 import (
 )
 
 __all__ = [
-    "SSGVQANetV2",
+    "customvqamodel",
     "SceneGraphEncoderV2",
     "SGTokenProjector",
     "GroundingRefinementHead",

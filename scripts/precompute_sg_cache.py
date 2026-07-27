@@ -73,7 +73,7 @@ from PIL import Image
 # -----------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.ssg_vqa_net_v2 import SSGVQANetV2  # noqa: E402
+from models.ssg_vqa_net_v2 import customvqamodel  # noqa: E402
 from data.mimic_cxr_dataset import MIMICCXRVQADataset  # noqa: E402
 
 logging.basicConfig(
@@ -102,7 +102,7 @@ def _state_sha(module: torch.nn.Module) -> str:
     return h.hexdigest()[:16]
 
 
-def cache_signature(model: SSGVQANetV2) -> Dict[str, Any]:
+def cache_signature(model: customvqamodel) -> Dict[str, Any]:
     """Everything that, if changed, invalidates the cached graphs."""
     ip = model.processor.image_processor
     base = model.qwen.get_base_model() if hasattr(model.qwen, "get_base_model") else model.qwen
@@ -152,7 +152,7 @@ def assert_manifest_matches(cache_root: Path, sig: Dict[str, Any]) -> None:
 
 @torch.no_grad()
 def precompute_one(
-    model: SSGVQANetV2,
+    model: customvqamodel,
     pil_image: Image.Image,
     device: torch.device,
 ) -> Dict[str, Any]:
@@ -233,8 +233,8 @@ def main():
     cache_root = args.cache_root.resolve()
 
     # ---- Build the model with Stage-1 weights ----------------------------
-    logger.info("Loading SSGVQANetV2 (4-bit QLoRA, frozen for inference)...")
-    model = SSGVQANetV2(
+    logger.info("Loading customvqamodel (4-bit QLoRA, frozen for inference)...")
+    model = customvqamodel(
         qwen_model_id=args.qwen_model_id,
         use_quantization=True,
         training_mode="pretrain",     # ensures sg_generator is FROZEN (not sg_only)

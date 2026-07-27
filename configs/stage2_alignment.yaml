@@ -21,7 +21,7 @@
 
 model:
   # Frozen SG generator loaded from Stage 1's standalone output.
-  # SSGVQANetV2 swaps the loaded module in over its own internal
+  # customvqamodel swaps the loaded module in over its own internal
   # SceneGraphGenerator; the encoder/projector/injection flow is unchanged.
   sg_generator:
     name: txrv_detr

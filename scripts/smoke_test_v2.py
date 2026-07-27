@@ -2,7 +2,7 @@
 """
 SSG-VQA-Net v2 smoke test.
 
-Purpose: confirm SSGVQANetV2 can be instantiated, run forward+backward+
+Purpose: confirm customvqamodel can be instantiated, run forward+backward+
 optimizer step, and that all the safety checks (vision-path verification,
 SG token round-trip, label masking) pass — on every visible GPU. No real
 dataset required: builds a 1-sample dummy batch in memory.
@@ -91,9 +91,9 @@ def _run_one_gpu(
     # Heavy import only inside the per-GPU loop so a single GPU's failure
     # doesn't cascade into module-level errors.
     try:
-        from models import SSGVQANetV2
+        from models import customvqamodel
     except Exception as e:
-        print(f"  ✗ cannot import SSGVQANetV2: {e}")
+        print(f"  ✗ cannot import customvqamodel: {e}")
         traceback.print_exc()
         return False
 
@@ -107,7 +107,7 @@ def _run_one_gpu(
 
     t0 = time.time()
     try:
-        model = SSGVQANetV2(
+        model = customvqamodel(
             qwen_model_id=model_id,
             use_quantization=use_quant_eff,
             num_sg_tokens=4,        # smaller than default 8 for faster smoke

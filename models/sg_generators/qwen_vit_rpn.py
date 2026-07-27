@@ -29,7 +29,7 @@ class QwenViTRPNSGGenerator(SGGenerator):
     runs the legacy SceneGraphGenerator RPN over them.
 
     Because Qwen features are used, this generator does NOT accept a plain
-    ``(B, 3, H, W)`` image tensor. Instead the caller (SSGVQANetV2) passes
+    ``(B, 3, H, W)`` image tensor. Instead the caller (customvqamodel) passes
     a pre-computed feature map via the ``features`` kwarg. That keeps the
     signature compatible with the base class while acknowledging that this
     generator is a wrapper around the old coupled path.

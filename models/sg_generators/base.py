@@ -127,7 +127,7 @@ class SGGenerator(nn.Module, abc.ABC):
         )
 
     # ------------------------------------------------------------------
-    # Checkpoint helpers -- so the pluggable loader in SSGVQANetV2 can
+    # Checkpoint helpers -- so the pluggable loader in customvqamodel can
     # load pretrained generator weights without knowing the class.
     # ------------------------------------------------------------------
     def save_weights(self, path: str) -> None:

@@ -22,7 +22,7 @@ Implements ``SGGenerator`` from ``models/sg_generators/base.py``. Input
 is a batch of raw RGB images (B, 3, H, W) in ``[0, 1]``; output is the
 same ``{"raw": ..., "dicts": ...}`` payload that the downstream
 ``SceneGraphEncoderV2`` and ``MultiTaskLoss`` already consume, so
-plugging this generator into ``SSGVQANetV2`` costs nothing else.
+plugging this generator into ``customvqamodel`` costs nothing else.
 """
 from __future__ import annotations
 

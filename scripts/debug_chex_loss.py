@@ -19,7 +19,7 @@ import torch
 sys.path.insert(0, '.')
 from configs.mimic_cxr_config import load_config_from_file
 from data.mimic_cxr_dataset import MIMICCXRVQADataset, collate_fn
-from models.ssg_vqa_net_v2 import SSGVQANetV2
+from models.ssg_vqa_net_v2 import customvqamodel
 from training.loss import MultiTaskLoss
 
 
@@ -73,7 +73,7 @@ def main():
     # Run model forward + loss
     print("\n[3] Building model (this takes ~60s for Qwen3-VL 8B in 4-bit)...")
     device = torch.device('cuda:0')
-    model = SSGVQANetV2(
+    model = customvqamodel(
         qwen_model_id='Qwen/Qwen3-VL-8B-Instruct',
         use_quantization=True,
         training_mode='sg_only',

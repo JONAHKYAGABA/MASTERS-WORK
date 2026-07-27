@@ -4,7 +4,7 @@ scripts/serve_app.py — FastAPI inference server + optional ngrok tunnel.
 
 A minimal web UI that lets a user upload a chest X-ray and ask a question.
 The server:
-  - Loads the trained SSGVQANetV2 once at startup (the Stage 4 best_model by
+  - Loads the trained customvqamodel once at startup (the Stage 4 best_model by
     default; override with --checkpoint).
   - Serves a single HTML page at GET / with an upload form.
   - Accepts multipart POST /predict (image + question), runs inference, and
@@ -149,15 +149,15 @@ def build_model(
     checkpoint_path: Optional[Path],
     trust_checkpoint: bool = False,
 ):
-    """Build a fresh SSGVQANetV2 and load weights from pytorch_model.bin.
+    """Build a fresh customvqamodel and load weights from pytorch_model.bin.
 
-    We deliberately AVOID ``SSGVQANetV2.from_pretrained`` because the
+    We deliberately AVOID ``customvqamodel.from_pretrained`` because the
     config.json saved next to the model is the full training config
     (nested: ``{model: {...}, training: {...}, data: {...}}``), not the
     flat init kwargs the model constructor accepts. Calling
     from_pretrained therefore raises:
 
-        TypeError: SSGVQANetV2.__init__() got an unexpected keyword
+        TypeError: customvqamodel.__init__() got an unexpected keyword
         argument 'model'
 
     Instead we mirror exactly what train_mimic_cxr.py does on resume:
@@ -165,7 +165,7 @@ def build_model(
     ``pytorch_model.bin`` with strict=False (bitsandbytes quant metadata
     intentionally produces "unexpected keys" — harmless).
     """
-    from models import SSGVQANetV2
+    from models import customvqamodel
 
     if torch.cuda.is_available():
         torch.cuda.set_device(gpu)
@@ -199,8 +199,8 @@ def build_model(
     # entire raw generation (including <think> and <box> tags) leaks into
     # the "Answer" field. 384 gives ~300 tokens for the actual answer text
     # while keeping inference under ~12s on Qwen3-VL-8B QLoRA.
-    log.info("constructing SSGVQANetV2 with explicit kwargs (training_mode=finetune)")
-    model = SSGVQANetV2(
+    log.info("constructing customvqamodel with explicit kwargs (training_mode=finetune)")
+    model = customvqamodel(
         qwen_model_id=model_id,
         use_quantization=force_qlora,
         num_sg_tokens=8,

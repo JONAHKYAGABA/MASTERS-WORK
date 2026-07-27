@@ -61,7 +61,7 @@ class ModelConfig:
     # ----- V2 standalone scene-graph generator -----
     # When non-None, train_mimic_cxr.py dispatches to the standalone SG
     # generator trainer at phase=sg_only, and swaps the loaded generator
-    # into SSGVQANetV2.sg_generator at phases 2-4. Shape:
+    # into customvqamodel.sg_generator at phases 2-4. Shape:
     #   sg_generator:
     #     name: txrv_detr
     #     num_entities: 22

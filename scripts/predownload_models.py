@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 DEFAULT_MODELS = [
-    # Primary VLM backbone — picked up by SSGVQANetV2 default.
+    # Primary VLM backbone — picked up by customvqamodel default.
     "Qwen/Qwen3-VL-8B-Instruct",
 ]
 
